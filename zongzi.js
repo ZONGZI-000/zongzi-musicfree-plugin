@@ -5254,6 +5254,86 @@ async function neteaseSheetDetail(playlistId, page) {
   };
 }
 
+/* ---------- 榜单 / 推荐歌单 ----------
+ *
+ * MusicFree 的「榜单」页走 getTopLists，之前我们一项都没实现，
+ * 所以那页永远是空的 —— 其实内容一直都在我们自己手里：
+ * 歌单详情（neteaseSheetDetail）本来就能把任意歌单拉成可播放列表，
+ * 只是没有一个「入口」把这些歌单列出来。
+ *
+ * 下面三组全部匿名实测可用（2026-10-18）：
+ *   榜单       /api/toplist              64 个（飙升/新歌/热歌/原创/古典…）
+ *   推荐歌单   /api/personalized/playlist 8~12 个官方推荐（带 alg 标记）
+ *   分类精选   /api/playlist/highquality  按分类出精品歌单
+ *
+ * ⚠️ 不用登录。真正的「每日推荐」（recommend/songs）必须有 MUSIC_U cookie，
+ *    匿名请求返回空数组 —— 那是账号行为画像驱动的东西，不是算法能逆向出来的。
+ *    这里给的是公开侧的推荐，性质上是「运营推荐」，不是「个性化推荐」。
+ */
+function neTopItem(p) {
+  const creator = (p && p.creator) || {};
+  return {
+    id: String((p && p.id) || ""),
+    platform: "网易云",
+    title: (p && p.name) || "",
+    // 榜单没有 creator，就把更新频率当副标题（「刚刚更新」「每周四更新」）
+    artist: creator.nickname || (p && p.updateFrequency) || "",
+    artwork: (p && (p.coverImgUrl || p.coverImageUrl)) || "",
+    worksNum: Number((p && p.trackCount) || 0),
+    playCount: Number((p && p.playCount) || 0),
+    description: (p && (p.updateFrequency || p.description)) || "",
+    _provider: "netease",
+  };
+}
+
+/** 分类精选用哪几个分类。太少显得空，太多会让「榜单」页打开变慢 */
+const NE_SHEET_CATS = ["华语", "流行", "摇滚", "民谣", "电子", "轻音乐", "爵士", "古风"];
+
+async function neteaseTopListGroups() {
+  const groups = [];
+
+  // ① 官方榜单（不带任何参数就是全部 64 个）
+  try {
+    const r = await httpGet("https://music.163.com/api/toplist", null, NETEASE_HEADERS);
+    const list = ((r && r.list) || []).filter((p) => p && p.id && p.name);
+    if (list.length) {
+      groups.push({
+        title: "网易云榜单",
+        data: list.map(neTopItem),
+      });
+    }
+  } catch (e) { console.log("[粽子] 榜单失败: " + e.message); }
+
+  // ② 官方推荐歌单
+  try {
+    const r = await httpGet("https://music.163.com/api/personalized/playlist", { limit: 12 }, NETEASE_HEADERS);
+    const list = ((r && r.result) || []).filter((p) => p && p.id && p.name);
+    if (list.length) {
+      groups.push({
+        title: "推荐歌单",
+        data: list.map(neTopItem),
+      });
+    }
+  } catch (e) { console.log("[粽子] 推荐歌单失败: " + e.message); }
+
+  // ③ 分类精选：每个分类取 8 张精品歌单，并发拉，单条失败不影响其他
+  try {
+    const results = await Promise.all(NE_SHEET_CATS.map((cat) =>
+      httpGet("https://music.163.com/api/playlist/highquality/list",
+        { cat: cat, limit: 8, lasttime: 0, area: "全部" }, NETEASE_HEADERS)
+        .then((r) => ((r && r.playlists) || []).map(neTopItem))
+        .catch(() => [])
+    ));
+    for (let i = 0; i < NE_SHEET_CATS.length; i++) {
+      if (results[i] && results[i].length) {
+        groups.push({ title: NE_SHEET_CATS[i] + "精选", data: results[i] });
+      }
+    }
+  } catch (e) { console.log("[粽子] 分类精选失败: " + e.message); }
+
+  return groups.filter((g) => g.data && g.data.length);
+}
+
 /* ---------- 专辑详情 ---------- */
 async function getAlbumDetail(albumItem, page) {
   const id = albumItem && albumItem.id;
@@ -7333,7 +7413,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.14",
+  version: "4.9.15",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
@@ -7486,6 +7566,20 @@ module.exports = {
     return kuwoSheetDetail(sheetItem.id, page);
   },
   getArtistWorks: getArtistWorksOf,
+  /* 榜单页入口。返回 [{ title, data: [歌单] }]，
+     MusicFree 会按分组渲染成「网易云榜单 / 推荐歌单 / 华语精选 …」。
+     点进去走 getMusicSheetInfo（_provider 是 netease，正好复用现有歌单详情）。 */
+  getTopLists: function () {
+    return neteaseTopListGroups().catch((e) => {
+      console.log("[粽子] 榜单页整体失败: " + e.message);
+      return [];
+    });
+  },
+  /* 榜单详情。MusicFree 的榜单条目和歌单是同一套结构，直接复用 */
+  getTopListDetail: function (topListItem) {
+    if (!topListItem || !topListItem.id) return Promise.resolve(null);
+    return neteaseSheetDetail(topListItem.id, 1).catch(() => null);
+  },
 };/**
  * 严格匹配：搜索结果必须和请求的是同一首歌。
  * 踩过的坑：搜「稻香 周杰伦」，咪咕返回一堆周杰伦的别的歌
