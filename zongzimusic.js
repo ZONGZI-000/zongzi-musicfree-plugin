@@ -9538,10 +9538,10 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.32",
+  version: "4.9.33",
   author: "粽子 & Alma",
   description:
-    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。v4.9.25 接入 B 站鬼畜区：搜索并上 tids=119，榜单页多一组「B站鬼畜」，不进推荐页。v4.9.26 鬼畜取消整体下沉，按匹配度正常排序（原唱仍靠权威目录排第一）。v4.9.32 拼单详情提速：网易歌单补齐量按 cap 截断、主体与反差歌并发取数、Deezer 封面 4 秒并发兜底（原来可能卡 60 秒转圈）。v4.9.27 修 B 站播两秒跳歌：取流地址必须带 Referer，且改为整首预下载；同时修 48kbps 音源被误判成试听片段。",
+    "聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张歌单，按分类配封面。",
   supportedSearchType: ["music", "album", "artist", "sheet"],
   // 音频缓存策略：no-cache = 每次播放都重新取地址（直链带时效签名，缓存必然过期）
   cacheControl: "no-cache",
