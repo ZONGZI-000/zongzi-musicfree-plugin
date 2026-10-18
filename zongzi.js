@@ -6783,82 +6783,549 @@ async function resolveMediaSource(musicItem, quality) {
 
 /* ============================================================
  * 歌词
+ *
+ * 两层结构：
+ *   ① 本源直取 —— 条目来自哪个平台就先问那个平台（命中最准）。
+ *   ② 跨源兜底 —— B站 / YouTube / JOOX / Apple 本身没有歌词库，
+ *      以及本源只回「暂无歌词」的曲子，按「歌名 + 歌手 + 时长」去公共库反查。
+ *      顺序 LRCLIB → 网易云 → 酷狗 → hi.cn。
+ *
+ * 实测（2026-10-18）：
+ *   - LRCLIB 是公开 API，不用 key、不用登录，返回带时间轴的 LRC。
+ *     《晴天》《起风了》《優しい彗星》都命中，同步歌词 1000 字以上。
+ *     它对 B站 / YouTube 这种「标题很脏」的条目最关键 —— 那两个源
+ *     以前点了歌词永远是空的。
+ *   - 网易云官方 /api/song/lyric 一次能同时拿原文和翻译（tlyric），
+ *     译文按同一时间戳并排插在原文下一行，播放器滚词就是双语。
+ *   - 酷我 COCO 通道固定返回 400（实测 kuwo/migu 都是），
+ *     只有官方 m.kuwo.cn 按 musicId 直取才行。
+ *   - 酷狗 krcs.kugou.com/search + lyrics.kugou.com/download
+ *     返回 base64 的 LRC，华语老歌命中率高，能补网易云没有的曲目。
  * ============================================================ */
-async function getLyric(musicItem) {
-  const provider = musicItem._provider || LABEL_TO_PROVIDER[musicItem.platform];
-  if (!provider) return { rawLrc: "" };
+const LYRIC_UA = "zongzi-musicfree-plugin/4.9 (https://github.com/ZONGZI-000/zongzi-musicfree-plugin)";
+const LRCLIB_SEARCH = "https://lrclib.net/api/search";
+const NE_LYRIC = "https://music.163.com/api/song/lyric";
+const NE_SEARCH_PC = "https://music.163.com/api/cloudsearch/pc";
+const KG_LRC_SEARCH = "https://krcs.kugou.com/search";
+const KG_LRC_DOWNLOAD = "https://lyrics.kugou.com/download";
+const KW_LRC = "https://m.kuwo.cn/newh5/singles/songinfoandlrc";
+const QQ_LYRIC = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg";
 
-  // 咪咕直出：搜索引擎里本来就带 lyricUrl，直接拉最省事。
-  // 用搜索补一次是因为 MusicFree 存 item 时不保证把 _raw 原样带回来。
+/** 歌词兜底是否开启（默认开） */
+function shouldLyricFallback() {
+  try {
+    const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
+    const v = vars.lyricOnline;
+    if (v === undefined || v === null || v === "") return true;
+    return !(v === "0" || v === "false" || v === "off");
+  } catch (e) { return true; }
+}
+
+/** 歌词是否并排显示译文（默认开） */
+function shouldLyricTranslation() {
+  try {
+    const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
+    const v = vars.lyricTranslation;
+    if (v === undefined || v === null || v === "") return true;
+    return !(v === "0" || v === "false" || v === "off");
+  } catch (e) { return true; }
+}
+
+/** 带超时的 Promise —— 兜底源多，任何一个卡住都不能拖住整条链 */
+function lyricTimeout(p, ms) {
+  return new Promise((resolve) => {
+    let done = false;
+    const t = setTimeout(() => { if (!done) { done = true; resolve(null); } }, ms || 8000);
+    Promise.resolve(p).then(
+      (v) => { if (!done) { done = true; clearTimeout(t); resolve(v); } },
+      () => { if (!done) { done = true; clearTimeout(t); resolve(null); } }
+    );
+  });
+}
+
+const B64_REV = (function () {
+  const m = {};
+  for (let i = 0; i < B64_CHARS.length; i++) m[B64_CHARS[i]] = i;
+  return m;
+})();
+
+/** base64 → UTF-8 文本（Hermes 没有 Buffer / atob，纯 JS 解） */
+function b64ToText(str) {
+  const s = String(str || "").replace(/[^A-Za-z0-9+/]/g, "");
+  const bytes = [];
+  let buf = 0, bits = 0;
+  for (let i = 0; i < s.length; i++) {
+    const v = B64_REV[s[i]];
+    if (v === undefined) continue;
+    buf = (buf << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buf >> bits) & 0xff);
+    }
+  }
+  let out = "";
+  for (let i = 0; i < bytes.length;) {
+    const b = bytes[i++];
+    if (b < 0x80) { out += String.fromCharCode(b); continue; }
+    if (b >= 0xf0 && i + 2 < bytes.length) {
+      const c = ((b & 7) << 18) | ((bytes[i] & 63) << 12) | ((bytes[i + 1] & 63) << 6) | (bytes[i + 2] & 63);
+      i += 3;
+      out += String.fromCodePoint ? String.fromCodePoint(c) : "";
+      continue;
+    }
+    if (b >= 0xe0 && i + 1 < bytes.length) {
+      const c = ((b & 15) << 12) | ((bytes[i] & 63) << 6) | (bytes[i + 1] & 63);
+      i += 2;
+      out += String.fromCharCode(c);
+      continue;
+    }
+    if (b >= 0xc0 && i < bytes.length) {
+      const c = ((b & 31) << 6) | (bytes[i] & 63);
+      i += 1;
+      out += String.fromCharCode(c);
+      continue;
+    }
+    out += "?";
+  }
+  return out;
+}
+
+/** 秒 → [mm:ss.xx] */
+function lrcTime(sec) {
+  const t = Math.max(0, Number(sec) || 0);
+  const m = Math.floor(t / 60);
+  const s = t - m * 60;
+  return (m < 10 ? "0" + m : String(m)) + ":" + (s < 10 ? "0" : "") + s.toFixed(2);
+}
+
+/**
+ * 这段文本能不能当歌词交付。
+ * ⚠️ 各平台对无版权 / 纯音乐一律回一句「暂无歌词」，
+ *    字数够、也有时间轴，直接返回会让用户看到一句假歌词。
+ *    所以必须显式挡掉，继续走下一个通道。
+ */
+function lrcLooksReal(txt) {
+  if (typeof txt !== "string") return false;
+  const s = txt.trim();
+  if (s.length < 20) return false;
+  if (/暂无歌词|無歌詞|无歌词|暂无歌词信息|純音樂|纯音乐/i.test(s) && !/\[\d{1,3}:\d{2}/.test(s)) return false;
+  /* 只剩制作名单的「歌词」不能交付。
+     实测 YouTube 的《晴天》条目拿到过 38 个字的
+     「[00:00.00] 作曲 : 周杰伦」—— 长度过关、也有时间轴，
+     但播放器里就是一行字挂在那儿，比没有歌词更难看。
+     判据：去掉「作词/作曲/编曲/制作人/混音/母带/录音/吉他/贝斯/鼓 :」这类
+     名单行之后，真正带时间轴的歌词行不足 5 行，就当没拿到。 */
+  const lrcLines = s.split(/\r?\n/).filter((l) => /^\[\d{1,3}:\d{2}(?:\.\d+)?\].*\S/.test(l));
+  if (!lrcLines.length) {
+    // 完全没有时间轴：纯文本歌词也算数（有些源只给纯词）
+    return s.length >= 20;
+  }
+  const CREDIT = /^\s*\[\d{1,3}:\d{2}(?:\.\d+)?\]\s*(作词|作曲|編曲|编曲|填词|填詞|制作人|製作人|监制|監製|混音|母带|母帶|录音|錄音|吉他|贝斯|貝斯|鼓|和声|和聲|弦乐|弦樂|键盘|鍵盤|出品|发行|發行|词|詞|曲|演唱|原唱|OP|SP|ISRC|Produced|Composed|Written|Lyrics|Arranged)\s*[:：]/i;
+  const real = lrcLines.filter((l) => !CREDIT.test(l));
+  return real.length >= 5;
+}
+
+/** QQ 的歌词偶尔带 HTML 实体（&#10; 之类），不转会把它们直接显示出来 */
+function decodeLrcEntities(s) {
+  return String(s || "")
+    .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(Number(d)))
+    .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&amp;/g, "&").replace(/&quot;/g, "\"")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ");
+}
+
+/** 同一首歌，两个名字算不算对得上（简繁、括号、空格都归一后比）
+ *  ⚠️ 必须走 normTextZ（先统一到简体）而不是 normText：
+ *     歌词库大量条目是繁体（「原諒我不明白你的悲傷」），
+ *     查询侧是简体时就永远匹配不上，整条兜底链全空。 */
+function lyricSame(a, b) {
+  const x = normTextZ(a), y = normTextZ(b);
+  if (!x || !y) return false;
+  return x === y || x.indexOf(y) >= 0 || y.indexOf(x) >= 0;
+}
+
+/**
+ * 歌名匹配分级打分（0 = 不算命中）。
+ *
+ * ⚠️ 不能直接用 lyricSame 打分。它是双向子串判断，在搜索结果里够用，
+ *    放进歌词库就会放出离谱结果：实测搜「这首歌根本不存在测试用xxxzzz」，
+ *    网易云回了一首《不存在》，「不存在」三个字确实被目标串包含，
+ *    于是一首完全无关的歌词被当成命中交出去。
+ *
+ * 分级：
+ *   40 归一后完全相等
+ *   30 候选更长且包含目标 —— 通常是「晴天 (Live)」「晴天 - Remastered」这类变体
+ *   22 目标更长但包含候选，且候选长度 ≥ 目标的 60%（挡「不存在」这种碎片词）
+ *    0 其余情况一律不认
+ */
+function lyricNameScore(cand, want) {
+  const x = normTextZ(cand), y = normTextZ(want);
+  if (!x || !y) return 0;
+  if (x === y) return 40;
+  if (x.length >= y.length) return x.indexOf(y) >= 0 ? 30 : 0;
+  if (y.indexOf(x) >= 0 && x.length * 100 >= y.length * 60) return 22;
+  return 0;
+}
+
+/** 命中与否（阈值 22 ~ 30 都算命中，打分用 lyricNameScore） */
+function lyricNameHit(cand, want) {
+  return lyricNameScore(cand, want) > 0;
+}
+
+/** 条目时长（毫秒），0 表示未知 */
+function lyricDurMs(item) {
+  const ms = Number(item && item.duration) || 0;
+  return ms > 500 ? ms : 0;
+}
+
+/**
+ * 把翻译并按时间戳插到原文下一行。
+ * 播放器是按行滚的，同一时间戳两行会同时高亮，看起来就是双语字幕。
+ */
+function mergeTranslation(lrc, tlrc) {
+  if (!lrc) return "";
+  if (!tlrc) return lrc;
+  const tmap = {};
+  let n = 0;
+  String(tlrc).split(/\r?\n/).forEach((line) => {
+    const m = line.match(/^\[(\d{1,3}:\d{2}(?:\.\d+)?)\](.*)$/);
+    if (!m) return;
+    const text = decodeLrcEntities(m[2]).trim();
+    if (text) { tmap[m[1]] = text; n++; }
+  });
+  if (!n) return lrc;
+  const out = [];
+  String(lrc).split(/\r?\n/).forEach((line) => {
+    out.push(line);
+    const m = line.match(/^\[(\d{1,3}:\d{2}(?:\.\d+)?)\](.*)$/);
+    if (!m) return;
+    const tr = tmap[m[1]];
+    if (tr && tr !== m[2].trim()) out.push("[" + m[1] + "]" + tr);
+  });
+  return out.join("\n");
+}
+
+/**
+ * 从脏标题里猜「歌名 + 歌手」。
+ * B站 / YouTube 的标题长这样：「【4K】晴天 - 周杰伦 官方MV」「周杰伦 - 晴天 (高音质)」
+ * 不洗干净的话拿去 LRCLIB 搜永远是 0 条。
+ */
+function lyricCleanTitle(rawTitle) {
+  let s = String(rawTitle || "");
+  s = s.replace(/【[^】]*】/g, " ")
+    .replace(/\[[^\]]*\]/g, " ")
+    .replace(/（[^）]*）/g, " ")
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/《([^》]*)》/g, " $1 ")
+    .replace(/「([^」]*)」/g, " $1 ");
+  // 英文营销词
+  s = s.replace(/\b(?:official|lyrics?|video|audio|music|mv|pv|hd|hq|4k|8k|1080p|720p|hi-?res|remaster(?:ed)?|live|cover|feat|ft)\b\.?/gi, " ");
+  // 中文营销词
+  s = s.replace(/官方|正式版|高清|高音质|无损|动态歌词|歌词版|滚动歌词|完整版|修复版|重制版|现场版|翻唱|伴奏|纯享|音质|高清版/gi, " ");
+  s = s.replace(/[_|｜/／·•]+/g, " ");
+  return s.replace(/\s+/g, " ").trim();
+}
+
+function lyricNameArtist(item) {
+  let knownArtist = String((item && item.artist) || "").trim();
+  /* YouTube 的 artist 是频道名，官方发行版频道一律带 " - Topic" 后缀
+     （"周杰倫 - Topic"），不剥掉拿去比对歌手永远对不上。 */
+  knownArtist = knownArtist.replace(/\s*[-–—]\s*Topic\s*$/i, "").trim();
+  let t = lyricCleanTitle(item && item.title);
+  // 标题里常把歌手也写进去：「晴天 周杰伦」
+  if (knownArtist) {
+    const na = lyricCleanTitle(knownArtist);
+    if (na && t !== na) t = t.replace(new RegExp(na.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), " ").trim();
+  }
+  const parts = t.split(/\s+[-–—]\s+/).map((x) => x.trim()).filter(Boolean);
+  let name = t, artist = knownArtist;
+  if (parts.length === 2) {
+    const a = parts[0], b = parts[1];
+    // 哪一边跟已知歌手对得上，另一边就是歌名
+    if (knownArtist && lyricSame(a, knownArtist) && !lyricSame(b, knownArtist)) { artist = a; name = b; }
+    else if (knownArtist && lyricSame(b, knownArtist) && !lyricSame(a, knownArtist)) { artist = b; name = a; }
+    else { name = a; artist = knownArtist || b; }
+  } else if (parts.length > 2) {
+    name = parts[0];
+  }
+  name = name.replace(/\s+/g, " ").trim();
+  if (!name) name = String((item && item.title) || "").trim();
+  return { name: name, artist: artist };
+}
+
+/* ---------- 各通道 ---------- */
+
+/** LRCLIB：公开同步歌词库，中日英覆盖最好 */
+async function lrclibLyric(want, durMs) {
+  /* ⚠️ 带 artist_name 搜召回会明显变窄：LRCLIB 是精确匹配，
+     歌手名写法稍有出入（「周杰伦」vs「周杰倫」、Topic 频道名）就是 0 条。
+     所以带歌手搜空了就脱掉歌手再搜一次，宁可多一次请求。 */
+  const params = { track_name: want.name };
+  if (want.artist) params.artist_name = want.artist;
+  let list = await httpGet(LRCLIB_SEARCH, params, { "User-Agent": LYRIC_UA, Accept: "application/json" });
+  if ((!Array.isArray(list) || !list.length) && want.artist) {
+    list = await httpGet(LRCLIB_SEARCH, { track_name: want.name }, { "User-Agent": LYRIC_UA, Accept: "application/json" });
+  }
+  if (!Array.isArray(list) || !list.length) return "";
+  let best = "", bestScore = -1;
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i] || {};
+    const lrc = c.syncedLyrics || "";
+    if (!lrc || lrc.length < 30) continue;
+    let sc = 0;
+    const ns = lyricNameScore(c.trackName, want.name);
+    if (!ns) continue;
+    sc += ns;
+    if (want.artist && lyricSame(c.artistName, want.artist)) sc += 25;
+    else if (want.artist) sc -= 5;
+    const cd = Number(c.duration) || 0;
+    if (durMs > 0 && cd > 0) {
+      const diff = Math.abs(cd - durMs / 1000);
+      if (diff <= 2) sc += 30;
+      else if (diff <= 5) sc += 18;
+      else if (diff <= 12) sc += 6;
+      else if (diff > 40) sc -= 25;
+    }
+    if (c.instrumental) sc -= 40;
+    if (sc > bestScore) { bestScore = sc; best = lrc; }
+  }
+  /* 阈值不能只判 >0：名字沾边（+20）减掉「歌手不明」的 -5 还是正数，
+     照样会把别人同名的歌交出去。要求至少「名字对上 + 一项旁证」。 */
+  return bestScore >= 25 ? best : "";
+}
+
+/** 网易云官方：按 id 直取，原文 + 翻译一起拿 */
+async function neteaseLyricById(id) {
+  if (!id) return "";
+  const r = await httpGet(NE_LYRIC, { id: id, lv: -1, kv: -1, tv: -1 }, NETEASE_HEADERS);
+  const lrc = (r && r.lrc && r.lrc.lyric) || "";
+  if (!lrcLooksReal(lrc)) return "";
+  const tl = (r && r.tlyric && r.tlyric.lyric) || "";
+  return shouldLyricTranslation() ? mergeTranslation(lrc, tl) : lrc;
+}
+
+/** 网易云官方：按关键词搜一首再取（B站/YouTube 条目没有网易云 id） */
+async function neteaseLyricByQuery(keyword, want, durMs) {
+  const s = await httpPost(NE_SEARCH_PC, { s: keyword, type: 1, limit: 10, offset: 0 },
+    Object.assign({ "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" }, NETEASE_HEADERS));
+  const songs = (s && s.result && s.result.songs) || [];
+  let best = null, bestScore = -1;
+  for (let i = 0; i < songs.length; i++) {
+    const x = songs[i] || {};
+    const artists = ((x.ar || x.artists || []).map((a) => a && a.name).filter(Boolean)).join(" ");
+    let sc = 0;
+    const ns = lyricNameScore(x.name, want.name);
+    if (!ns) continue;
+    sc += ns;
+    if (want.artist && lyricSame(artists, want.artist)) sc += 30;
+    else if (want.artist) sc -= 10;
+    const d = Number(x.dt || x.duration || 0);
+    if (durMs > 0 && d > 0) {
+      const diff = Math.abs(d - durMs) / 1000;
+      if (diff <= 2) sc += 30;
+      else if (diff <= 5) sc += 18;
+      else if (diff <= 12) sc += 6;
+      else if (diff > 40) sc -= 25;
+    }
+    if (sc > bestScore) { bestScore = sc; best = x; }
+  }
+  /* 阈值 30：只有歌名完全对上（40）才够；
+     名字沾边（20）必须再有一条旁证（歌手对上或时长对上）才放行。
+     实测「这首歌根本不存在测试用xxxzzz」曾靠一个「存在」碎片词匹配到
+     汪峰的《存在》，就是这里卡住的。 */
+  if (!best || bestScore < 30) return "";
+  return neteaseLyricById(best.id);
+}
+
+/** QQ 官方：按 songmid 取，带翻译 */
+async function qqLyricByMid(mid) {
+  if (!mid) return "";
+  const r = await httpGet(QQ_LYRIC,
+    { songmid: mid, format: "json", nobase64: 1, g_tk: 5381, loginUin: 0, hostUin: 0, platform: "yqq", needNewCode: 0 },
+    { Referer: "https://y.qq.com/portal/player.html" });
+  let j = r;
+  if (typeof j === "string") {
+    // 这个接口有时候会套一层 callback()
+    const body = j.replace(/^[^{]*\(/, "").replace(/\)\s*$/, "");
+    try { j = JSON.parse(body); } catch (e) { return ""; }
+  }
+  const lrc = decodeLrcEntities((j && j.lyric) || "");
+  if (!lrcLooksReal(lrc)) return "";
+  const tr = decodeLrcEntities((j && j.trans) || "");
+  return (tr && shouldLyricTranslation()) ? mergeTranslation(lrc, tr) : lrc;
+}
+
+/** 酷我官方：按 musicId 直取（COCO 的酷我通道固定 400） */
+async function kuwoLyricById(id) {
+  if (!id) return "";
+  const r = await httpGet(KW_LRC, { musicId: id }, { Referer: "https://www.kuwo.cn/", "User-Agent": UA });
+  const list = (r && r.data && r.data.lrclist) || [];
+  if (!list.length) return "";
+  const lines = [];
+  for (let i = 0; i < list.length; i++) {
+    const text = decodeLrcEntities(String((list[i] && list[i].lineLyric) || "").trim());
+    if (!text) continue;
+    lines.push("[" + lrcTime(list[i].time) + "]" + text);
+  }
+  const txt = lines.join("\n");
+  return lrcLooksReal(txt) ? txt : "";
+}
+
+/** 酷狗 krcs：华语老歌命中率高，返回 base64 的 LRC */
+async function kugouLyricByQuery(keyword, want, durMs) {
+  const s = await httpGet(KG_LRC_SEARCH, { ver: 1, man: "yes", client: "mobi", keyword: keyword }, { "User-Agent": UA });
+  const cands = (s && s.candidates) || [];
+  let best = null, bestScore = -1;
+  for (let i = 0; i < cands.length; i++) {
+    const c = cands[i] || {};
+    let sc = 0;
+    const ns = lyricNameScore(c.song, want.name);
+    if (!ns) continue;
+    sc += ns;
+    if (want.artist && lyricSame(c.singer, want.artist)) sc += 25;
+    else if (want.artist) sc -= 10;
+    const cd = Number(c.duration) || 0;
+    if (durMs > 0 && cd > 0) {
+      const diff = Math.abs(cd - durMs / 1000);
+      if (diff <= 2) sc += 25;
+      else if (diff <= 5) sc += 15;
+      else if (diff > 40) sc -= 25;
+    }
+    if (sc > bestScore) { bestScore = sc; best = c; }
+  }
+  if (!best || bestScore < 30) return "";
+  const d = await httpGet(KG_LRC_DOWNLOAD,
+    { ver: 1, client: "pc", id: best.id, accesskey: best.accesskey, fmt: "lrc", charset: "utf8" },
+    { "User-Agent": UA });
+  const txt = d && d.content ? decodeLrcEntities(b64ToText(d.content)) : "";
+  return lrcLooksReal(txt) ? txt : "";
+}
+
+/** 把条目自身的 id 拿去各平台直取 */
+async function lyricFromOwnSource(provider, item, want, durMs) {
+  const id = String((item && item.id) || "");
+
+  // 咪咕直出：搜索结果里本来就带 lyricUrl
   if (provider === "miguapi") {
-    let u = (musicItem._raw && musicItem._raw.lyricUrl) || "";
+    let u = (item && item._raw && item._raw.lyricUrl) || "";
     if (!u) {
       try {
-        const list = await miguApiSearch((musicItem.title + " " + (musicItem.artist || "")).trim(), 3);
+        const list = await miguApiSearch((want.name + " " + (want.artist || "")).trim(), 3);
         for (let i = 0; i < list.length; i++) {
-          if (list[i].lyricUrl && titleMatch(list[i].title, musicItem.title)) { u = list[i].lyricUrl; break; }
+          if (list[i].lyricUrl && titleMatch(list[i].title, want.name)) { u = list[i].lyricUrl; break; }
         }
-      } catch (e) { /* 落到下面 */ }
+      } catch (e) { /* 落到别处 */ }
     }
     if (u) {
       try {
         const txt = await httpGet(u);
-        // ⚠️ 咪咕有些曲目的 lyricUrl 只返回一句「[00:00.00]暂无歌词」。
-        //    那种不能当成功 —— 直接返回会让用户看到一句假歌词，
-        //    所以继续往下走其他通道。
-        if (typeof txt === "string" && txt.indexOf("[") >= 0 && !/暂无歌词|无歌词|纯音乐/i.test(txt)) {
-          return { rawLrc: txt };
-        }
-      } catch (e) { /* 落到下面 */ }
+        if (lrcLooksReal(txt) && txt.indexOf("[") >= 0) return txt;
+      } catch (e) { /* 落到别处 */ }
     }
+    return "";
   }
 
-  if (provider !== "kuwo") {
-    try {
-      const res = await httpGet(COCO + "/api/lyric", { id: musicItem.id, provider: provider, extra: "" }, cocoHeaders());
-      const lines = (res && res.lines) || [];
-      // 有些平台对无版权/纯音乐只回一句「暂无歌词」，那不算拿到歌词。
-      const real = lines.filter((l) => l && String(l.text || "").trim() && !/暂无歌词|无歌词/i.test(l.text));
-      if (real.length) {
-        return {
-          rawLrc: real.map((l) => {
-            const t = Number(l.time) || 0;
-            const m = Math.floor(t / 60);
-            const sec = t % 60;
-            const ss = (sec < 10 ? "0" : "") + sec.toFixed(2);
-            return "[" + (m < 10 ? "0" + m : m) + ":" + ss + "]" + (l.text || "");
-          }).join("\n"),
-        };
-      }
-    } catch (e) { /* 落到下面 */ }
+  if (provider === "netease") return neteaseLyricById(id);
+  if (provider === "qq") return qqLyricByMid(id);
+  if (provider === "kuwo") return kuwoLyricById(id);
+
+  if (provider === "kugou" || provider === "migu") {
+    // 酷狗/咪咕走 COCO：实测酷狗 63 行、咪咕 0 行（失败就走兜底）
+    const res = await httpGet(COCO + "/api/lyric", { id: id, provider: provider, extra: "" }, cocoHeaders());
+    const lines = (res && res.lines) || [];
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i] || {};
+      const text = String(l.text || "").trim();
+      if (!text || /暂无歌词|无歌词|純音樂|纯音乐/i.test(text)) continue;
+      out.push("[" + lrcTime(l.time) + "]" + text);
+    }
+    const txt = out.join("\n");
+    return lrcLooksReal(txt) ? txt : "";
   }
-  // 酷我或 COCO 没给：用 hi.cn
-  // ⚠️ hi.cn 的酷我通道必须用「歌名 + 歌手」搜，单给歌名召回很差
-  //    （实测 "晴天 周杰伦" 能中，"晴天" 单独搜会 0 条）
-  try {
-    const platform = provider === "kuwo" ? "kuwo" : "wyy";
-    const want = { name: musicItem.title, singer: musicItem.artist };
-    const kws = buildKeywords(want);
+
+  return "";
+}
+
+/** 跨源兜底：LRCLIB → 网易云 → 酷狗 */
+async function lyricFromPublicSources(want, durMs) {
+  const queries = [];
+  const push = (s) => {
+    const v = String(s || "").replace(/\s+/g, " ").trim();
+    if (!v) return;
+    /* 简繁两版都塞：各平台互不通用。
+       实测《原諒我不明白你的悲傷》只有繁体写法能在网易云音乐搜到。 */
+    const vs = zhVariants(v);
+    for (let i = 0; i < vs.length; i++) {
+      const x = vs[i].replace(/\s+/g, " ").trim();
+      if (x && queries.indexOf(x) < 0) queries.push(x);
+    }
+  };
+  if (want.name && want.artist) push(want.name + " " + want.artist);
+  if (want.name) push(want.name);
+
+  // ① LRCLIB（同步歌词质量最好，先试）
+  const lr = await lyricTimeout(lrclibLyric(want, durMs), 9000);
+  if (lr && lrcLooksReal(lr)) return lr;
+
+  // ② 网易云（华语覆盖最全，还带翻译）
+  for (let i = 0; i < queries.length; i++) {
+    const t = await lyricTimeout(neteaseLyricByQuery(queries[i], want, durMs), 9000);
+    if (t && lrcLooksReal(t)) return t;
+  }
+
+  // ③ 酷狗（老歌、冷门翻唱）
+  for (let i = 0; i < queries.length; i++) {
+    const t = await lyricTimeout(kugouLyricByQuery(queries[i], want, durMs), 9000);
+    if (t && lrcLooksReal(t)) return t;
+  }
+  return "";
+}
+
+async function getLyric(musicItem) {
+  const item = musicItem || {};
+  const provider = item._provider || LABEL_TO_PROVIDER[item.platform] || "";
+  const want = lyricNameArtist(item);
+  const durMs = lyricDurMs(item);
+
+  /* ① 本源直取 */
+  if (provider) {
+    try {
+      const t = await lyricTimeout(lyricFromOwnSource(provider, item, want, durMs), 10000);
+      if (t && lrcLooksReal(t)) return { rawLrc: t };
+    } catch (e) { /* 落到兜底 */ }
+  }
+
+  /* ② 跨源兜底（B站/YouTube/JOOX/Apple 全靠这一层） */
+  if (shouldLyricFallback() && want.name) {
+    try {
+      const t = await lyricFromPublicSources(want, durMs);
+      if (t && lrcLooksReal(t)) return { rawLrc: t };
+    } catch (e) { /* 落到 hi.cn */ }
+  }
+
+  /* ③ hi.cn（最后一道，网易云/酷我两路）
+     ⚠️ 酷我通道必须用「歌名 + 歌手」搜，只给歌名召回很差
+        （实测 "晴天 周杰伦" 能中，"晴天" 单独搜 0 条） */
+  const platforms = provider === "kuwo" ? ["kuwo", "wyy"] : ["wyy", "kuwo"];
+  const kws = buildKeywords({ name: want.name, singer: want.artist });
+  for (let p = 0; p < platforms.length; p++) {
     for (let i = 0; i < kws.length; i++) {
       let items = [];
-      try { items = await hiSearch(platform, kws[i], 8); } catch (e) { continue; }
-      const hit = items.find((x) => titleMatch(x.name, musicItem.title));
+      try { items = await hiSearch(platforms[p], kws[i], 8); } catch (e) { continue; }
+      const hit = items.find((x) => lyricNameHit(x.name, want.name));
       if (!hit) continue;
       try {
         const r = await httpPost(HI + "?act=getLyric", {
-          platform: platform, songid: hit.id, time: hit.time, sign: hit.sign,
+          platform: platforms[p], songid: hit.id, time: hit.time, sign: hit.sign,
         }, HI_HEADERS);
         const txt = r && r.data;
-        // 同样要挡「暂无歌词」：长度够但不含任何时间轴 + 有效内容
-        if (typeof txt === "string" && txt.length > 10 && !/暂无歌词|无歌词/i.test(txt)) {
-          return { rawLrc: txt };
-        }
+        if (typeof txt === "string" && lrcLooksReal(txt)) return { rawLrc: txt };
       } catch (e) { /* 试下一个关键词 */ }
     }
-    return { rawLrc: "" };
-  } catch (e) {
-    return { rawLrc: "" };
   }
+  return { rawLrc: "" };
 }
 
 /* ============================================================
@@ -6866,7 +7333,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.13",
+  version: "4.9.14",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
@@ -6954,6 +7421,16 @@ module.exports = {
       key: "sortByCompleteness",
       name: "按完整度排序（默认开）",
       hint: "填 1 开启、0 关闭。开启后搜索结果先按「是不是你要的那首歌」排，同一首歌里则完整的在前、试听和时长未知的沉底。关掉就回到各平台轮流交替的原始顺序。",
+    },
+    {
+      key: "lyricOnline",
+      name: "在线歌词兜底（默认开）",
+      hint: "填 1 开启、0 关闭。开启后本源没歌词（B站 / YouTube / JOOX / Apple 本身没有歌词库）或只回「暂无歌词」时，会按歌名+歌手+时长去 LRCLIB、网易云、酷狗反查。网易云命中时原文和翻译按同一时间戳并排显示。关掉就只用当前平台自己的歌词。",
+    },
+    {
+      key: "lyricTranslation",
+      name: "歌词显示译文（默认开）",
+      hint: "填 1 开启、0 关闭。开启后网易云 / QQ 有官翻的曲子会把译文插在原文下一行（同一时间戳），播放器滚词就是双语字幕。关掉只显示原文。",
     },
     {
       key: "jooxCookie",
