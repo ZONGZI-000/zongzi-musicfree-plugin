@@ -4,6 +4,22 @@
 
 八平台聚合的音乐源插件，支持单曲 / 专辑 / 歌手 / 歌单四类搜索，取流自动跨平台兜底。
 
+## 关于 MusicFree
+
+[MusicFree](https://github.com/maotoumao/MusicFree) 是一个开源、免费、无广告的音乐播放器，本身不内置任何音源——搜索和播放能力全靠插件提供。播放器只负责界面、播放队列、歌词、音效和下载，插件负责「歌从哪来」。这个仓库就是给它写的一个音源插件。
+
+| 项 | 说明 |
+|---|---|
+| 主页 | https://musicfree.catcat.work |
+| 源码 | [Android 版](https://github.com/maotoumao/MusicFree) · [桌面版](https://github.com/maotoumao/MusicFreeDesktop)（Electron） |
+| 开源协议 | AGPL-3.0 |
+| 运行平台 | Android（arm64 / armv7 / x86 / universal APK）· Windows / macOS / Linux |
+| 官方插件库 | [maotoumao/MusicFreePlugins](https://github.com/maotoumao/MusicFreePlugins)（本插件不在其中，需手动安装） |
+
+插件需要实现的接口只有几个：搜索（单曲 / 专辑 / 歌手 / 歌单）、`getMediaSource` 取播放地址、`getLyric` 取歌词，另外可选实现推荐页 `getRecommendSheetTags` / `getRecommendSheetsByTag` 和榜单页。只要能把某个平台的歌曲信息映射成 MusicFree 的数据结构，它就能出现在搜索和播放里——这也是这类插件能同时接好几个平台的原因。
+
+本插件用的是 CommonJS 写法（`module.exports = { platform, version, srcUrl, getMediaSource, ... }`），文件由播放器直接拉取执行，不经应用商店；`srcUrl` 指向本仓库固定地址，所以播放器里能「检查更新」。
+
 ## 安装
 
 MusicFree → 设置 → 插件 → 从网络安装，粘贴：
@@ -35,6 +51,21 @@ https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/vers
 主目录只留一个固定名 `zongzimusic.js`（永远是最新版，也是 `srcUrl` 指向的地址），避免根目录越堆越乱。
 
 `zongzi.js` 仍会同步一份最新内容，只为兼容还没更新到 v4.9.20 的旧安装——等大家都迁过去就会停掉。
+
+## 在 MusicFree 里能用到什么
+
+装上之后，播放器里会出现一个叫「粽子音源」的插件，四个页面都能用上：
+
+| 位置 | 效果 |
+|---|---|
+| 搜索 | 单曲 / 专辑 / 歌手 / 歌单四类都能搜，同一平台多个结果自动去重合并 |
+| 推荐页 | 每天一张《拼好歌》，按分类（华语 / 古风 / 爵士 / 深夜 / 治愈 / 钢琴 / 说唱 / R&B）轮换 |
+| 榜单页 | 各平台热歌榜、新歌榜 |
+| 播放 | 取流时按你选的音质跨平台兜底：128k / 320k / 无损，取不到就往下退 |
+| 歌词 | 优先用原平台歌词，缺的从 LRCLIB 等公开歌词库补，带时间轴 |
+| 下载 | 用播放器自带的下载功能，插件只提供地址不落盘 |
+
+音效、倍速、淡入淡出、悬浮歌词这些是播放器自己的功能，跟插件无关。
 
 ## 每日推荐 · 拼好歌
 
