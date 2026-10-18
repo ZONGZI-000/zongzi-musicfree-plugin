@@ -22,6 +22,16 @@ https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/zongzi.js
 
 > 必须版本号变大才会更新（App 用 `compare(oldVersion, newVersion, ">")` 判断）。
 
+## 历史版本
+
+所有旧版都放在 `versions/` 文件夹里，文件名是 `zongzi-<版本号>.js`，要装特定版本直接换地址：
+
+```
+https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/versions/zongzi-4.9.18.js
+```
+
+主目录只留一个固定名 `zongzi.js`（永远是最新版，也是 `srcUrl` 指向的地址），避免根目录越堆越乱。
+
 ## 包含的平台
 
 | 平台 | 说明 |
