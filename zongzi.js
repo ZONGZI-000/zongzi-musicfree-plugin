@@ -8100,8 +8100,22 @@ async function searchMusicAll(query, page) {
     return f1 && f1 === flatTitle(query) && f1.length >= 2;
   });
   let appleCat = null;
-  if (artistQuery || artistHits >= 2 || !exactTitleHit) {
-    appleCat = await appleArtistCatalog(query);
+  /* ⚠️ 组合查询（「晴天 周杰伦」）也要能用上 Apple 目录。
+     直接拿整串去问当然不行 —— Apple 里没有叫「晴天周杰伦」的歌手。
+     所以：组合查询时把「歌手那一半」拎出来问。
+     怎么拎：结果是按「歌名 + 歌手」写的，取最后一个词当歌手名
+     （中文习惯「歌名 歌手」，英文也多是这个顺序）。
+     查到之后**只用来打分/白名单，不用来删条目** —— 删的条件里
+     写死了 artistQuery，组合查询不会命中，不会误杀。
+     这样《晴天》的原唱条目能拿到 trackHit=45，
+     而「晴天(深情版)」这类反而因为不在目录里被压到 -60。 */
+  let appleQuery = query;
+  if (!artistQuery && queryHasSpace) {
+    const parts = String(query).trim().split(/\s+/);
+    if (parts.length >= 2) appleQuery = parts[parts.length - 1];
+  }
+  if (artistQuery || artistHits >= 2 || !exactTitleHit || (appleQuery !== query)) {
+    appleCat = await appleArtistCatalog(appleQuery);
     if (appleCat) {
       console.log("[粽子] Apple 目录「" + appleCat.name + "」"
         + appleCat.albums.length + " 张专辑 / " + appleCat.tracks.length + " 首");
