@@ -5419,7 +5419,15 @@ async function neteaseSheetDetail(playlistId, page, maxTracks) {
   // 补齐 trackIds 里还没拿到元数据的那部分（一次最多 100 个）
   const have = {};
   for (let i = 0; i < musicList.length; i++) have[musicList[i].id] = 1;
-  const allIds = ((p.trackIds) || []).map((x) => x.id).filter((id) => id && !have[String(id)]);
+  /* ⚠️ 补齐量必须卡在 cap 以内。playlist/detail 只返前 10 首完整曲目 +
+     全量 trackIds；若按 trackIds 全量补，一张 200 首的歌单会发 2 次请求、
+     拉回 200 首 —— 而拼单每张源歌单只要 50 首，等于白跑 4 倍。
+     拼单要拼 4 张源歌单 + 1 张反差歌单，累计几十次多余请求，
+     手机上就表现为详情页一直转圈进不去。 */
+  const allIds = ((p.trackIds) || [])
+    .map((x) => x.id)
+    .filter((id) => id && !have[String(id)])
+    .slice(0, Math.max(0, cap - musicList.length));
   for (let i = 0; i < allIds.length; i += 100) {
     const chunk = allIds.slice(i, i + 100);
     try {
@@ -6008,6 +6016,10 @@ const DZ_COVER_CACHE = {};
    没画的分类继续用 Deezer 的图兜底，不会出现空封面。 */
 const COVER_CDN = "https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/covers/";
 const MIX_COVERS = {
+  /* 「全部」是推荐页的「热门」tag，不是某个曲风，暂时复用最像合集的 R&B 那张
+     （黄昏城市 + 拼图块）。等出图额度恢复再单独画一张多曲风混拼的。 */
+  "全部": ["rnb.jpg"],
+  "热门": ["rnb.jpg"],
   "华语": ["huayu.jpg"],
   "古风": ["gufeng.jpg", "gufeng2.jpg"],
   "爵士": ["jazz.jpg"],
@@ -6126,7 +6138,12 @@ const MIX_SOURCE_NOTE = "曲目取自网易云、QQ 音乐等平台的公开歌�
 async function dzCovers(cat) {
   const key = cat || "全部";
   const own = MIX_COVERS[key];
-  if (own && own.length) return own.map((f) => COVER_CDN + f);
+  /* 一个分类画了几张就轮着用，按天换：今天 ① 用 A、明天 ① 用 B，
+     同一天里内容不跳，跨天才换 —— 不是「主图 + 备用」，几张地位一样。 */
+  if (own && own.length) {
+    const off = recDayKey() % own.length;
+    return own.map((_, k) => COVER_CDN + own[(off + k) % own.length]);
+  }
   const hit = DZ_COVER_CACHE[key];
   if (hit && Date.now() - hit.at < DZ_COVER_TTL) return hit.v;
   /* 降级链：分类词 → 泛流派词 → 空。宁可没图，也不能卡住整页。 */
@@ -6187,20 +6204,22 @@ async function mixEntries(cat, fallbackArt) {
 }
 
 /** 从某分类的当天池子里挑几张源歌单，把它们的前 N 首收成候选曲库 */
-async function mixSourceSongs(cat, day, seq, skipOrigin) {
+async function mixSourceSongs(cat, day, seq, skipOrigin, opts) {
+  const nSheets = (opts && opts.sheets) || MIX_SRC_SHEETS;
+  const nLimit = (opts && opts.limit) || MIX_SRC_LIMIT;
   const pool = await recSheetPool(cat);
   if (!pool.length) return [];
   const ordered = recDayOrder(pool, "mix|" + cat + "|" + seq, Math.floor(day / 30));
   /* 优先网易（取流最稳），不够再补 QQ */
   const ne = ordered.filter((x) => x.platform === "网易云" || x._provider === "netease");
   const qq = ordered.filter((x) => x._provider === "qq");
-  const picks = ne.slice(0, MIX_SRC_SHEETS).concat(qq.slice(0, MIX_SRC_SHEETS)).slice(0, MIX_SRC_SHEETS);
+  const picks = ne.slice(0, nSheets).concat(qq.slice(0, nSheets)).slice(0, nSheets);
 
   const jobs = picks.map((p) => {
     if (p._provider === "qq") {
-      return qqSheetDetail(p.id, 1).then((r) => ((r && r.musicList) || []).slice(0, MIX_SRC_LIMIT));
+      return qqSheetDetail(p.id, 1).then((r) => ((r && r.musicList) || []).slice(0, nLimit));
     }
-    return neteaseSheetDetail(p.id, 1, MIX_SRC_LIMIT).then((r) => ((r && r.musicList) || []).slice(0, MIX_SRC_LIMIT));
+    return neteaseSheetDetail(p.id, 1, nLimit).then((r) => ((r && r.musicList) || []).slice(0, nLimit));
   });
   const arrs = await Promise.all(jobs.map((j) => j.catch(() => [])));
   const seen = {};
@@ -6266,17 +6285,26 @@ async function mixSheetDetail(recipe) {
   const seq = recipe.seq || 1;
   const seed = ((day * 2654435761) ^ recHash("mix|" + cat + "|" + seq)) >>> 0;
 
-  const songs = await mixSourceSongs(tag, day, seq);
+  /* 主体和反差歌的取数互不依赖，必须并发。
+     串行的话就是「4 张源歌单 → 再 4 张反差歌单」两波网络往返，
+     手机上点进详情要等十秒以上（表现为一直转圈）。
+     反差歌只要一首，所以给它 1 张歌单、20 首候选就够，不用整份拉。
+     ⚠️ 用 allSettled 而不是 all：反差歌挂了不能让整张拼单跟着失败。 */
+  const far = MIX_CONTRAST[cat] || "爵士";
+  const both = await Promise.all([
+    mixSourceSongs(tag, day, seq),
+    mixSourceSongs(far, day, seq + 7, null, { sheets: 1, limit: 20 }).catch(() => []),
+  ]);
+  const songs = both[0];
+  const farPool = both[1];
   if (!songs.length) throw new Error("拼单：源曲库为空");
 
-  /* 反差歌：从「离得最远」的分类里拿一首，且不能是已经在单里的歌手 */
+  /* 反差歌：不能是已经在单里的歌手 */
   let contrast = null;
   try {
-    const far = MIX_CONTRAST[cat] || "爵士";
-    const pool = await mixSourceSongs(far, day, seq + 7);
     const used = {};
     songs.forEach((s) => { used[normText(splitSingers(s.artist)[0] || "")] = 1; });
-    const cand = pool.filter((s) => !used[normText(splitSingers(s.artist)[0] || "")]);
+    const cand = farPool.filter((s) => !used[normText(splitSingers(s.artist)[0] || "")]);
     if (cand.length) contrast = cand[day % cand.length];
   } catch (e) { /* 拿不到反差歌就少一首，不影响整张 */ }
 
@@ -9400,7 +9428,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.30",
+  version: "4.9.31",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。v4.9.25 接入 B 站鬼畜区：搜索并上 tids=119，榜单页多一组「B站鬼畜」，不进推荐页。v4.9.26 鬼畜取消整体下沉，按匹配度正常排序（原唱仍靠权威目录排第一）。v4.9.27 修 B 站播两秒跳歌：取流地址必须带 Referer，且改为整首预下载；同时修 48kbps 音源被误判成试听片段。",
