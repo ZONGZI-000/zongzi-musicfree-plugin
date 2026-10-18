@@ -7,7 +7,13 @@
 MusicFree → 设置 → 插件 → 从网络安装，粘贴：
 
 ```
-https://gitee.com/zongziiiiiiiiiiiiiiiiiiiiiiiiiiii/zongzi-musicfree-plugin/raw/master/zongzi.js
+https://gitee.com/zongziiiiiiiiiiiiiiiiiiiiiiiiiiii/zongzi-musicfree-plugin/raw/master/zongzi-4.9.8.js
+```
+
+Gitee 会间歇性对 js 文件返回 451「内容违规」，那种时候换 GitHub 镜像：
+
+```
+https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/zongzi-4.9.8.js
 ```
 
 ## 更新

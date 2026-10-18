@@ -59,10 +59,39 @@ else
 fi
 rm -f "$REMOTE_TMP"
 
+echo "==> 5/5 同步到 GitHub（Gitee 被风控时的备用源）"
+# Gitee 会间歇性对 js 返回 451「内容违规」，那一版在 Gitee 上就彻底死了。
+# GitHub 不做这层人工审核，所以每次发版都镜像一份，Gitee 挂了还能从这边装。
+GH_USER="ZONGZI-000"
+GH_REPO="zongzi-musicfree-plugin"
+GH_URL="https://raw.githubusercontent.com/$GH_USER/$GH_REPO/master/zongzi-$VERSION.js"
+cp -f "$OUT" "D:/workspace/zongzi-musicfree-plugin/zongzi-$VERSION.js"
+cd "D:/workspace/zongzi-musicfree-plugin"
+git add -A
+if git diff --cached --quiet; then
+  echo "    没有新改动，跳过提交"
+else
+  git -c user.name="zongzi" -c user.email="mr.zongzi666@gmail.com" commit -q -m "v$VERSION: $MSG" || true
+  git push -q origin master || echo "    ⚠️  推送失败（检查网络/凭据），Gitee 那份仍然可用"
+  echo "    ✅ 已推送"
+fi
+# 和 Gitee 一样：状态码 200 不代表内容对，必须比版本号
+GH_TMP=$(mktemp)
+curl -sL -m 60 "$GH_URL?nocache=$(date +%s)" -o "$GH_TMP" || true
+GH_VER=$(grep -oE 'version: "[0-9.]+"' "$GH_TMP" 2>/dev/null | tail -1 | grep -oE '[0-9.]+' || echo "?")
+if [ "$GH_VER" = "$VERSION" ]; then
+  echo "    ✅ GitHub 镜像可下载 (v$GH_VER)"
+else
+  echo "    ⚠️  GitHub 镜像版本读不到（$GH_VER），稍后再核实"
+fi
+rm -f "$GH_TMP"
+
 echo ""
 echo "✅ 发版完成 v$VERSION"
 echo ""
-echo "MusicFree 安装/更新地址："
+echo "MusicFree 安装/更新地址（主）："
 echo "   $URL"
+echo "备用（GitHub 镜像，Gitee 被 451 时用这个）："
+echo "   $GH_URL"
 echo ""
 echo "去 MusicFree → 插件 → 粽子音源 → 检查更新"
