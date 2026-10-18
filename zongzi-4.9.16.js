@@ -588,7 +588,7 @@ async function verifyPlayable(url, extraHeaders) {
 
 /** 「只给了试听片段」判据
  *
- *  实测（2026-10-18）：QQ 音乐对 VIP 曲目会返回 200 正常、魔数是 MP3 的地址，
+ *  实测（2026-10-18）：QQ 音乐对部分会员曲目会返回 200 正常、魔数是 MP3 的地址，
  *  但整段只有 60 秒。《晴天》时长 269s，拿到的文件只有 960887 字节，
  *  折合 3.5 KB/s（≈28kbps）—— 连 48kbps 都装不下，只能是片段。
  *  旧代码只验「能不能播」，于是把它当成功返回，跨平台兜底根本没机会上场。
@@ -5378,6 +5378,343 @@ async function neteaseTopListGroups() {
   return groups.filter((g) => g.data && g.data.length);
 }
 
+/* ============================================================
+ * Apple Music 榜单（官方 Marketing Tools 公开接口）
+ *
+ * https://rss.applemarketingtools.com/api/v2/<区>/music/most-played/100/songs.json
+ *
+ * 为什么值得接进来：不用登录、不用 key、不是逆向，是苹果自己给
+ * 「营销工具」用的公开 feed。字段有歌名 / 歌手 / 封面 / 发行日期 /
+ * 专辑 id / 歌曲 id，一次 100 首。缺点是不给时长和专辑名 ——
+ * 这两样用一次 itunes lookup 批量补（100 个 id 一次给全，约 1 秒）。
+ *
+ * ⚠️ 实测延迟不稳定：cn 3~5s、us 有时 20s 超时、tw/de 偶尔 502。
+ *    所以榜单入口**不预拉数据**，只放静态的地区条目，点进去才请求 ——
+ *    否则「榜单」页每次打开都要等好几秒，体验还不如不做。
+ *    拉到的结果缓存 30 分钟，反复进出不重复打苹果。
+ * ============================================================ */
+const APPLE_CHART_BASE = "https://rss.applemarketingtools.com/api/v2";
+
+/** 参与的地区。只挑华语用户真的会看的，全上会让榜单页太长 */
+const APPLE_CHART_REGIONS = [
+  ["cn", "中国"], ["hk", "香港"], ["tw", "台湾"], ["jp", "日本"],
+  ["kr", "韩国"], ["us", "美国"], ["gb", "英国"], ["sg", "新加坡"],
+];
+
+/** 专辑榜 / 歌单榜只做这三个区（再多就是摆设了） */
+const APPLE_CHART_ALBUM_REGIONS = [["cn", "中国"], ["us", "美国"], ["jp", "日本"]];
+
+const APPLE_CHART_CACHE = {};
+const APPLE_CHART_TTL = 30 * 60 * 1000;
+
+function shouldUseAppleChart() {
+  try {
+    const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
+    const v = vars.useAppleChart;
+    if (v === undefined || v === null || v === "") return true;
+    return !(v === "0" || v === "false" || v === "off");
+  } catch (e) { return true; }
+}
+
+/** 带重试的 Apple 榜单请求。单次 8s，失败再来一次 —— 苹果这边超时是常态 */
+async function appleChartRaw(cc, kind, limit) {
+  const ck = cc + ":" + kind + ":" + limit;
+  const hit = APPLE_CHART_CACHE[ck];
+  if (hit && Date.now() - hit.at < APPLE_CHART_TTL) return hit.v;
+
+  const url = APPLE_CHART_BASE + "/" + cc + "/music/most-played/" + limit + "/" + kind + ".json";
+  let out = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await axios_1.get(url, {
+        timeout: 8000,
+        headers: { "User-Agent": UA },
+        validateStatus: () => true,
+      });
+      if (r && r.status === 200 && r.data && r.data.feed) { out = r.data.feed; break; }
+    } catch (e) { /* 换一次重试 */ }
+  }
+  if (out) APPLE_CHART_CACHE[ck] = { at: Date.now(), v: out };
+  return out;
+}
+
+/** 批量补时长 + 专辑名。查不到就算了，不影响列表出来 */
+async function appleChartMeta(cc, ids) {
+  const meta = {};
+  if (!ids || !ids.length) return meta;
+  try {
+    const r = await axios_1.get("https://itunes.apple.com/lookup", {
+      params: { id: ids.join(","), country: cc, entity: "song", limit: 200 },
+      timeout: 10000,
+      headers: { "User-Agent": UA },
+      validateStatus: () => true,
+    });
+    const res = (r && r.data && r.data.results) || [];
+    for (let i = 0; i < res.length; i++) {
+      const x = res[i];
+      if (x && x.kind === "song" && x.trackId) meta[String(x.trackId)] = x;
+    }
+  } catch (e) { /* 用榜单自带字段顶上 */ }
+  return meta;
+}
+
+/** 热门歌曲榜 → 可播放列表 */
+async function appleChartSongList(cc, limit) {
+  const feed = await appleChartRaw(cc, "songs", limit);
+  const list = (feed && feed.results) || [];
+  if (!list.length) return [];
+  const meta = await appleChartMeta(cc, list.map((x) => x.id));
+  const out = [];
+  for (let i = 0; i < list.length; i++) {
+    const x = list[i] || {};
+    const m = meta[String(x.id)] || {};
+    if (!x.name) continue;
+    out.push({
+      id: "apsong:" + cc + ":" + x.id,
+      platform: "Apple Music",
+      title: x.name,
+      artist: x.artistName || "",
+      album: m.collectionName || "",
+      artwork: String(x.artworkUrl100 || "").replace("100x100", "600x600"),
+      duration: Number(m.trackTimeMillis || 0),
+      _provider: "apple",
+    });
+  }
+  return out;
+}
+
+/* ---------- Apple 网页结构（专辑 / 歌单的曲目表） ----------
+ *
+ * itunes lookup 对**一部分**专辑直接返回 0 首（实测《太阳之子》
+ * 五个区都查不到曲目，而专辑页明明有 13 首）；对歌单更是根本不支持
+ * （pl.xxx 传进 lookup 直接 400）。所以曲目表改从网页里读：
+ * music.apple.com 的页面内嵌一段 <script id="serialized-server-data">，
+ * 里面是完整 JSON，曲目在 itemKind 为 trackLockup 的 section 里，
+ * 带标题 / 时长 / 歌手 / 专辑 / 封面 / 歌曲 id。实测专辑 13 首、
+ * 歌单 98 首全部完整，一次请求 2 秒。
+ */
+async function applePageData(cc, kind, pageId) {
+  const url = "https://music.apple.com/" + cc + "/" + kind + "/" + pageId;
+  try {
+    const r = await axios_1.get(url, {
+      timeout: 12000,
+      headers: { "User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9" },
+      validateStatus: () => true,
+      responseType: "text",
+    });
+    if (!r || r.status !== 200) return null;
+    const m = String(r.data).match(/<script[^>]*id="serialized-server-data"[^>]*>([\s\S]*?)<\/script>/);
+    if (!m) return null;
+    return JSON.parse(m[1]);
+  } catch (e) {
+    console.log("[粽子] Apple 页面解析失败: " + e.message);
+    return null;
+  }
+}
+
+/** Apple 的封面 url 带 {w}x{h} 占位符，换成实际尺寸 */
+function appleArtUrl(it) {
+  const d = (it && it.artwork && it.artwork.dictionary) || {};
+  const u = String(d.url || "");
+  if (!u) return "";
+  return u.replace("{w}", "600").replace("{h}", "600").replace("{f}", "jpg");
+}
+
+/** 从页面 JSON 里把曲目捞出来（专辑页和歌单页结构一致） */
+function applePageTracks(json) {
+  const page = (json && json.data && json.data[0] && json.data[0].data) || {};
+  const secs = page.sections || [];
+  const out = [];
+  let pageTitle = "";
+  let pageArtist = "";
+  let pageArt = "";
+  for (let s = 0; s < secs.length; s++) {
+    const sec = secs[s] || {};
+    const items = sec.items || [];
+    if (!pageTitle && sec.itemKind === "containerDetailHeaderLockup" && items.length) {
+      const h = items[0] || {};
+      pageTitle = h.title || pageTitle;
+      pageArtist = ((h.subtitleLinks || [])[0] || {}).title || pageArtist;
+      pageArt = appleArtUrl(h);
+    }
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i] || {};
+      const tid = String(it.id || "");
+      if (tid.indexOf("track-lockup") < 0) continue;
+      if (!it.title) continue;
+      const parts = tid.split(" - ");
+      out.push({
+        songId: parts.length >= 3 ? parts[parts.length - 1] : "",
+        name: it.title,
+        artist: ((it.subtitleLinks || [])[0] || {}).title || "",
+        album: ((it.tertiaryLinks || [])[0] || {}).title || "",
+        dur: Number(it.duration || 0),
+        artwork: appleArtUrl(it),
+      });
+    }
+  }
+  return { title: pageTitle, artist: pageArtist, artwork: pageArt, tracks: out };
+}
+
+/** 榜单入口的静态条目（不联网，秒开） */
+function appleChartEntries() {
+  const groups = [];
+  const songs = [];
+  for (let i = 0; i < APPLE_CHART_REGIONS.length; i++) {
+    const cc = APPLE_CHART_REGIONS[i][0];
+    const name = APPLE_CHART_REGIONS[i][1];
+    songs.push({
+      id: "apchart:" + cc + ":songs",
+      platform: "Apple Music",
+      title: "Apple " + name + " · 热门歌曲 100",
+      artist: "Apple Music 官方榜",
+      artwork: "",
+      worksNum: 100,
+      description: "每日更新 · 该地区播放量最高",
+      _provider: "apple",
+    });
+  }
+  groups.push({ title: "Apple Music 热门歌曲", data: songs });
+
+  const extra = [];
+  for (let i = 0; i < APPLE_CHART_ALBUM_REGIONS.length; i++) {
+    const cc = APPLE_CHART_ALBUM_REGIONS[i][0];
+    const name = APPLE_CHART_ALBUM_REGIONS[i][1];
+    extra.push({
+      id: "apchart:" + cc + ":albums",
+      platform: "Apple Music",
+      title: "Apple " + name + " · 热门专辑 50",
+      artist: "Apple Music 官方榜",
+      artwork: "",
+      worksNum: 50,
+      description: "每日更新",
+      _provider: "apple",
+    });
+    extra.push({
+      id: "apchart:" + cc + ":playlists",
+      platform: "Apple Music",
+      title: "Apple " + name + " · 热门歌单 50",
+      artist: "Apple Music 官方榜",
+      artwork: "",
+      worksNum: 50,
+      description: "每日更新 · 编辑精选",
+      _provider: "apple",
+    });
+  }
+  if (extra.length) groups.push({ title: "Apple Music 专辑 / 歌单榜", data: extra });
+  return groups;
+}
+
+/** 榜单详情：按 id 里的类型分流 */
+async function appleChartDetail(topListItem) {
+  const id = String((topListItem && topListItem.id) || "");
+  const parts = id.split(":");
+  const cc = parts[1] || "cn";
+  const kind = parts[2] || "songs";
+
+  if (kind === "songs") {
+    const musicList = await appleChartSongList(cc, 100);
+    return { isEnd: true, musicList: musicList };
+  }
+
+  const feed = await appleChartRaw(cc, kind, 50);
+  const list = (feed && feed.results) || [];
+  const art = (x) => String((x && x.artworkUrl100) || "").replace("100x100", "600x600");
+
+  if (kind === "albums") {
+    return {
+      isEnd: true,
+      musicList: list.filter((x) => x && x.name).map((x) => ({
+        id: "apalbum:" + cc + ":" + x.id,
+        platform: "Apple Music",
+        title: x.name,
+        artist: x.artistName || "",
+        album: x.name || "",
+        artwork: art(x),
+        date: x.releaseDate || "",
+        _provider: "apple",
+        _kind: "album",
+      })),
+    };
+  }
+
+  /* 歌单榜：条目本身就是一张歌单，点进去走 getMusicSheetInfo 的 apple 分支 */
+  return {
+    isEnd: true,
+    musicList: list.filter((x) => x && x.name).map((x) => ({
+      id: "applaylist:" + cc + ":" + x.id,
+      platform: "Apple Music",
+      title: x.name,
+      artist: "Apple Music",
+      album: "",
+      artwork: art(x),
+      date: x.releaseDate || "",
+      _provider: "apple",
+      _kind: "sheet",
+    })),
+  };
+}
+
+
+/* ---------- Apple 曲目表 → 可播放条目 ----------
+ * Apple 的页面里只有元数据，音频还得靠跨平台兜底（_provider: "apple"，
+ * 走 resolveMediaSource 的兜底链路）。和「Apple 目录占位专辑」那段一样，
+ * 先用 YouTube 找一遍 —— 找到了直接标 YouTube，播放时省一次兜底搜索。
+ * 并发 4 路，13 首大约 3 秒；串行要十几秒，点进去像卡死了。
+ */
+async function appleTracksToPlayable(tracks, artist, artwork, albumTitle) {
+  const out = new Array(tracks.length);
+  let idx = 0;
+  const worker = async () => {
+    while (idx < tracks.length) {
+      const i = idx++;
+      const t = tracks[i];
+      let ytHit = null;
+      try {
+        const list = await ytSearchRaw(t.name + " " + (t.artist || artist || ""));
+        const tn = normTextZ(t.name);
+        if (tn) {
+          let best = null, bestSc = -Infinity;
+          for (let j = 0; j < (list || []).length; j++) {
+            const y = list[j];
+            const yn = normTextZ(y.title || "");
+            if (!yn || yn.indexOf(tn) < 0) continue;
+            let sc = 0;
+            if (/[-–—]\s*Topic$/i.test(String(y.artist || ""))) sc += 60;
+            if (yn === tn) sc += 40;
+            else sc -= (yn.length - tn.length);
+            const sec = ytDurSec(y.durationText);
+            if (sec > 0 && t.dur > 0) {
+              const d = Math.abs(sec - Math.round(t.dur / 1000));
+              sc += d <= 12 ? 30 : (d <= 40 ? 5 : -80);
+            }
+            if (/live|現場|现场|演唱會|演唱会|翻唱|cover|remix|伴奏|純享|纯享/i.test(y.title || "")) sc -= 50;
+            if (sc > bestSc) { bestSc = sc; best = y; }
+          }
+          if (best && bestSc > -60) ytHit = best;
+        }
+      } catch (e) { /* 单首失败不影响别的 */ }
+
+      const ySec = ytHit ? ytDurSec(ytHit.durationText) : 0;
+      out[i] = {
+        id: ytHit ? String(ytHit.id) : "",
+        platform: ytHit ? "YouTube" : "Apple Music",
+        title: t.name,
+        artist: t.artist || artist || "",
+        album: t.album || albumTitle || "",
+        artwork: t.artwork || artwork || "",
+        duration: ySec > 0 ? ySec * 1000 : Number(t.dur || 0),
+        _provider: ytHit ? "yt" : "apple",
+      };
+    }
+  };
+  const n = Math.min(4, Math.max(1, tracks.length));
+  const ws = [];
+  for (let k = 0; k < n; k++) ws.push(worker());
+  await Promise.all(ws);
+  return out;
+}
+
 /* ---------- 专辑详情 ---------- */
 async function getAlbumDetail(albumItem, page) {
   const id = albumItem && albumItem.id;
@@ -5386,6 +5723,34 @@ async function getAlbumDetail(albumItem, page) {
   /* Apple Music 目录占位专辑：平台没这张唱片，但用户点了得有东西看。
      曲目表从 Apple 的歌手目录里按专辑名捞，再用 YouTube 找可播放的音频 ——
      找到了就能听，找不到至少知道这张专辑有哪几首。 */
+  /* Apple 榜单里的专辑（apalbum:<区>:<专辑id>）：曲目直接读专辑页，
+     因为 itunes lookup 对一部分专辑返回 0 首（实测《太阳之子》五个区全空）。 */
+  if (String(id).indexOf("apalbum:") === 0) {
+    const parts = String(id).split(":");
+    const cc = parts[1] || "cn";
+    const albumId = parts[2] || "";
+    const json = await applePageData(cc, "album", albumId);
+    const parsed = applePageTracks(json);
+    const tracks = parsed.tracks || [];
+    const musicList = tracks.length
+      ? await appleTracksToPlayable(tracks, parsed.artist || albumItem.artist, parsed.artwork || albumItem.artwork, parsed.title || albumItem.title)
+      : [];
+    return {
+      isEnd: true,
+      albumItem: {
+        id: String(id),
+        platform: "Apple Music",
+        title: parsed.title || albumItem.title || "",
+        artist: parsed.artist || albumItem.artist || "",
+        artwork: parsed.artwork || albumItem.artwork || "",
+        date: albumItem.date || "",
+        description: "",
+        worksNum: musicList.length || Number(albumItem.worksNum || 0),
+      },
+      musicList: musicList,
+    };
+  }
+
   if (albumItem._provider === "apple" || String(id).indexOf("apple:") === 0) {
     const parts = String(id).split(":");
     const artistId = parts[1] || "";
@@ -7583,6 +7948,11 @@ module.exports = {
       hint: "填 1 开启、0 关闭。开启后网易云 / QQ 有官翻的曲子会把译文插在原文下一行（同一时间戳），播放器滚词就是双语字幕。关掉只显示原文。",
     },
     {
+      key: "useAppleChart",
+      name: "Apple Music 榜单（默认开）",
+      hint: "填 1 开启、0 关闭。接入苹果官方公开的 Marketing Tools 榜单 feed（不用登录、不用 key），榜单页会多出「Apple 热门歌曲」8 个地区 × 100 首，以及中国/美国/日本的热门专辑和歌单各 50 张。曲目和封面直接来自苹果，音频走跨平台兜底。",
+    },
+    {
       key: "jooxCookie",
       name: "JOOX Cookie（可选）",
       hint: "登录 joox.com 后，把浏览器里 joox.com 域下的全部 cookie 粘进来（含 session_key / user_type / wmid 等 HttpOnly 项）。留空则 JOOX 不参与。",
@@ -7594,6 +7964,34 @@ module.exports = {
   getAlbumInfo: getAlbumDetail,
   getMusicSheetInfo: async function (sheetItem, page) {
     if (!sheetItem) return null;
+    /* Apple 榜单里的歌单（applaylist:<区>:<pl.xxx>）：
+       itunes lookup 对 pl. 开头的 id 直接 400，所以读歌单网页
+       里内嵌的 serialized-server-data（实测 98 首完整，2 秒）。 */
+    if (String(sheetItem.id || "").indexOf("applaylist:") === 0) {
+      const parts = String(sheetItem.id).split(":");
+      const cc = parts[1] || "cn";
+      const plId = parts[2] || "";
+      const json = await applePageData(cc, "playlist", plId);
+      const parsed = applePageTracks(json);
+      const tracks = parsed.tracks || [];
+      const musicList = tracks.length
+        ? await appleTracksToPlayable(tracks, parsed.artist || "", parsed.artwork || sheetItem.artwork, parsed.title || sheetItem.title)
+        : [];
+      return {
+        isEnd: true,
+        sheetItem: {
+          id: String(sheetItem.id),
+          platform: "Apple Music",
+          title: parsed.title || sheetItem.title || "",
+          artist: parsed.artist || "",
+          artwork: parsed.artwork || sheetItem.artwork || "",
+          worksNum: musicList.length || Number(sheetItem.worksNum || 0),
+          playCount: 0,
+          description: "",
+        },
+        musicList: musicList,
+      };
+    }
     if (sheetItem._provider === "netease" || sheetItem.platform === "网易云") {
       try {
         return await neteaseSheetDetail(sheetItem.id, page);
@@ -7640,15 +8038,23 @@ module.exports = {
      MusicFree 会按分组渲染成「网易云榜单 / 推荐歌单 / 华语精选 …」。
      点进去走 getMusicSheetInfo（_provider 是 netease，正好复用现有歌单详情）。 */
   getTopLists: function () {
-    return neteaseTopListGroups().catch((e) => {
+    /* Apple 榜单是静态条目、不联网，所以可以和网易那批并发；
+       Promise.all 里任何一边失败都各自兜住，缺谁都不影响另一边。 */
+    const ne = neteaseTopListGroups().catch((e) => {
       console.log("[粽子] 榜单页整体失败: " + e.message);
       return [];
     });
+    if (!shouldUseAppleChart()) return ne;
+    const ap = Promise.resolve(appleChartEntries());
+    return Promise.all([ne, ap]).then((r) => r[0].concat(r[1]));
   },
-  /* 榜单详情。MusicFree 的榜单条目和歌单是同一套结构，直接复用 */
+  /* 榜单详情。网易的榜单条目和歌单是同一套结构，直接复用；
+     Apple 的三类（歌曲 / 专辑 / 歌单）自己分流。 */
   getTopListDetail: function (topListItem) {
     if (!topListItem || !topListItem.id) return Promise.resolve(null);
-    return neteaseSheetDetail(topListItem.id, 1).catch(() => null);
+    const id = String(topListItem.id);
+    if (id.indexOf("apchart:") === 0) return appleChartDetail(topListItem).catch(() => null);
+    return neteaseSheetDetail(id, 1).catch(() => null);
   },
 };/**
  * 严格匹配：搜索结果必须和请求的是同一首歌。
