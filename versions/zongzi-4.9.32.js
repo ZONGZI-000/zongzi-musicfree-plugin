@@ -5817,10 +5817,22 @@ async function qqSheetDetail(disstid, page) {
   };
 }
 
+/* 我们自己的分类名 → 网易目录里真有的那个词。
+   ⚠️ 「深夜」不在网易那 70 个分类里（它只有「夜晚」）。不映射的话
+      highquality 返回 0 张，代码会回落到 playlist/list 的模糊热门搜，
+      于是「深夜」拼出来一堆广播剧、翻唱和恋爱神曲 —— 名义上是深夜，
+      点开完全不是那么回事。凡是和网易目录对不上的，都在这里兜一下。 */
+const NE_CAT_ALIAS = {
+  "深夜": "夜晚",
+};
+
 /** 某个 tag 当天的歌单池（已洗牌、已去重，按天固定） */
 async function recSheetPool(tagName) {
-  const cat = tagName || "全部";
-  const ck = cat + "|" + recDayKey();
+  const raw = tagName || "全部";
+  const cat = NE_CAT_ALIAS[raw] || raw;
+  /* 缓存键必须用原始 tag：深夜和夜晚映射到同一个网易词，但它们是两个分类，
+     共用一个键会让后进的那个把前一个的池子覆盖掉。 */
+  const ck = raw + "|" + recDayKey();
   const hit = REC_POOL_CACHE[ck];
   if (hit && Date.now() - hit.at < REC_POOL_TTL) return hit.v;
 
@@ -6017,23 +6029,110 @@ const DZ_COVER_CACHE = {};
    没画的分类继续用 Deezer 的图兜底，不会出现空封面。 */
 const COVER_CDN = "https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/covers/";
 const MIX_COVERS = {
-  /* 「全部」是推荐页的「热门」tag，不是某个曲风，暂时复用最像合集的 R&B 那张
-     （黄昏城市 + 拼图块）。等出图额度恢复再单独画一张多曲风混拼的。 */
+  /* 只有 11 张自绘图，但网易目录有 70 个分类，加上 QQ 独有的那几个。
+     所以不追求「一类一图」，而是按耳感和气质贴到最接近的那一张上 ——
+     有图总比现搜强：Deezer 在国内经常连不通，一旦卡住就是 4 秒起步的空窗。
+     等出图额度恢复，缺的那几张再单独补，补完只要改这里一行。 */
   "全部": ["rnb.jpg"],
   "热门": ["rnb.jpg"],
+
+  /* 华语那张：中文流行、KTV、榜单、翻唱这一路 */
   "华语": ["huayu.jpg"],
+  "流行": ["huayu.jpg"],
+  "粤语": ["huayu.jpg"],
+  "闽南语": ["huayu.jpg"],
+  "KTV": ["huayu.jpg"],
+  "榜单": ["huayu.jpg"],
+  "翻唱": ["huayu.jpg"],
+  "网络歌曲": ["huayu.jpg"],
+  "综艺": ["huayu.jpg"],
+  "90后": ["huayu.jpg"],
+  "快乐": ["huayu.jpg"],
+
+  /* 古风那张：水墨、五声音阶、民族器乐、世界音乐 */
   "古风": ["gufeng.jpg", "gufeng2.jpg"],
+  "民族": ["gufeng.jpg", "gufeng2.jpg"],
+  "世界音乐": ["gufeng.jpg", "gufeng2.jpg"],
+
+  /* 爵士那张：留声机、黑胶，老唱片气质 */
   "爵士": ["jazz.jpg"],
+  "蓝调": ["jazz.jpg"],
+  "Bossa Nova": ["jazz.jpg"],
+  "酒吧": ["jazz.jpg"],
+  "下午茶": ["jazz.jpg"],
+  "怀旧": ["jazz.jpg"],
+  "经典": ["jazz.jpg"],
+  "70后": ["jazz.jpg"],
+  "80后": ["jazz.jpg"],
+
+  /* 电子那张：霓虹、电路板，跑得起来的节奏 */
   "电子": ["electronic.jpg"],
+  "舞曲": ["electronic.jpg"],
+  "ACG": ["electronic.jpg"],
+  "日语": ["electronic.jpg"],
+  "游戏": ["electronic.jpg"],
+  "地铁": ["electronic.jpg"],
+  "驾车": ["electronic.jpg"],
+  "00后": ["electronic.jpg"],
+  "DJ": ["electronic.jpg"],
+
+  /* 摇滚那张：电吉他、爆炸线，音量和情绪都往上推 */
   "摇滚": ["rock.jpg"],
+  "英伦": ["rock.jpg"],
+  "金属": ["rock.jpg"],
+  "朋克": ["rock.jpg"],
+  "后摇": ["rock.jpg"],
+  "吉他": ["rock.jpg"],
+  "运动": ["rock.jpg"],
+  "兴奋": ["rock.jpg"],
+  "现场音乐": ["rock.jpg"],
+
+  /* 深夜那张：台灯、星空、暖光，灯关一半的时候 */
   "夜晚": ["night.jpg"],
   "深夜": ["night.jpg"],
+  "安静": ["night.jpg"],
+  "孤独": ["night.jpg"],
+  "思念": ["night.jpg"],
+  "伤感": ["night.jpg"],
+  "午休": ["night.jpg"],
+
+  /* 治愈那张：抱猫、落叶、暖米色，不设防的一单 */
   "治愈": ["healing.jpg"],
+  "放松": ["healing.jpg"],
+  "清新": ["healing.jpg"],
+  "民谣": ["healing.jpg"],
+  "清晨": ["healing.jpg"],
+  "校园": ["healing.jpg"],
+  "儿童": ["healing.jpg"],
+  "散步": ["healing.jpg"],
+  "旅行": ["healing.jpg"],
+  "乡村": ["healing.jpg"],
+  "New Age": ["healing.jpg"],
+  "婚礼": ["healing.jpg"],
+
+  /* 钢琴那张：琴键、琴谱、小黑猫，不抢注意力 */
   "钢琴": ["piano.jpg"],
   "轻音乐": ["piano.jpg"],
-  "流行": ["huayu.jpg"],
+  "器乐": ["piano.jpg"],
+  "古典": ["piano.jpg"],
+  "学习": ["piano.jpg"],
+  "工作": ["piano.jpg"],
+  "影视原声": ["piano.jpg"],
+  "感动": ["piano.jpg"],
+
+  /* 说唱那张：砖墙涂鸦、喷漆罐 */
   "说唱": ["rap.jpg"],
+  "MC喊麦": ["rap.jpg"],
+
+  /* R&B 那张：黄昏城市、黑胶唱机，转音和鼓机 */
   "R&B/Soul": ["rnb.jpg"],
+  "欧美": ["rnb.jpg"],
+  "韩语": ["rnb.jpg"],
+  "浪漫": ["rnb.jpg"],
+  "情歌": ["rnb.jpg"],
+  "拉丁": ["rnb.jpg"],
+  "雷鬼": ["rnb.jpg"],
+  "法语": ["rnb.jpg"],
 };
 
 /* 拼单的介绍：写清这是什么风格、大概从哪儿来的，不写怎么配比的。
