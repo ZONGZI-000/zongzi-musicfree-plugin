@@ -609,15 +609,29 @@ async function verifyPlayable(url, extraHeaders) {
  *  判据用「每秒钟多少字节」而不是「够不够某个码率」：
  *  码率是服务端自己标称的，会撒谎；字节总数 ÷ 时长是硬算出来的。
  *  低于 48kbps（6KB/s）在音乐里不存在，低于这个必然是片段/截断。
- *  时长未知的条目一律放行，宁可放过也不冤枉。 */
+ *  时长未知的条目不再一律放行 —— 那是 4.9.24 之前最大的漏网口子：
+ *  咪咕直出、酷我搜索给的 duration 大量是 0，等于全部免检。
+ *  现在改成「拿不到总字节数就放行，拿得到就按 400KB 绝对下限判」。 */
 const MIN_BYTES_PER_SEC = 6 * 1024; // ≈48kbps
+/* 时长未知时的绝对下限：整首歌不可能小于 400KB（就算 64kbps 也有 1.5MB）。
+   拿它兜住「平台不给时长 → 免检通行」这个洞。 */
+const MIN_FULL_BYTES = 400 * 1024;
 
-async function isPreviewOnly(url, durationMs) {
+async function isPreviewOnly(url, durationMs, fallbackMs) {
   const ms = Number(durationMs) || 0;
-  if (ms <= 0) return false;
+  const fb = Number(fallbackMs) || 0;
   const p = await probeAudio(url);
+  /* 时长未知时，能拿到实际字节数就按「一首歌至少该有多少字节」判：
+     完整版 mp3 128k 也至少 1.5MB，低于 400KB 的绝不可能是整首。
+     之前这里直接 return false 放行，等于把「时长 0」变成了免检通行证 ——
+     而咪咕直出、酷我搜索一堆条目时长都是 0。 */
+  const useMs = ms > 0 ? ms : fb;
+  if (useMs <= 0) {
+    if (!p.total) return false;
+    return p.total < MIN_FULL_BYTES;
+  }
   if (!p.total) return false;
-  return p.total / (ms / 1000) < MIN_BYTES_PER_SEC;
+  return p.total / (useMs / 1000) < MIN_BYTES_PER_SEC;
 }
 
 /** 把各平台五花八门的时长写法统一成毫秒。
@@ -7506,12 +7520,13 @@ const RESOLVERS = {
 /* 最终排名比较器。抽成具名函数，是因为「降级补搜」合并后还要用它再排一次 ——
    之前把比较器写成内联箭头函数，补搜那条路径就只能干瞪眼地 append。 */
 function compareRank(a, b) {
-  /* 鬼畜区条目：能搜到，但永远排在所有音乐条目之后。
-     用户要的是「能看鬼畜」，不是「搜什么都先给我鬼畜」——
-     音乐区那批正经音源必须先占住前排。
-     ⚠️ 这一层必须在 tier 之前判断，不然 tier 高的鬼畜会翻上来。 */
-  const gq = a._guichu ? 1 : 0, gb = b._guichu ? 1 : 0;
-  if (gq !== gb) return gq - gb;
+  /* ⚠️ 鬼畜区条目**不单独降权**。
+     以前这里有一条「_guichu 一律排到所有音乐条目之后」的硬规则，
+     实测代价是搜「改革春风吹满地」时，18 条对口鬼畜被压到第 80 位往后，
+     而排在前面的全是四平台那种同名网络歌手翻唱 —— 用户要看的本来就是鬼畜，
+     按「谁更匹配查询」排就行，不该因为出身分区被埋掉。
+     鬼畜和翻唱一视同仁：真原唱自然会凭 _auth / _bone / tier 抢到前排，
+     抢不到的是因为它本身就不匹配。 */
   // tier 越大越好（3 完全匹配 / 2 沾边 / 1 变体），降序
   if (a._tier !== b._tier) return (b._tier || 0) - (a._tier || 0);
   // 相关性闸门降权（原因见 searchMusicAll 里 _rel 的注释）
@@ -7721,7 +7736,8 @@ async function searchMusicAll(query, page) {
   // 音乐区（父分区 3）底下是 130 音乐综合 / 193 MV / 31 翻唱 / 59 演奏，
   // 鬼畜（119）和动画（1）根本不在里面。所以「改革春风吹满地」
   // 「大碗宽面」这类作品在音乐区搜出来是空手，只能靠歌名恰好撞上别的区。
-  // 这里并发问一次 119，命中的标记 _guichu，排序时统一压到音乐条目之后。
+  // 这里并发问一次 119，命中的标记 _guichu（只用来识别来源分区，
+  // 排序时不再整体下沉 —— 见 compareRank 顶部那段说明）。
   // ⚠️ 鬼畜区**不**参与「音乐区搜空就退全站」的兜底 —— 那一路退的是全站，
   //    会把时政、游戏、影视区一起卷进来，跟鬼畜不是一回事。
   if (shouldUseBilibili() && shouldBiliGuichu()) {
@@ -7763,7 +7779,15 @@ async function searchMusicAll(query, page) {
       withRetry("咪咕直出", () => miguApiSearch(query, 10)).then((l) =>
         (l || []).map((x) => ({
           id: x.id, platform: "咪咕直出", title: x.title, artist: x.artist,
-          album: "", artwork: x.artwork, duration: 0,
+          album: "", artwork: x.artwork,
+          /* ⚠️ 这里原来是 duration: 0，等于把 miguApiSearch 已经算好的时长
+             整个扔掉。后果很实在：
+               ① completenessOf 只能判「时长未知」，试听片段检查
+                  （isPreviewOnly）拿到 ms<=0 直接 return false，全线放行；
+               ② 列表里全是 00:00，用户看不出哪条是完整版。
+             咪咕不直接给时长，是靠 rateFormats 的文件大小反推的
+             （miguDurationMs），那个值本来就是对的，透传即可。 */
+          duration: Number(x.duration) || 0,
           _provider: "miguapi", _raw: x,
         }))
       )
@@ -8167,9 +8191,7 @@ async function searchMusicAll(query, page) {
   const out = [];
   groups.forEach((arr) => {
     arr.sort((a, b) => {
-      // 鬼畜区条目压到音乐条目之后（理由见 compareRank）
-      const gq = a._guichu ? 1 : 0, gb = b._guichu ? 1 : 0;
-      if (gq !== gb) return gq - gb;
+      // 鬼畜条目跟普通条目一起比 tier，不再整体沉底（理由见 compareRank）
       // ⚠️ tier 越大越好（3 完全匹配 / 1 变体），所以必须**降序**
       if (a._tier !== b._tier) return b._tier - a._tier;
       // 相关性闸门降权（0 = 跟查询沾不上边，压到相关的后面，但不删）
@@ -8425,7 +8447,74 @@ function inlineCachePut(item, url) {
   }
 }
 
+/**
+ * 给播放地址配「播放时必须带的请求头」和「协议升级」。
+ *
+ * 两件事合在一起做，因为它们解决的是同一个症状：**列表里点开没反应**。
+ *
+ * ① http → https
+ *    Android 9+ 默认禁明文流量（cleartextTrafficPermitted=false），
+ *    插件给个 http:// 地址，播放器直接拒连 —— 而且报的是「无法播放」，
+ *    看起来像源挂了，其实是协议。实测 QQ 的 ws.stream.qqmusic.qq.com
+ *    https 版本完全可用，直接换就行。
+ *    ⚠️ 酷狗的 fs.youthandroid2.kugou.com 证书不匹配，换 https 反而更糟，
+ *       所以只对「确实支持 https」的域名升级，别一刀切。
+ *
+ * ② Referer
+ *    B站 CDN 不带 Referer 返回 403，酷狗部分域名同理。
+ *    这两个头必须交给客户端在请求时带，插件自己带了没用。
+ */
+const HTTPS_OK_HOST = /(^|\.)(qqmusic\.qq\.com|music\.126\.net|music\.163\.com|migu\.cn|12530\.com|kugou\.com\.cn|kuwo\.cn)$/i;
+const PLAY_HEADERS = {
+  bilibili: { Referer: "https://www.bilibili.com/" },
+  kugou: { Referer: "https://www.kugou.com/" },
+  kuwo: { Referer: "https://www.kuwo.cn/" },
+  qq: { Referer: "https://y.qq.com/" },
+};
+
+function decorateSource(result, provider) {
+  if (!result || !result.url) return result;
+  const u = String(result.url);
+  if (u.indexOf("data:") === 0) return result;      // 内联数据不需要头
+
+  let out = u;
+  if (out.indexOf("http://") === 0) {
+    /* 只看域名白名单，不盲目替换：证书不匹配的域名换上去会比 http 更糟 */
+    let host = "";
+    try { host = String(new URL(out).host || ""); } catch (e) { host = ""; }
+    if (host && HTTPS_OK_HOST.test(host)) {
+      const cand = out.replace(/^http:\/\//, "https://");
+      /* 用「能取到字节」实测，不是只看域名 —— 有的域名证书对但路径只走 http */
+      if (httpsCacheIsOk(cand)) out = cand;
+    }
+  }
+
+  const h = PLAY_HEADERS[provider];
+  if (h) {
+    result.url = out;
+    result.headers = Object.assign({}, result.headers || {}, h);
+  } else if (out !== u) {
+    result.url = out;
+  }
+  return result;
+}
+
+/* 同一个 https 地址只测一次，避免每次播放都多打一个请求 */
+const _httpsOk = {};
+function httpsCacheIsOk(url) {
+  const k = url.slice(0, 200);
+  if (_httpsOk[k] !== undefined) return _httpsOk[k];
+  /* 同步路径里没法发请求，所以这里采用「乐观放行 + 后台校正」：
+     先认为可以（域名白名单已经筛过一遍），后台探一次，失败就记住。
+     下一次播放同域名就会走 http 了。 */
+  _httpsOk[k] = true;
+  probeAudio(url).then((r) => { _httpsOk[k] = !!r.ok; }).catch(() => {});
+  return true;
+}
+
 async function getMediaSource(musicItem, quality) {
+  const providerForPlay = musicItem._provider || LABEL_TO_PROVIDER[musicItem.platform] || "";
+
   // 1) 内存里已有完整音频（data: URI）→ 直接复用，别重复下载
   const inline = inlineCacheGet(musicItem);
   if (inline) return { url: inline };
@@ -8433,10 +8522,18 @@ async function getMediaSource(musicItem, quality) {
   // 2) 30 分钟内的直链缓存（跟音质无关），不再重走取流链路
   const cached = mediaCacheGet(musicItem);
   if (cached) {
-    return { url: cached };
+    /* ⚠️ 缓存命中也要过 decorateSource。缓存里存的是裸 URL，
+       请求头不在里面 —— 直接返回 { url: cached } 的话，
+       B站/酷狗那批「必须带 Referer」的歌第一次能播、第二次 403，
+       是最难查的那种间歇性故障。 */
+    return decorateSource({ url: cached }, providerForPlay);
   }
 
   const result = await resolveMediaSource(musicItem, quality);
+
+  /* 把「播放该带的头」和「http→https」补上。
+     这一步必须在缓存之前 —— 缓存的是可以直接交给播放器的成品。 */
+  decorateSource(result, providerForPlay);
 
   const isInline = result.url && String(result.url).indexOf("data:") === 0;
   if (isInline) {
@@ -8467,8 +8564,8 @@ async function resolveMediaSource(musicItem, quality) {
   /* 本平台和兜底都要过同一道关：能不能播、是不是完整。
      抽成闭包是为了让两条路径完全同构 —— 之前只在兜底里做校验，
      结果本平台「能播但是 60 秒试听」就一路过关了。 */
-  const accept = async (u, who) => {
-    if (await isPreviewOnly(u, durMs)) {
+  const accept = async (u, who, altDurMs) => {
+    if (await isPreviewOnly(u, durMs, altDurMs)) {
       previewOnly = previewOnly || u;
       errors.push(who + ": 只给试听片段");
       return null;
@@ -9084,10 +9181,10 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.25",
+  version: "4.9.26",
   author: "粽子 & Alma",
   description:
-    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。v4.9.25 接入 B 站鬼畜区：搜索并上 tids=119，榜单页多一组「B站鬼畜」，不进推荐页。",
+    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。v4.9.25 接入 B 站鬼畜区：搜索并上 tids=119，榜单页多一组「B站鬼畜」，不进推荐页。v4.9.26 鬼畜取消整体下沉，按匹配度正常排序（原唱仍靠权威目录排第一）。",
   supportedSearchType: ["music", "album", "artist", "sheet"],
   // 音频缓存策略：no-cache = 每次播放都重新取地址（直链带时效签名，缓存必然过期）
   cacheControl: "no-cache",
@@ -9122,7 +9219,7 @@ module.exports = {
     {
       key: "biliGuichu",
       name: "Bilibili 鬼畜区（默认开）",
-      hint: "填 1 开启、0 关闭。开启后搜索会额外问一次 B 站鬼畜区（tids=119），并在「榜单」页多一组「B站鬼畜 · 本周热门」。鬼畜条目永远排在音乐条目之后，也**不会**出现在推荐页 —— 推荐页仍然只有正经歌单。关掉就彻底不碰鬼畜。",
+      hint: "填 1 开启、0 关闭。开启后搜索会额外问一次 B 站鬼畜区（tids=119），并在「榜单」页多一组「B站鬼畜 · 本周热门」。鬼畜条目按匹配度正常参与排序，不再统一压到音乐条目之后 —— 真原唱靠权威目录自然排前面，鬼畜排在翻唱那一档。它们**不会**出现在推荐页，推荐页仍然只有正经歌单。关掉就彻底不碰鬼畜。",
     },
     {
       key: "useMiguApi",
