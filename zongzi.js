@@ -1135,12 +1135,17 @@ function lcsLen(a, b) {
  * 原名反查：拿查询词去网易云歌手搜索，捞 name / alias / transNames。
  *
  * 场景：用户搜「摇晃帝国」（乐队名的中文译法），B 站根本不认这个名字，
- * 只有搜「ゆらゆら帝国」才有正确结果。网易云的歌手接口会把译名一起返回，
- * 正好可以补上。
+ * 只有搜「ゆらゆら帝国」才有正确结果。
+ *
+ * 两路来源，互补：
+ *   网易云 cloudsearch —— 别名在 artists[].alias，中文译名在曲目 ar[].tns
+ *                         （实测能给出「摇摆帝国」这个中文译法）
+ *   QQ 音乐歌手接口    —— 译名直接写在括号里，形如
+ *                         「L'Arc〜en〜Ciel (彩虹乐队)」「Queen (皇后乐队)」
+ *                         （实测「彩虹乐队」网易云只给到 Rainbow，QQ 才是对的）
  *
  * ⚠️ 必须卡置信度，否则「稻香」会被解析成歌手「周杰伦」，
  *    拿「周杰伦」去搜 B 站就变成整个歌手主页了。
- *    这里用「最长公共子串 ≥ 2 个字」当门槛，且只取前 3 个候选里第一个命中的。
  *    反查结果只用来**追加** anchor 和关键词，永远不会顶掉原查询。
  */
 async function neteaseArtistAliases(query) {
@@ -1148,7 +1153,7 @@ async function neteaseArtistAliases(query) {
   if (!q) return [];
   const ck = cacheGet("alias", q, "");
   if (ck) return ck;
-  let out = [];
+  const out = [];    // 网易云那一路的原始产出
   try {
     // ⚠️ 用 POST 打 /api/cloudsearch/pc，不要用 GET /api/search/get/web。
     //    实测 2026-10-18：GET 版连续请求几次就返回
@@ -1244,8 +1249,66 @@ async function neteaseArtistAliases(query) {
       }
     }
   } catch (e) { /* 反查失败就当没有，不影响主流程 */ }
-  cachePut("alias", q, "", out);
-  return out;
+
+  /* 第二路：QQ 音乐歌手接口。
+     它的译名格式是「原名 (译名)」，是一条**显式声明**：
+       「L'Arc〜en〜Ciel (彩虹乐队)」= 平台自己写着这两个名字是同一个人。
+     这比网易云那套「看谁在结果里占多数」的推断可靠得多 ——
+     实测「彩虹乐队」，网易云推断出的却是 Rainbow（完全另一支乐队），
+     QQ 的括号才是对的（中文语境下「彩虹乐队」= L'Arc〜en〜Ciel）。
+     所以 QQ 一旦给出「括号里正好是查询词」的条目，就以它为准，
+     网易云那一路直接弃用。
+
+     ⚠️ 它同时会返回一堆「(xxx成员)」条目，那些是乐队成员的歌手页，
+        名字里带「成员」的一律不要 —— 拿成员名去搜会把整支乐队淹掉。 */
+  const qqNames = [];
+  let qqAuthoritative = false;
+  try {
+    const qq = await axios_1.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp", {
+      params: { w: q, t: 9, p: 1, n: 5, format: "json" },
+      timeout: 8000,
+      headers: { "User-Agent": UA, Referer: "https://y.qq.com/" },
+      validateStatus: () => true,
+    });
+    const sl = (qq.data && qq.data.data && qq.data.data.singer && qq.data.data.singer.list) || [];
+    const qn0 = normTextZ(q);
+    for (let i = 0; i < Math.min(3, sl.length); i++) {
+      const raw = String(sl[i].singerName || "").trim();
+      if (!raw || /成员|樂隊成員|乐队成员/.test(raw)) continue;
+      // 「L'Arc〜en〜Ciel (彩虹乐队)」→ 主名 + 括号里的译名
+      const inner = (raw.match(/[（(]([^）)]+)[）)]/) || [])[1] || "";
+      const main = raw.replace(/[（(][^）)]*[）)]/g, "").trim();
+      if (normTextZ(inner) === qn0 && main) {
+        // 括号译名就是查询词 → 平台明确说「这俩是同一个」，以它为准
+        qqAuthoritative = true;
+        qqNames.push(main);
+        continue;
+      }
+      if (!main) continue;
+      if (normTextZ(main) === qn0) continue;
+      /* 没有括号译名时，主名要跟查询词有 2 字连续重合才收
+         （防止搜「晴天」时把 QQ 里同名的野鸡歌手当成译名）。 */
+      if (lcsLen(q, main) >= 2) qqNames.push(main);
+    }
+  } catch (e) { /* QQ 拿不到就算了，网易云那一路还可能有 */ }
+
+  /* 合并：
+     - QQ 权威 → 只用 QQ 的（网易云的推断可能是错的）
+     - 否则 → QQ 的名字排前面，网易云的（原名/假名/罗马音）跟在后面
+     最多 6 个，多了只会拖慢 B 站那几轮关键词尝试。 */
+  const pool = qqAuthoritative ? qqNames : qqNames.concat(out);
+  const merged = [];
+  const qn1 = normTextZ(q);
+  for (let i = 0; i < pool.length; i++) {
+    const n = String(pool[i] || "").trim();
+    if (!n) continue;
+    if (normTextZ(n) === qn1) continue;
+    if (merged.indexOf(n) >= 0) continue;
+    merged.push(n);
+    if (merged.length >= 6) break;
+  }
+  cachePut("alias", q, "", merged);
+  return merged;
 }
 
 function normText(s) {
@@ -6329,7 +6392,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.9",
+  version: "4.9.10",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
@@ -6346,7 +6409,7 @@ module.exports = {
      同一份内容换个文件名就能正常下载。所以发布文件名带版本号：
      某个具体文件被风控标记时，下次发版换个新名字就绕过去了。
      发版时记得同步改这里的版本号。 */
-  srcUrl: "https://gitee.com/zongziiiiiiiiiiiiiiiiiiiiiiiiiiii/zongzi-musicfree-plugin/raw/master/zongzi-4.9.9.js",
+  srcUrl: "https://gitee.com/zongziiiiiiiiiiiiiiiiiiiiiiiiiiii/zongzi-musicfree-plugin/raw/master/zongzi.js",
   userVariables: [
     {
       key: "feishuWebhook",

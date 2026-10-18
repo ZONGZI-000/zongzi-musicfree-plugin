@@ -29,15 +29,22 @@ if ! cmp -s "$SRC" "$OUT"; then
 fi
 node -e "console.log('    ' + (require('fs').statSync('$OUT').size/1024).toFixed(1) + ' KB')"
 
-echo "==> 3/4 上传到 Gitee"
+echo "==> 3/4 上传到 Gitee（固定名 + 版本名各一份）"
 cd "D:/workspace/zongzi-musicfree-plugin"
+# ⚠️ 为什么要传两份：
+#   srcUrl 现在指向固定的 zongzi.js，这样用户「检查更新」永远有路可走，
+#   不会因为某次换了文件名而断链（4.9.5→4.9.7 就卡死过一次）。
+#   但 Gitee 会间歇性对 js 返回 451，固定名一旦被标记就全军覆没，
+#   所以同时留一份带版本号的，主链挂了还能手动换。
+VER="" MSG="$MSG" node deploy.js
 VER="$VERSION" MSG="$MSG" node deploy.js
 
 echo "==> 4/4 验证远程内容"
 # ⚠️ 文件名必须和插件里的 srcUrl 完全一致（带版本号）。
 #    Gitee 会对某些 js 文件间歇性返回 451「内容违规」，固定文件名一旦被标记，
 #    连历史版本都下不来 —— 每次发版换新文件名是唯一能绕开的风险控制。
-URL="https://gitee.com/$USER/$REPO/raw/master/zongzi-$VERSION.js"
+URL="https://gitee.com/$USER/$REPO/raw/master/zongzi.js"
+URL_VER="https://gitee.com/$USER/$REPO/raw/master/zongzi-$VERSION.js"
 sleep 2
 # ⚠️ 必须 -L 跟跳转：Gitee 现在对 raw 返回 302，指向 raw.giteeusercontent.com。
 #    不带 -L 只会拿到 470 字节的跳转页，看起来「HTTP 200」其实根本不是脚本。
@@ -89,8 +96,10 @@ rm -f "$GH_TMP"
 echo ""
 echo "✅ 发版完成 v$VERSION"
 echo ""
-echo "MusicFree 安装/更新地址（主）："
+echo "MusicFree 安装/更新地址（固定，推荐）："
 echo "   $URL"
+echo "带版本号的行为备用："
+echo "   $URL_VER"
 echo "备用（GitHub 镜像，Gitee 被 451 时用这个）："
 echo "   $GH_URL"
 echo ""
