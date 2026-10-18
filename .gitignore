@@ -1,2 +1,7 @@
 _remote.js
 node_modules/
+# 临时测试脚本，不进仓库（publish.sh 会 git add -A，所以必须在这里挡住）
+_*.js
+# 本地备份
+*.bak-*
+node_modules
