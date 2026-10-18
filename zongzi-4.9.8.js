@@ -65,7 +65,6 @@ const MIGU_LISTEN = "https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/sub/listenSo
  *      key 和 clientVersion 必须是新的，用旧的会 400。
  * ============================================================ */
 const YT_ANDROID = {
-  key: "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
   version: "20.10.38",
   ua: "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
   sdk: 34,
@@ -189,11 +188,45 @@ async function ytPlayerVisionos(videoId) {
 }
 
 const YT_IOS = {
-  key: "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc",
   version: "20.10.4",
   ua: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
   nameId: 5,
 };
+
+/* ============================================================
+ * innertube API key —— 运行时抓取，绝不硬编码
+ * 硬编码会在 GitHub 触发 "Google API Key" 密钥扫描告警。
+ * 这个 key 本身就是 YouTube 首页 HTML 里的公开值，抓一次缓存 1 小时。
+ * ============================================================ */
+let ytPubKeyCache = "";
+let ytPubKeyAt = 0;
+async function ytPubKey() {
+  if (ytPubKeyCache && Date.now() - ytPubKeyAt < 60 * 60 * 1000) return ytPubKeyCache;
+  const urls = [
+    "https://www.youtube.com/",
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  ];
+  for (const u of urls) {
+    try {
+      const r = await axios_1.get(u, {
+        timeout: 15000,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        },
+        validateStatus: () => true,
+        responseType: "text",
+        transformResponse: [(x) => x],
+      });
+      const m = String(r.data || "").match(/"INNERTUBE_API_KEY":"([^"]+)"/);
+      if (m && m[1]) {
+        ytPubKeyCache = m[1];
+        ytPubKeyAt = Date.now();
+        return ytPubKeyCache;
+      }
+    } catch (e) {}
+  }
+  throw new Error("yt: 无法从网页获取 innertube API key");
+}
 
 /* ============================================================
  * JOOX —— 需要登录 Cookie
@@ -2438,7 +2471,7 @@ function ytDurSec(s) {
 async function ytSearchRaw(query) {
   const c = YT_ANDROID;
   const r = await axios_1.post(
-    "https://www.youtube.com/youtubei/v1/search?key=" + c.key + "&prettyPrint=false",
+    "https://www.youtube.com/youtubei/v1/search?key=" + (await ytPubKey()) + "&prettyPrint=false",
     JSON.stringify({ context: ytCtx(c), query: query }),
     { timeout: 20000, headers: ytHeaders(c), validateStatus: () => true }
   );
@@ -2501,7 +2534,7 @@ function ytRank(list, want) {
 async function ytPlayer(videoId, client) {
   const c = client || YT_ANDROID;
   const r = await axios_1.post(
-    "https://www.youtube.com/youtubei/v1/player?key=" + c.key + "&prettyPrint=false",
+    "https://www.youtube.com/youtubei/v1/player?key=" + (await ytPubKey()) + "&prettyPrint=false",
     JSON.stringify({ context: ytCtx(c), videoId: videoId, contentCheckOk: true, racyCheckOk: true }),
     { timeout: 20000, headers: ytHeaders(c), validateStatus: () => true }
   );

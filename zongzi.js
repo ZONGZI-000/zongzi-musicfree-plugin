@@ -65,7 +65,6 @@ const MIGU_LISTEN = "https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/sub/listenSo
  *      key 和 clientVersion 必须是新的，用旧的会 400。
  * ============================================================ */
 const YT_ANDROID = {
-  key: "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
   version: "20.10.38",
   ua: "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
   sdk: 34,
@@ -189,11 +188,45 @@ async function ytPlayerVisionos(videoId) {
 }
 
 const YT_IOS = {
-  key: "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc",
   version: "20.10.4",
   ua: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
   nameId: 5,
 };
+
+/* ============================================================
+ * innertube API key —— 运行时抓取，绝不硬编码
+ * 硬编码会在 GitHub 触发 "Google API Key" 密钥扫描告警。
+ * 这个 key 本身就是 YouTube 首页 HTML 里的公开值，抓一次缓存 1 小时。
+ * ============================================================ */
+let ytPubKeyCache = "";
+let ytPubKeyAt = 0;
+async function ytPubKey() {
+  if (ytPubKeyCache && Date.now() - ytPubKeyAt < 60 * 60 * 1000) return ytPubKeyCache;
+  const urls = [
+    "https://www.youtube.com/",
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  ];
+  for (const u of urls) {
+    try {
+      const r = await axios_1.get(u, {
+        timeout: 15000,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        },
+        validateStatus: () => true,
+        responseType: "text",
+        transformResponse: [(x) => x],
+      });
+      const m = String(r.data || "").match(/"INNERTUBE_API_KEY":"([^"]+)"/);
+      if (m && m[1]) {
+        ytPubKeyCache = m[1];
+        ytPubKeyAt = Date.now();
+        return ytPubKeyCache;
+      }
+    } catch (e) {}
+  }
+  throw new Error("yt: 无法从网页获取 innertube API key");
+}
 
 /* ============================================================
  * JOOX —— 需要登录 Cookie
@@ -1148,12 +1181,68 @@ function lcsLen(a, b) {
  *    拿「周杰伦」去搜 B 站就变成整个歌手主页了。
  *    反查结果只用来**追加** anchor 和关键词，永远不会顶掉原查询。
  */
-async function neteaseArtistAliases(query) {
+/* QQ 用「原名 (译名)」的写法明确声明「这两个名字是同一个人」，
+   实测搜「彩虹乐队」酷我返回的「彩虹乐队」是个 128 首的山寨号，
+   真正的 L'Arc〜en〜Ciel（613 首）根本不在结果里。
+   这份表给 searchArtist / searchAlbum 排序用：权威原名压过译名同名条目。 */
+const ALIAS_AUTH = {};
+
+/** 只问 QQ 一家：它的「原名 (译名)」是**显式声明**，最快也最可靠。
+ *
+ *  耗时实测 1.1~2.1 秒（周杰伦 2.1s / 起风了 1.1s / 摇晃帝国 1.2s）。
+ *
+ *  返回 { names, authoritative, exact }
+ *    authoritative  括号里的译名正好是查询词 → 平台明说「这俩是同一个人」
+ *    exact          QQ 里有一位的名字就是查询词 → 查询词本身就是本名
+ *                   （周杰伦 / 草东没有派对），不需要再问别的源
+ *
+ *  ⚠️ 「(xxx成员)」那些是乐队成员的歌手页，一律不要 ——
+ *     拿成员名去搜会把整支乐队淹掉（实测「五月天」会冒出
+ *     「五月天 阿信」「五月天 怪兽」「石头 (五月天成员)」）。
+ */
+async function qqArtistProbe(q) {
+  const res = { names: [], authoritative: false, exact: false };
+  const qn0 = normTextZ(q);
+  try {
+    const qq = await axios_1.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp", {
+      params: { w: q, t: 9, p: 1, n: 5, format: "json" },
+      timeout: 8000,
+      headers: { "User-Agent": UA, Referer: "https://y.qq.com/" },
+      validateStatus: () => true,
+    });
+    const sl = (qq.data && qq.data.data && qq.data.data.singer && qq.data.data.singer.list) || [];
+    for (let i = 0; i < Math.min(4, sl.length); i++) {
+      const raw = String(sl[i].singerName || "").trim();
+      if (!raw || /成员|樂隊成員|乐队成员/.test(raw)) continue;
+      // 「L'Arc〜en〜Ciel (彩虹乐队)」→ 主名 + 括号里的译名
+      const inner = (raw.match(/[（(]([^）)]+)[）)]/) || [])[1] || "";
+      const main = raw.replace(/[（(][^）)]*[）)]/g, "").trim();
+      if (normTextZ(inner) === qn0 && main) {
+        // 括号译名就是查询词 → 平台明确说「这俩是同一个」，以它为准
+        res.authoritative = true;
+        if (res.names.indexOf(main) < 0) res.names.push(main);
+        continue;
+      }
+      if (!main) continue;
+      if (normTextZ(main) === qn0) { res.exact = true; continue; }
+      /* 没有括号译名时，主名要跟查询词有 2 字连续重合才收
+         （防止搜「晴天」时把 QQ 里同名的野鸡歌手当成译名）。 */
+      if (lcsLen(q, main) >= 2 && res.names.indexOf(main) < 0) res.names.push(main);
+    }
+  } catch (e) { /* 拿不到就交出空结果 */ }
+  if (res.authoritative) ALIAS_AUTH[qn0] = res.names.slice();
+  return res;
+}
+
+async function neteaseArtistAliases(query, qqPre) {
   const q = String(query || "").trim();
   if (!q) return [];
   const ck = cacheGet("alias", q, "");
   if (ck) return ck;
   const out = [];    // 网易云那一路的原始产出
+  /* ⚠️ 网易云那两发请求和 QQ 那一路**并发**跑。
+     以前是串行的，等于白等 2 秒 —— 两边互不依赖。 */
+  const qqP = qqPre ? Promise.resolve(qqPre) : qqArtistProbe(q).catch(() => ({ names: [], authoritative: false, exact: false }));
   try {
     // ⚠️ 用 POST 打 /api/cloudsearch/pc，不要用 GET /api/search/get/web。
     //    实测 2026-10-18：GET 版连续请求几次就返回
@@ -1261,36 +1350,9 @@ async function neteaseArtistAliases(query) {
 
      ⚠️ 它同时会返回一堆「(xxx成员)」条目，那些是乐队成员的歌手页，
         名字里带「成员」的一律不要 —— 拿成员名去搜会把整支乐队淹掉。 */
-  const qqNames = [];
-  let qqAuthoritative = false;
-  try {
-    const qq = await axios_1.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp", {
-      params: { w: q, t: 9, p: 1, n: 5, format: "json" },
-      timeout: 8000,
-      headers: { "User-Agent": UA, Referer: "https://y.qq.com/" },
-      validateStatus: () => true,
-    });
-    const sl = (qq.data && qq.data.data && qq.data.data.singer && qq.data.data.singer.list) || [];
-    const qn0 = normTextZ(q);
-    for (let i = 0; i < Math.min(3, sl.length); i++) {
-      const raw = String(sl[i].singerName || "").trim();
-      if (!raw || /成员|樂隊成員|乐队成员/.test(raw)) continue;
-      // 「L'Arc〜en〜Ciel (彩虹乐队)」→ 主名 + 括号里的译名
-      const inner = (raw.match(/[（(]([^）)]+)[）)]/) || [])[1] || "";
-      const main = raw.replace(/[（(][^）)]*[）)]/g, "").trim();
-      if (normTextZ(inner) === qn0 && main) {
-        // 括号译名就是查询词 → 平台明确说「这俩是同一个」，以它为准
-        qqAuthoritative = true;
-        qqNames.push(main);
-        continue;
-      }
-      if (!main) continue;
-      if (normTextZ(main) === qn0) continue;
-      /* 没有括号译名时，主名要跟查询词有 2 字连续重合才收
-         （防止搜「晴天」时把 QQ 里同名的野鸡歌手当成译名）。 */
-      if (lcsLen(q, main) >= 2) qqNames.push(main);
-    }
-  } catch (e) { /* QQ 拿不到就算了，网易云那一路还可能有 */ }
+  const qq = await qqP.catch(() => ({ names: [], authoritative: false, exact: false }));
+  const qqNames = qq.names || [];
+  const qqAuthoritative = !!qq.authoritative;
 
   /* 合并：
      - QQ 权威 → 只用 QQ 的（网易云的推断可能是错的）
@@ -1309,6 +1371,126 @@ async function neteaseArtistAliases(query) {
   }
   cachePut("alias", q, "", merged);
   return merged;
+}
+
+/* ============================================================
+ * 歌手/专辑也要认原名
+ *
+ * 单曲搜索早就接了「原名反查」，但**歌手页和专辑页没接** ——
+ * 结果就是同一件事在两处表现不一致：
+ *   搜「摇晃帝国」单曲 → 前 7 条是 ゆらゆら帝国（对）
+ *   搜「摇晃帝国」歌手 → 0 条                （错，酷我/咪咕都不认这个译名）
+ *   搜「摇晃帝国」专辑 → 51 条《摇晃的红酒杯》（错，全是分词噪声）
+ *
+ * 这里的几个小工具专门给 searchArtist / searchAlbum 用。
+ * ============================================================ */
+
+
+/** 候选名字：原查询在最前，后面是反查到的原名/别名。
+ *
+ *  ⚠️ 分两级，别一上来就问网易云：
+ *     歌手页/专辑页是高频操作，每次都花 2 秒做反查、结果又没有别名，
+ *     用户只会觉得「插件变慢了」。
+ *     实测 QQ 一家就能覆盖绝大多数情况：
+ *       彩虹乐队 → L'Arc〜en〜Ciel（括号译名，权威）
+ *       周杰伦   → exact，名字本身就是本名，到此为止
+ *       草东没有派对 → exact，同上
+ *       摇晃帝国 → 空（QQ 没有，才需要网易云那一路补）
+ *     所以先问 QQ；只有「QQ 给不出任何线索」时才升级去问网易云。 */
+async function aliasCandidates(query) {
+  const q = String(query || "").trim();
+  const push = (arr, s) => {
+    const n = String(s || "").trim();
+    if (!n) return;
+    const k = normTextZ(n);
+    if (!k) return;
+    for (let i = 0; i < arr.length; i++) if (normTextZ(arr[i]) === k) return;
+    arr.push(n);
+  };
+  const names = [q];
+  let qq = { names: [], authoritative: false, exact: false };
+  try { qq = await qqArtistProbe(q); } catch (e) { /* 空 */ }
+  /* QQ 说「查询词就是本名」→ 没有别名可找，直接用原查询。
+     再问网易云只会白花 2 秒，还可能被它的推断带偏
+     （实测搜「彩虹乐队」它推的是 Rainbow，完全另一支乐队）。 */
+  if (qq.exact && !qq.authoritative) {
+    return { q: q, names: names, auth: [], cheap: true };
+  }
+  if (qq.authoritative) {
+    for (let i = 0; i < qq.names.length; i++) push(names, qq.names[i]);
+    return { q: q, names: names.slice(0, 5), auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: true };
+  }
+  // QQ 一无所获 → 才动用网易云那条慢路径（拿假名/罗马音/译名）
+  const al = await neteaseArtistAliases(q, qq).catch(() => []);
+  for (let i = 0; i < (al || []).length; i++) push(names, al[i]);
+  return { q: q, names: names.slice(0, 5), auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: false };
+}
+
+/** 这条结果的歌手名，是不是「查询词或它的别名」之一。
+ *  ⚠️ 只认「包含」，不认反向包含 —— 搜「摇晃帝国」时
+ *     不能因为「たまゆら帝国」里有「帝国」就放进来。 */
+function nameMatchesAny(name, names) {
+  const n = flatTitle(name);
+  if (!n) return false;
+  for (let i = 0; i < (names || []).length; i++) {
+    const t = flatTitle(names[i]);
+    if (t && n.indexOf(t) >= 0) return true;
+  }
+  return false;
+}
+
+/** 歌手条目排序：在原来 rankByName 的基础上，多认两个信号 ——
+ *   ① 权威原名（QQ 的「原名 (译名)」写法）压在译名同名条目之前
+ *   ② 作品多的更可能是正经歌手（128 首的山寨号 vs 613 首的本尊）
+ *  没有别名时不会走到这里（见 searchArtist 里的 names.length > 1 判断），
+ *  所以老行为一个字都不变。 */
+function rankArtistCandidates(list, query, names, authNames) {
+  const qz = normTextZ(query);
+  const auth = (authNames || []).map(normTextZ).filter(Boolean);
+  return list.map((x) => {
+    const nz = normTextZ(x.name);
+    let sc = 0;
+    if (nz === qz) sc += 100;
+    else if (nz.indexOf(qz) >= 0) sc += 55;
+    else sc += 20;                       // 只是命中了别名
+    for (let i = 0; i < auth.length; i++) {
+      if (nz === auth[i]) { sc += 120; break; }
+      if (nz.indexOf(auth[i]) >= 0) { sc += 60; break; }
+    }
+    sc -= Math.max(0, nz.length - qz.length) * 2;
+    if (x.platform === "酷我") sc += 5;
+    if (x._official) sc += 40;
+    if (x.platform === "咪咕直出" && nz !== qz) sc -= 15;
+    // 作品数只当小权重（最多 10 分），不能盖过名字匹配
+    const w = Number(x.worksNum || 0);
+    if (w > 0) sc += Math.min(10, (Math.log(w) / Math.LN10) * 6);
+    return { x: x, sc: sc };
+  }).sort((a, b) => b.sc - a.sc).map((y) => y.x);
+}
+
+/** 决定「真正要拿去搜的名字」。
+ *
+ *  原查询本身就是歌手 → 用原查询（一个字都不改）。
+ *  原查询平台不认（摇晃帝国 / 彩虹乐队），但某个别名认得出歌手
+ *  → 换成那个别名去搜，否则歌手页/专辑页永远是空的或被山寨号占满。
+ *
+ *  ⚠️ detectSingerQuery 自带缓存，后面 searchAlbum 再问一次是免费命中。 */
+async function pickEffectiveName(query, aliasP) {
+  const q = String(query || "").trim();
+  const cands = ((await aliasP) || []);
+  const names = cands.names || [];
+  if (names.length <= 1) return { name: q, via: "", names: names };
+  const hits = await Promise.all(names.map((nm) => detectSingerQuery(nm).catch(() => null)));
+  // 原查询自己就是歌手 → 别乱换
+  if (hits[0]) return { name: q, via: q, names: names };
+  let best = -1, bestAlbums = 0;
+  for (let i = 1; i < hits.length; i++) {
+    if (!hits[i]) continue;
+    const n = Number(hits[i].albumTotal || 0);
+    if (n > bestAlbums) { bestAlbums = n; best = i; }
+  }
+  if (best < 0) return { name: q, via: "", names: names };
+  return { name: names[best], via: names[best], names: names };
 }
 
 function normText(s) {
@@ -2559,7 +2741,7 @@ function ytDurSec(s) {
 async function ytSearchRaw(query) {
   const c = YT_ANDROID;
   const r = await axios_1.post(
-    "https://www.youtube.com/youtubei/v1/search?key=" + c.key + "&prettyPrint=false",
+    "https://www.youtube.com/youtubei/v1/search?key=" + (await ytPubKey()) + "&prettyPrint=false",
     JSON.stringify({ context: ytCtx(c), query: query }),
     { timeout: 20000, headers: ytHeaders(c), validateStatus: () => true }
   );
@@ -2622,7 +2804,7 @@ function ytRank(list, want) {
 async function ytPlayer(videoId, client) {
   const c = client || YT_ANDROID;
   const r = await axios_1.post(
-    "https://www.youtube.com/youtubei/v1/player?key=" + c.key + "&prettyPrint=false",
+    "https://www.youtube.com/youtubei/v1/player?key=" + (await ytPubKey()) + "&prettyPrint=false",
     JSON.stringify({ context: ytCtx(c), videoId: videoId, contentCheckOk: true, racyCheckOk: true }),
     { timeout: 20000, headers: ytHeaders(c), validateStatus: () => true }
   );
@@ -3894,12 +4076,19 @@ function sortAlbums(list, artistN) {
 
 /* ---------- 专辑 ---------- */
 async function searchAlbum(query, page) {
+  /* 同 searchArtist：译名搜不出唱片，得先换成原名。
+     实测「摇晃帝国」原样搜，51 条里全是《摇晃的红酒杯》《摇晃的时光》，
+     真乐队的 15 张专辑一张都看不到；换成「ゆらゆら帝国」后 15 张全出。 */
+  const aliasP = aliasCandidates(query).catch(() => ({ q: query, names: [query], auth: [] }));
+  const pick = await pickEffectiveName(query, aliasP).catch(() => ({ name: query, via: "", names: [query] }));
+  const eq = pick.name;
+
   const [kw, mg, kg] = await Promise.all([
-    kuwoSearchTyped(query, "album", page, KUWO_PAGE_SIZE).catch(() => ({ total: 0, list: [] })),
-    miguSearchTyped(query, "album", page, 10).catch(() => ({ total: 0, list: [] })),
+    kuwoSearchTyped(eq, "album", page, KUWO_PAGE_SIZE).catch(() => ({ total: 0, list: [] })),
+    miguSearchTyped(eq, "album", page, 10).catch(() => ({ total: 0, list: [] })),
     // 酷狗补正版专辑：实测「范特西」酷我前几条被翻唱专辑占满，
     // 而酷狗第 1 条就是周杰伦原版（songcount=10）
-    kugouSearchAlbum(query, page, 10).catch(() => []),
+    kugouSearchAlbum(eq, page, 10).catch(() => []),
   ]);
 
   const out = [];
@@ -3998,7 +4187,10 @@ async function searchAlbum(query, page) {
      （昕一 17 首、贺瑄 1 首…），名字完全一致，纯按名字排永远排在最前。
      判定成歌手名查询后，直接去酷狗歌手页拉他的专辑，并把列表里
      「不是这位歌手的」全部剔除 —— 用户搜歌手，想看的就是他的唱片。 */
-  const singerHit = await detectSingerQuery(query);
+  /* ⚠️ 判定要用**换过名之后**的词：原译名「摇晃帝国」在酷狗歌手库里
+     根本不存在，拿它去判定永远是 null，于是整条「歌手目录」分支被跳过，
+     用户搜歌手却看到一堆歌名里带「摇晃」的单曲专辑。 */
+  const singerHit = await detectSingerQuery(eq);
 
   /* ---- Apple 目录兜底：酷狗查不到这个歌手时，别放弃 ----
      实测搜「那我懂你意思了」，酷狗歌手接口 data:null，
@@ -4011,7 +4203,7 @@ async function searchAlbum(query, page) {
         Apple 给不了播放地址，只能指认「哪些是真专辑」。 */
   let appleAlbums = null;
   if (!singerHit) {
-    const cat = await appleArtistCatalog(query);
+    const cat = await appleArtistCatalog(eq);
     /* ⚠️ 门槛必须卡「目录够完整」，不能只看「有专辑」：
        iTunes 里有大量跟歌名/专辑名同名的小歌手 —— 搜「晴天」它会给出
        一个叫「晴天」的野鸡歌手（2~3 张单曲），搜「叶惠美」给「周婕纶」，
@@ -4029,7 +4221,7 @@ async function searchAlbum(query, page) {
        然后专辑页只剩《何时了却这牵挂》《未了的缘》——刘若英的《后来》
        一张都看不到。 */
     if (cat && !cat.truncated && cat.albums.length >= 2 && cat.tracks.length >= 10) {
-      if (await looksLikeSongQuery(query)) {
+      if (await looksLikeSongQuery(eq)) {
         console.log("[粽子]「" + cat.name + "」目录 " + cat.albums.length + " 张，"
           + "但「" + String(query).trim() + "」是歌名 → 不走 Apple 目录");
       } else {
@@ -4125,7 +4317,7 @@ async function searchAlbum(query, page) {
     };
     const hitByName = (x) => {
       const a = singerNorm(x.artist || "");
-      const names = [singerNorm(appleAlbums.name), singerNorm(query)];
+      const names = [singerNorm(appleAlbums.name), singerNorm(eq), singerNorm(query)];
       for (let i = 0; i < names.length; i++) {
         if (names[i] && a && (a === names[i] || a.indexOf(names[i]) >= 0)) return true;
       }
@@ -4206,8 +4398,8 @@ async function searchAlbum(query, page) {
      （搜「晴天」「花海」，想看这首歌收在哪张专辑）。
      那种查询下同名专辑全是翻唱合集，共识统计反而会指向翻唱者；
      让 Apple Music 指路才靠谱。 */
-  const albumAuth = await authorityHint(query, null);
-  let data = rankByName(out, query, "title", artistConsensus(out, query), albumAuth);
+  const albumAuth = await authorityHint(eq, null);
+  let data = rankByName(out, eq, "title", artistConsensus(out, eq), albumAuth);
 
   /* ---- 用权威目录把「这首歌的正版专辑」顶到最前 ----
      实测搜「晴天」，各平台返回 50 张名字含「晴天」的专辑，头部全是翻唱合集，
@@ -4282,12 +4474,37 @@ async function searchAlbum(query, page) {
 
 /* ---------- 歌手 ---------- */
 async function searchArtist(query, page) {
+  /* ---- 原名反查：译名搜不到歌手时，换成平台认得的名字 ----
+     实测 2026-10-18：
+       摇晃帝国   酷我/咪咕/酷狗 全部 0 条 → 歌手页空白
+       彩虹乐队   酷我返回 3 条，全是山寨号（128 首 / 1 首 / 慵懒彩虹乐队），
+                 真身 L'Arc〜en〜Ciel（613 首）根本不在结果里
+     反查拿到原名后再搜，两条都能出正确的人。
+     ⚠️ 原查询自己就是歌手时一个字都不改（周杰伦、草东没有派对），
+        否则会引入反查误判的风险。 */
+  const aliasP = aliasCandidates(query).catch(() => ({ q: query, names: [query], auth: [] }));
+  const pick = await pickEffectiveName(query, aliasP).catch(() => ({ name: query, via: "", names: [query] }));
+  const eq = pick.name;
+
   const [kw, mg, yt] = await Promise.all([
-    kuwoSearchTyped(query, "artist", page, KUWO_PAGE_SIZE).catch(() => ({ total: 0, list: [] })),
-    miguSearchTyped(query, "singer", page, 10).catch(() => ({ total: 0, list: [] })),
+    kuwoSearchTyped(eq, "artist", page, KUWO_PAGE_SIZE).catch(() => ({ total: 0, list: [] })),
+    miguSearchTyped(eq, "singer", page, 10).catch(() => ({ total: 0, list: [] })),
     // 冷门独立乐团在酷我/咪咕根本没有条目，只有 YouTube 的官方 Topic 频道路过
-    page === 1 ? ytSearchRaw(query).catch(() => []) : Promise.resolve([]),
+    page === 1 ? ytSearchRaw(eq).catch(() => []) : Promise.resolve([]),
   ]);
+
+  /* 过滤用的名字集合：原名 + 原查询 + 其余别名。
+     ⚠️ 原名必须在里面 —— 换了名字去搜，结果里当然只有原名。 */
+  const nameSet = [];
+  const addName = (s) => {
+    const n = String(s || "").trim();
+    if (!n) return;
+    for (let i = 0; i < nameSet.length; i++) if (flatTitle(nameSet[i]) === flatTitle(n)) return;
+    nameSet.push(n);
+  };
+  addName(eq);
+  addName(query);
+  for (let i = 0; i < (pick.names || []).length; i++) addName(pick.names[i]);
 
   const out = [];
   const seen = {};
@@ -4307,9 +4524,8 @@ async function searchArtist(query, page) {
     if (!id || seen[id]) continue;
     const nm = String(a.ARTIST || a.artist || "").replace(/&nbsp;/g, " ").trim();
     if (!nm) continue;
-    // 只留「名字里真的含查询词」的（允许繁简/大小写差异）
-    const nmFlat = flatTitle(nm);
-    if (qNorm && nmFlat.indexOf(qNorm) < 0) continue;
+    // 只留「名字里真的含查询词/原名」的（允许繁简/大小写差异）
+    if (!nameMatchesAny(nm, nameSet)) continue;
     seen[id] = 1;
     let pic = a.PICPATH || a.hts_PICPATH || "";
     if (pic && pic.indexOf("http") !== 0) pic = (basePic || "http://img1.kuwo.cn/star/starheads/") + pic;
@@ -4335,8 +4551,10 @@ async function searchArtist(query, page) {
      *      / Alex Band / This Band，长度跟查询几乎一样，光靠长度过滤不掉。
      * 所以必须要求**名字里真的含查询词**（繁简归一后比），才留下。 */
     const nm = String(a.name || "");
-    if (nm.length > String(query).length + 1) continue;
-    if (qNorm && flatTitle(nm).indexOf(qNorm) < 0) continue;
+    if (!nameMatchesAny(nm, nameSet)) continue;
+    // 换名搜索时不能再按「查询词长度」卡，否则「ゆらゆら帝国」会被算太长
+    if (pick.via && nm.length > eq.length + 1) continue;
+    if (!pick.via && nm.length > String(query).length + 1) continue;
     seen[id] = 1;
     const imgs = a.imgItems || [];
     out.push({
@@ -4364,8 +4582,8 @@ async function searchArtist(query, page) {
       if (!ch) continue;
       const cn = flatTitle(ch);
       if (!cn) continue;
-      // 频道名必须含查询词，否则「My Weekend with Books」这种翻唱频道也会进来
-      if (qNorm && cn.indexOf(qNorm) < 0) continue;
+      // 频道名必须含查询词/原名，否则「My Weekend with Books」这种翻唱频道也会进来
+      if (!nameMatchesAny(ch, nameSet)) continue;
       if (!ytArt[cn]) { ytArt[cn] = { name: ch, n: 0, avatar: yt[i].artwork || "" }; ytOrder.push(cn); }
       ytArt[cn].n++;
     }
@@ -4415,14 +4633,17 @@ async function searchArtist(query, page) {
      有一条就不兜底 —— 否则搜「周杰伦」会多出一个重复的 Apple 条目。 */
   if (!out.length) {
     try {
-      const cat = await appleArtistCatalog(query);
+      /* 换名了就先拿原名问 Apple（Apple 通常也只认原名），
+         原名也没有再退回原查询。 */
+      let cat = await appleArtistCatalog(eq);
+      if (!(cat && cat.id) && eq !== query) cat = await appleArtistCatalog(query);
       if (cat && cat.id && (cat.albums.length || cat.tracks.length)) {
         console.log("[粽子] 平台全无此歌手，Apple 目录「" + cat.name + "」"
           + cat.albums.length + " 张 / " + cat.tracks.length + " 首");
         out.push({
           id: "apart:" + cat.id,
           platform: "Apple Music",
-          name: cat.name || String(query),
+          name: cat.name || eq,
           avatar: (cat.albums[0] && cat.albums[0].artwork) || "",
           worksNum: cat.tracks.length || cat.albums.length,
           fans: 0,
@@ -4433,7 +4654,14 @@ async function searchArtist(query, page) {
     } catch (e) { /* 拿不到就维持空结果 */ }
   }
 
-  const deduped = dedupeArtists(rankByName(out, query, "name"));
+  /* 排序：
+     没换名、也没别名 → 走原来的 rankByName，老行为一个字不变。
+     有别名时改用 rankArtistCandidates —— 它会把「QQ 声明的原名」
+     （彩虹乐队 → L'Arc〜en〜Ciel）顶到山寨同名号前面。 */
+  const ranked = (pick.names.length > 1 || (pick.auth && pick.auth.length))
+    ? rankArtistCandidates(out, query, pick.names, pick.auth)
+    : rankByName(out, query, "name");
+  const deduped = dedupeArtists(ranked);
 
   /* 咪咕的歌手数据只有 id/name/highlightStr 三个字段（没有作品数、没有头像），
      单独出现时会显示成「0 首」的空条目，看着像坏数据。
@@ -6392,7 +6620,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.10",
+  version: "4.9.11",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
