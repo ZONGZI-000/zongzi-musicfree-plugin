@@ -280,6 +280,19 @@ function shouldBiliMusicOnly() {
   } catch (e) { return true; }
 }
 
+/** Bilibili 鬼畜区是否一起搜（默认开）
+ *  音乐区（tids=3）里没有鬼畜区和动画区，搜「改革春风吹满地」这种梗
+ *  在音乐区是空手 —— 它本来就长在鬼畜区。所以单开一路去问 119。
+ *  ⚠️ 鬼畜结果不参与推荐，排序也压在所有音乐条目之后。 */
+function shouldBiliGuichu() {
+  try {
+    const vars = (typeof env !== 'undefined' && env && env.userVariables) || {};
+    const v = vars.biliGuichu;
+    if (v === undefined || v === null || v === '') return true;
+    return !(v === '0' || v === 'false' || v === 'off');
+  } catch (e) { return true; }
+}
+
 /** 咪咕官方直出是否参与（默认开） */
 function shouldUseMiguApi() {
   try {
@@ -3419,7 +3432,7 @@ function biliHeaders() {
   };
 }
 
-async function biliSearch(keyword, page) {
+async function biliSearch(keyword, page, zone) {
   await biliEnsureCookie();
   const base = {
     search_type: "video", keyword: keyword, page: page || 1, page_size: 20, order: "totalrank",
@@ -3433,12 +3446,22 @@ async function biliSearch(keyword, page) {
   //    会返回《美国帝国崩溃三部曲》《瑞士独臂接触者》这类时政/新闻视频，
   //    而且 B 站在交错合并里排最前，整个结果列表会被它刷屏。
   //    tids=3 返回的全是 130(音乐综合)/193(MV)/31(翻唱)/59(演奏) 等音乐子分区。
-  const musicOnly = shouldBiliMusicOnly();
-  let r = await call(musicOnly ? { tids: 3 } : null);
+  //
+  // zone 三档：
+  //   "music"（默认）→ tids=3，搜不到时退回全站
+  //   "guichu"       → tids=119（鬼畜区），**不**退全站（退了全是时政和游戏）
+  //   "all"          → 不传 tids，全站
+  const zoneMode = zone || "music";
+  let tids = 3;
+  let fallbackAll = true;
+  if (zoneMode === "guichu") { tids = 119; fallbackAll = false; }
+  else if (zoneMode === "all") { tids = 0; fallbackAll = false; }
+  else if (!shouldBiliMusicOnly()) { tids = 0; fallbackAll = false; }
+  let r = await call(tids ? { tids: tids } : null);
   let d = r.data || {};
   let raw = (d.data && d.data.result) || [];
   // 音乐区过滤把结果吃光（冷门关键词很常见）就退回全站，至少别空手
-  if (d.code === 0 && !raw.length && musicOnly) {
+  if (d.code === 0 && !raw.length && fallbackAll) {
     r = await call(null);
     d = r.data || {};
     raw = (d.data && d.data.result) || [];
@@ -3467,6 +3490,68 @@ async function biliSearch(keyword, page) {
     });
   }
   return list;
+}
+
+/* ============================================================
+ * B 站鬼畜区（rid=119）排行榜
+ *
+ * 为什么单独做一个榜：鬼畜区不在音乐区（父分区 3）底下，
+ * 搜索只能靠关键词自己撞 —— 搜「稻香」能撞到《氘香》，
+ * 但不会告诉你「这周鬼畜区有什么好听的」。排行榜补的就是这一块。
+ *
+ * ⚠️ 只进「榜单」页，**不**进推荐页。推荐页是给日常听歌用的，
+ *    鬼畜一混进去，整个推荐区就变成整活合集了。
+ *
+ * ⚠️ rid 只认 119（鬼畜总榜）。用子分区 22/26/126/216 去打
+ *    ranking/v2 全部返回 -400，接口不支持。
+ * ============================================================ */
+const GUICHU_PREFIX = "guichu:";
+
+async function biliGuichuRank() {
+  await biliEnsureCookie();
+  const r = await axios_1.get("https://api.bilibili.com/x/web-interface/ranking/v2", {
+    params: { rid: 119, type: "all" },
+    timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
+  });
+  const d = r.data || {};
+  if (d.code !== 0) throw new Error("bili 鬼畜榜: " + d.code);
+  const list = (d.data && d.data.list) || [];
+  const out = [];
+  for (let i = 0; i < list.length; i++) {
+    const v = list[i];
+    const sec = Number(v.duration) || 0;
+    // 20~50 秒的整活片段当不成一首歌；超长的多是合集
+    if (sec > 0 && (sec < 60 || sec > 900)) continue;
+    if (!v.bvid) continue;
+    out.push({
+      id: v.bvid,
+      platform: "Bilibili",
+      title: String(v.title || ""),
+      artist: (v.owner && v.owner.name) || "",
+      album: v.tname || "",
+      artwork: v.pic ? (String(v.pic).indexOf("//") === 0 ? "https:" + v.pic : v.pic) : "",
+      duration: sec * 1000,
+      playCount: Number((v.stat && v.stat.view) || 0),
+      _provider: "bilibili",
+      _raw: v,
+    });
+  }
+  return out;
+}
+
+/** 鬼畜榜的条目（榜单页里那几张卡） */
+function biliGuichuEntries() {
+  return [{
+    id: GUICHU_PREFIX + "hot",
+    platform: "Bilibili",
+    title: "B站鬼畜区 · 本周热门",
+    artist: "Bilibili 鬼畜",
+    artwork: "",
+    worksNum: 100,
+    playCount: 0,
+    description: "鬼畜区总榜（rid=119），只收 1~15 分钟、能当歌听的部分。不进推荐页。",
+    _provider: "bilibili",
+  }];
 }
 
 /** 拿音频流。返回按码率降序 */
@@ -7421,6 +7506,12 @@ const RESOLVERS = {
 /* 最终排名比较器。抽成具名函数，是因为「降级补搜」合并后还要用它再排一次 ——
    之前把比较器写成内联箭头函数，补搜那条路径就只能干瞪眼地 append。 */
 function compareRank(a, b) {
+  /* 鬼畜区条目：能搜到，但永远排在所有音乐条目之后。
+     用户要的是「能看鬼畜」，不是「搜什么都先给我鬼畜」——
+     音乐区那批正经音源必须先占住前排。
+     ⚠️ 这一层必须在 tier 之前判断，不然 tier 高的鬼畜会翻上来。 */
+  const gq = a._guichu ? 1 : 0, gb = b._guichu ? 1 : 0;
+  if (gq !== gb) return gq - gb;
   // tier 越大越好（3 完全匹配 / 2 沾边 / 1 变体），降序
   if (a._tier !== b._tier) return (b._tier || 0) - (a._tier || 0);
   // 相关性闸门降权（原因见 searchMusicAll 里 _rel 的注释）
@@ -7625,6 +7716,47 @@ async function searchMusicAll(query, page) {
     );
   }
 
+  // Bilibili 鬼畜区（tids=119）
+  // ── 为什么要单开一路 ──
+  // 音乐区（父分区 3）底下是 130 音乐综合 / 193 MV / 31 翻唱 / 59 演奏，
+  // 鬼畜（119）和动画（1）根本不在里面。所以「改革春风吹满地」
+  // 「大碗宽面」这类作品在音乐区搜出来是空手，只能靠歌名恰好撞上别的区。
+  // 这里并发问一次 119，命中的标记 _guichu，排序时统一压到音乐条目之后。
+  // ⚠️ 鬼畜区**不**参与「音乐区搜空就退全站」的兜底 —— 那一路退的是全站，
+  //    会把时政、游戏、影视区一起卷进来，跟鬼畜不是一回事。
+  if (shouldUseBilibili() && shouldBiliGuichu()) {
+    jobs.push(
+      aliasPromise.then(async (aliases) => {
+        const anchors = [query].concat(aliases);
+        const kws = aliases.length ? aliases.concat([query]) : [query];
+        for (let k = 0; k < kws.length; k++) {
+          let raw = [];
+          try { raw = await biliSearch(kws[k], 1, "guichu"); } catch (e) { continue; }
+          const keep = (raw || [])
+            .filter((x) => {
+              const d = x.duration / 1000;
+              // 鬼畜区大量 20~50 秒的整活片段，60 秒以下当不成一首歌
+              if (d > 0 && (d < 60 || d > 900)) return false;
+              if (!titleMatchesAnchors(x.title, anchors, query)) return false;
+              return true;
+            })
+            .map((x) => ({
+              id: x.id, platform: "Bilibili", title: x.title, artist: x.artist,
+              album: "", artwork: x.artwork, duration: x.duration,
+              playCount: Number(x.play || 0),
+              _provider: "bilibili", _raw: x, _guichu: 1,
+            }));
+          if (keep.length) {
+            console.log("[粽子] Bilibili鬼畜 " + keep.length + " 条（关键词: " + kws[k] + "）");
+            return keep;
+          }
+        }
+        return [];
+      })
+        .catch((e) => { console.log("[粽子] Bilibili鬼畜 失败: " + e.message); return []; })
+    );
+  }
+
   // 咪咕官方直出
   if (shouldUseMiguApi()) {
     jobs.push(
@@ -7744,7 +7876,10 @@ async function searchMusicAll(query, page) {
        判据是「查询词之外还有一大坨内容」：
        去掉查询词后剩下的字数 ≥ 8，且带视频特征词。
        正常的《晴天 (Live)》《晴天 - 周杰伦》去掉「晴天」只剩几个字，不会被误杀。 */
-    if ((it.platform === "YouTube" || it.platform === "Bilibili") &&
+    /* ⚠️ 鬼畜区条目必须先放行：NON_MUSIC_VIDEO_RE 里写着「鬼畜 / 整活 /
+       恶搞」，这正是它们自己的分类名，不放行会被自己那条规则吃光。
+       它们进到这里时已经过 titleMatchesAnchors，标题确实对得上查询词。 */
+    if (!it._guichu && (it.platform === "YouTube" || it.platform === "Bilibili") &&
         NON_MUSIC_VIDEO_RE.test(it.title) &&
         !isArtistQuery(query, it.artist)) {
       const residual = coreTitle(it.title).replace(qcore, "").length;
@@ -7755,7 +7890,7 @@ async function searchMusicAll(query, page) {
          【Taylor Swift】Patient Zero幕后花絮混剪版MV首播！
        它的 artist 写着 TaylorSwiftChina，含歌手名，
        上面那条「artist 不是歌手本人」的前提完全挡不住它。 */
-    if ((it.platform === "YouTube" || it.platform === "Bilibili") &&
+    if (!it._guichu && (it.platform === "YouTube" || it.platform === "Bilibili") &&
         MEDIA_VIDEO_RE.test(it.title)) {
       const residual2 = coreTitle(it.title).replace(qcore, "").length;
       if (residual2 >= 6) { droppedNews++; continue; }
@@ -8032,6 +8167,9 @@ async function searchMusicAll(query, page) {
   const out = [];
   groups.forEach((arr) => {
     arr.sort((a, b) => {
+      // 鬼畜区条目压到音乐条目之后（理由见 compareRank）
+      const gq = a._guichu ? 1 : 0, gb = b._guichu ? 1 : 0;
+      if (gq !== gb) return gq - gb;
       // ⚠️ tier 越大越好（3 完全匹配 / 1 变体），所以必须**降序**
       if (a._tier !== b._tier) return b._tier - a._tier;
       // 相关性闸门降权（0 = 跟查询沾不上边，压到相关的后面，但不删）
@@ -8946,10 +9084,10 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.24",
+  version: "4.9.25",
   author: "粽子 & Alma",
   description:
-    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
+    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。v4.9.25 接入 B 站鬼畜区：搜索并上 tids=119，榜单页多一组「B站鬼畜」，不进推荐页。",
   supportedSearchType: ["music", "album", "artist", "sheet"],
   // 音频缓存策略：no-cache = 每次播放都重新取地址（直链带时效签名，缓存必然过期）
   cacheControl: "no-cache",
@@ -8980,6 +9118,11 @@ module.exports = {
       key: "biliMusicOnly",
       name: "Bilibili 只搜音乐区（默认开）",
       hint: "填 1 开启、0 关闭。开启后 B 站搜索限定在音乐区（父分区 3，包含音乐综合 / MV / 翻唱 / 演奏），不会再把时政、新闻、游戏视频混进歌单。冷门关键词音乐区搜不到时自动退回全站。",
+    },
+    {
+      key: "biliGuichu",
+      name: "Bilibili 鬼畜区（默认开）",
+      hint: "填 1 开启、0 关闭。开启后搜索会额外问一次 B 站鬼畜区（tids=119），并在「榜单」页多一组「B站鬼畜 · 本周热门」。鬼畜条目永远排在音乐条目之后，也**不会**出现在推荐页 —— 推荐页仍然只有正经歌单。关掉就彻底不碰鬼畜。",
     },
     {
       key: "useMiguApi",
@@ -9197,13 +9340,40 @@ module.exports = {
     });
     if (!shouldUseAppleChart()) return ne;
     const ap = Promise.resolve(appleChartEntries());
-    return Promise.all([ne, ap]).then((r) => r[0].concat(r[1]));
+    return Promise.all([ne, ap]).then((r) => {
+      const all = r[0].concat(r[1]);
+      /* 鬼畜榜单独一组，而且**只**挂在榜单页 —— 推荐页那边不掺。
+         它排在网易/Apple 之后，日常听歌的人刷不到那儿也不碍事。 */
+      if (shouldUseBilibili() && shouldBiliGuichu()) {
+        all.push({ title: "B站鬼畜", data: biliGuichuEntries() });
+      }
+      return all;
+    });
   },
   /* 榜单详情。网易的榜单条目和歌单是同一套结构，直接复用；
      Apple 的三类（歌曲 / 专辑 / 歌单）自己分流。 */
   getTopListDetail: function (topListItem) {
     if (!topListItem || !topListItem.id) return Promise.resolve(null);
     const id = String(topListItem.id);
+    if (id.indexOf(GUICHU_PREFIX) === 0) {
+      return biliGuichuRank().then((musicList) => ({
+        isEnd: true,
+        sheetItem: {
+          id: id,
+          platform: "Bilibili",
+          title: topListItem.title || "B站鬼畜区 · 本周热门",
+          artist: topListItem.artist || "Bilibili 鬼畜",
+          artwork: (musicList[0] && musicList[0].artwork) || topListItem.artwork || "",
+          worksNum: musicList.length,
+          playCount: 0,
+          description: topListItem.description || "",
+        },
+        musicList: musicList,
+      })).catch((e) => {
+        console.log("[粽子] 鬼畜榜失败: " + e.message);
+        return { isEnd: true, sheetItem: topListItem, musicList: [] };
+      });
+    }
     if (id.indexOf("apchart:") === 0 || id.indexOf("apalbum:") === 0 || id.indexOf("applaylist:") === 0) {
       return appleChartDetail(topListItem).catch((e) => {
         console.log("[粽子] Apple 榜单详情失败: " + e.message);
