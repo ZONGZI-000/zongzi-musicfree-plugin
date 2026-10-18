@@ -561,6 +561,12 @@ const _audioProbeCache = {};
  *  ok    = 魔数是真音频（ID3/MP3/Ogg/FLAC/ftyp/WebM）
  *  total = 音频总字节数；拿不到（服务端不给 Content-Range）= 0 */
 async function probeAudio(url, extraHeaders) {
+  /* data: URI 直接判活，绝不发请求。
+     整首内联（YouTube / B站）返回的就是几 MB 的 base64 字符串，
+     交给 axios 会被当成 URL 去解析，既慢又可能卡死整个取流。 */
+  if (String(url).indexOf("data:") === 0) return { ok: true, total: 0 };
+  /* B 站 CDN 必须带 Referer，否则 403。这里统一补，省得每个调用点都记着传。 */
+  if (!extraHeaders && /bilivideo/.test(String(url))) extraHeaders = { Referer: "https://www.bilibili.com/" };
   const hit = _audioProbeCache[url];
   if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.v;
   const out = { ok: false, total: 0 };
@@ -612,7 +618,10 @@ async function verifyPlayable(url, extraHeaders) {
  *  时长未知的条目不再一律放行 —— 那是 4.9.24 之前最大的漏网口子：
  *  咪咕直出、酷我搜索给的 duration 大量是 0，等于全部免检。
  *  现在改成「拿不到总字节数就放行，拿得到就按 400KB 绝对下限判」。 */
-const MIN_BYTES_PER_SEC = 6 * 1024; // ≈48kbps
+/* 阈值取 36kbps（4.5KB/s）。原来的 48kbps 会把 B 站 48kbps 档的鬼畜流
+   误判成"试听片段"（实测 85 秒 857KB = 82kbps 能过，但 48kbps 档正好压线），
+   于是一路去走跨平台兜底，光等待就 15~20 秒，表现就是"点了半天不播"。 */
+const MIN_BYTES_PER_SEC = 4.5 * 1024; // ≈36kbps
 /* 时长未知时的绝对下限：整首歌不可能小于 400KB（就算 64kbps 也有 1.5MB）。
    拿它兜住「平台不给时长 → 免检通行」这个洞。 */
 const MIN_FULL_BYTES = 400 * 1024;
@@ -3244,13 +3253,13 @@ const INLINE_CHUNK = 256 * 1024;
 const INLINE_CONCURRENCY = 4;
 
 /** 下载单个 Range 块。返回 Uint8Array，失败返回 null。 */
-async function fetchRange(url, start, end) {
+async function fetchRange(url, start, end, extraHeaders) {
   try {
     const r = await axios_1.get(url, {
       timeout: 20000,
       responseType: "arraybuffer",
       validateStatus: () => true,
-      headers: { "User-Agent": UA, Range: "bytes=" + start + "-" + end },
+      headers: Object.assign({ "User-Agent": UA, Range: "bytes=" + start + "-" + end }, extraHeaders || {}),
       maxContentLength: (end - start + 1) * 2,
     });
     if (!r || !r.data) return null;
@@ -3266,12 +3275,13 @@ async function fetchRange(url, start, end) {
  *
  * ⚠️ 必须分块并发下载：整文件单请求会被 YouTube 卡死 70 秒后 abort。
  */
-async function inlineAudio(url, sizeHint, mimeHint) {
+async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes) {
   const size = Number(sizeHint || 0);
-  if (!size || size > YT_INLINE_MAX_BYTES) return null;
+  const cap = Number(maxBytes) || YT_INLINE_MAX_BYTES;
+  if (!size || size > cap) return null;
 
   // 先拉第一块确认能下、并验魔数（省得白下整首才发现是错误页）
-  const first = await fetchRange(url, 0, Math.min(INLINE_CHUNK, size) - 1);
+  const first = await fetchRange(url, 0, Math.min(INLINE_CHUNK, size) - 1, extraHeaders);
   if (!first || first.length < 4096) return null;
   {
     const x = (i) => first[i] || 0;
@@ -3299,7 +3309,7 @@ async function inlineAudio(url, sizeHint, mimeHint) {
     while (!failed && cursor < ranges.length) {
       const idx = cursor++;
       const [s, e] = ranges[idx];
-      const part = await fetchRange(url, s, e);
+      const part = await fetchRange(url, s, e, extraHeaders);
       if (!part) { failed = true; return; }
       u8.set(part, s);
       filled += part.length;
@@ -3310,7 +3320,7 @@ async function inlineAudio(url, sizeHint, mimeHint) {
   await Promise.all(workers);
 
   if (failed || filled < size * 0.98) return null;
-  if (u8.length < 4096 || u8.length > YT_INLINE_MAX_BYTES) return null;
+  if (u8.length < 4096 || u8.length > cap) return null;
 
   const isWebm = u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3;
   const b64 = b64FromU8(u8);
@@ -3587,8 +3597,10 @@ async function biliStreams(bvid) {
 
   const out = [];
   // 普通音频（字段是 baseUrl，不是 url）
+  // backupUrl 一并收下：B 站给同一档音频分发 3 个 CDN 域名，
+  // 单个节点偶尔会慢到超时（实测见过 15 秒才回第一块），换域名比重走兜底快得多。
   (dash.audio || []).forEach((a) => {
-    if (a.baseUrl) out.push({ kind: "audio", id: a.id, bw: a.bandwidth || 0, url: a.baseUrl });
+    if (a.baseUrl) out.push({ kind: "audio", id: a.id, bw: a.bandwidth || 0, url: a.baseUrl, alts: a.backupUrl || [] });
   });
   // 杜比
   if (dash.dolby && dash.dolby.audio) {
@@ -3605,17 +3617,65 @@ async function biliStreams(bvid) {
   return out;
 }
 
+/* B 站整首预下载。
+ *
+ * 为什么要做：API 拿到的是带签名的直链，而 B 站 CDN 对"没带 Referer 的请求"
+ * 直接 403。插件内部验活时会手动补这个头，但播放器只拿到一条裸 URL ——
+ * 它不会补。实际表现是：点播放能"打开"，播两秒超时，自动跳下一首。
+ * 预下载成 data: URI 后播放器零网络请求，这个问题从根上消失。
+ *
+ * 实测：85~129 秒的鬼畜音频 0.8~3MB，下载 + base64 一共 0.3~1 秒。
+ */
+/* 上限 8MB：内联缓存只留 3 首（见 INLINE_CACHE_MAX），8MB×3 = 24MB 是
+   Hermes 能接受的上限。超过 8MB 的长音频自动退回流式，播放器照样能放。 */
+const BILI_INLINE_MAX_BYTES = 8 * 1024 * 1024;
+
+function shouldInlineBili() {
+  try {
+    const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
+    const v = vars.inlineBili;
+    if (v === undefined || v === null || v === "") return true;
+    return !(v === "0" || v === "false" || v === "off");
+  } catch (e) { return true; }
+}
+
+const BILI_CDN_HEADERS = () => ({ Referer: "https://www.bilibili.com/" });
+
 async function biliFetchUrl(bvid, quality) {
   const list = await biliStreams(bvid);
   const pool = list.filter((x) => x.kind === "audio");
   const use = pool.length ? pool : list;
-  // super 取最高，其余取较低的那档省流量
-  const pick = lossless(quality) || quality === "320k" ? use[0] : use[use.length - 1];
-  // B站 CDN 必须带 Referer，否则 403
-  if (!(await verifyPlayable(pick.url, { Referer: "https://www.bilibili.com/", Cookie: biliCookie }))) {
-    throw new Error("bili: 地址不可播");
+
+  /* 挑档规则：先按音质选，再按可用性选节点。
+     旧代码对 standard/low 直接取 use[use.length-1]（最低档），
+     而 B 站低档就是 48kbps —— 既难听，又正好压在"是否试听片段"的判定线上。 */
+  let order;
+  if (lossless(quality) || quality === "320k") {
+    order = use.slice();                     // 最高档优先
+  } else {
+    const target = 132000;                   // 最接近 128k 的那档
+    order = use.slice().sort((a, b) => Math.abs(a.bw - target) - Math.abs(b.bw - target));
   }
-  return pick.url;
+
+  const errors = [];
+  for (let i = 0; i < order.length; i++) {
+    const cands = [order[i].url].concat(order[i].alts || []);
+    for (let j = 0; j < cands.length; j++) {
+      const u = cands[j];
+      if (!u) continue;
+      // B 站 CDN 必须带 Referer，否则 403
+      const pr = await probeAudio(u, BILI_CDN_HEADERS());
+      if (!pr.ok) { errors.push(Math.round(order[i].bw / 1000) + "k#" + j); continue; }
+      if (shouldInlineBili() && pr.total && pr.total <= BILI_INLINE_MAX_BYTES) {
+        try {
+          const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(), BILI_INLINE_MAX_BYTES);
+          if (dataUri) return dataUri;       // 播放器零请求，最稳
+        } catch (e) { /* 失败就退回流式 */ }
+      }
+      return u;
+    }
+  }
+  throw new Error("bili: 没有可播的音频节点（试过 " + errors.join("/") + "）");
 }
 
 async function resolveBilibili(id, want, quality) {
@@ -7858,8 +7918,20 @@ async function searchMusicAll(query, page) {
      整批判成无关：搜「摇晃帝国」时 keep=0，于是回退成「一条都不筛」，
      咪咕那六条《摇晃》反而全冒出来了。
      query 先注册为真，别名兜在后面。 */
-  const aliasList = await aliasPromise;
-  const matchAnchors = [query].concat(aliasList);
+  const aliasListRaw = await aliasPromise;
+  /* ⚠️⚠️ 这里有个致命的坑，必须挡掉（2026-10-18 定位到）：
+     反查拿到的是「这串词指向哪位歌手」，但这个结论只对**纯歌手名查询**成立。
+     一旦查询是「歌名 + 歌手」（「晴天 周杰伦」），反查照样会返回歌手名
+     ["周杰倫","周杰伦"]，而我们把它注册成「晴天周杰伦 的别名」。
+     于是 isArtistQuery("晴天 周杰伦", "周杰伦") 命中 →
+     周杰伦的**每一首**歌都被判成 tier=3「完全匹配」，
+     列表前十几位全是《最后的战役》《东风破》《星晴》《花海》。
+     用户看到的就是「搜晴天，结果一堆别的歌」。
+     判据：查询里带空格、且反查结果和查询串不是同一个人名时，不注册。
+     纯歌手名查询（「周杰伦」「IGU Band」「摇晃帝国」）仍然照旧注册。 */
+  const queryHasSpace = /\s/.test(String(query).trim());
+  const aliasList = queryHasSpace ? [] : aliasListRaw;
+  const matchAnchors = [query].concat(aliasListRaw);   // 匹配锚点仍然可以用全部别名
   /* 反查到的别名注册成「同一身份」，供 isArtistQuery 使用。
      ⚠️ 这一步必须在 detectArtistQuery 之前 ——
         实测搜「IGU Band」：B 站/YouTube 拿别名「那我懂你意思了」搜回来 12 条，
@@ -9181,10 +9253,10 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.26",
+  version: "4.9.27",
   author: "粽子 & Alma",
   description:
-    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。v4.9.25 接入 B 站鬼畜区：搜索并上 tids=119，榜单页多一组「B站鬼畜」，不进推荐页。v4.9.26 鬼畜取消整体下沉，按匹配度正常排序（原唱仍靠权威目录排第一）。",
+    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。v4.9.25 接入 B 站鬼畜区：搜索并上 tids=119，榜单页多一组「B站鬼畜」，不进推荐页。v4.9.26 鬼畜取消整体下沉，按匹配度正常排序（原唱仍靠权威目录排第一）。v4.9.27 修 B 站播两秒跳歌：取流地址必须带 Referer，且改为整首预下载；同时修 48kbps 音源被误判成试听片段。",
   supportedSearchType: ["music", "album", "artist", "sheet"],
   // 音频缓存策略：no-cache = 每次播放都重新取地址（直链带时效签名，缓存必然过期）
   cacheControl: "no-cache",
@@ -9235,6 +9307,11 @@ module.exports = {
       key: "inlineYoutube",
       name: "YouTube 整首预载（默认开）",
       hint: "填 1 开启、0 关闭。开启后 YouTube 的每首歌会先完整下载并内联，播放时不卡（代价是首次多等 2~5 秒）。超过 6MB 的文件会自动回退流式。其它平台不受影响。",
+    },
+    {
+      key: "inlineBili",
+      name: "Bilibili 整首预下载（默认开）",
+      hint: "填 1 开启、0 关闭。开启后 B 站音频会先整首下载进内存再交给播放器。B 站 CDN 强制要求 Referer，播放器拿裸链接会 403（表现为播两秒超时跳下一首）；预下载能彻底避开。单曲约 1~3MB，多等 0.3~1 秒。",
     },
     {
       key: "prefetch",

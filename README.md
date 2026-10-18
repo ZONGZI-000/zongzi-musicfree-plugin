@@ -54,6 +54,10 @@ https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/vers
 | `useBilibili` | 开 | Bilibili 参与搜索 |
 | `useYoutube` | 开 | YouTube 参与搜索 |
 | `useMiguApi` | 开 | 咪咕直出参与搜索 |
+| `biliMusicOnly` | 开 | Bilibili 只搜音乐区 |
+| `biliGuichu` | 开 | Bilibili 鬼畜区（搜索 + 榜单页，不进推荐） |
+| `inlineYoutube` | 开 | YouTube 整首预载（超 6MB 退流式） |
+| `inlineBili` | 开 | Bilibili 整首预下载（超 8MB 退流式） |
 | `jooxCookie` | 空 | JOOX 登录 Cookie（不填则不参与） |
 | `feishuWebhook` | 空 | 拿到播放地址后推送到飞书 |
 
