@@ -7885,7 +7885,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.18",
+  version: "4.9.19",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
@@ -7896,12 +7896,13 @@ module.exports = {
   //    App 会 axios.get(srcUrl) 拉取这份脚本，比对里面的 version，
   //    比已装的旧就自动替换（见 pluginManager/index.ts 的 installPluginFromUrl + compare）。
   //    所以每次发版必须改 version，否则 App 认为「已是最新」不会更新。
-  /* ⚠️ 文件名别改回 zongzi.js —— 实测 2026-10-18，Gitee 会对这个文件
-     间歇性返回 451「The content may contain violation information」，
-     连历史版本都下不来，App 的「检查更新」全部失败。
-     同一份内容换个文件名就能正常下载。所以发布文件名带版本号：
-     某个具体文件被风控标记时，下次发版换个新名字就绕过去了。
-     发版时记得同步改这里的版本号。 */
+  /* 更新源：GitHub raw（固定名，2026-10-18 起弃用 Gitee）。
+     Gitee 会静默风控 js 文件——上传返回 200、下载返回 451，
+     而且整个仓库跟着不可用，历史版本也下不来，所以彻底迁走了。
+     GitHub 不做内容审核，这个固定地址永远指向 master 上的最新版，
+     「检查更新」不会再断链。每次发版记得改 version，否则 App 认为已是最新。
+     国内直连 raw 慢时可换 jsDelivr 镜像（有 12 小时缓存，发版后不一定立刻生效）：
+     https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/zongzi.js */
   srcUrl: "https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/zongzi.js",
   userVariables: [
     {

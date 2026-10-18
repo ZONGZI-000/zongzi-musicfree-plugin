@@ -7,18 +7,18 @@
 MusicFree → 设置 → 插件 → 从网络安装，粘贴：
 
 ```
-https://gitee.com/zongziiiiiiiiiiiiiiiiiiiiiiiiiiii/zongzi-musicfree-plugin/raw/master/zongzi-4.9.8.js
+https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/zongzi.js
 ```
 
-Gitee 会间歇性对 js 文件返回 451「内容违规」，那种时候换 GitHub 镜像：
+国内直连 GitHub raw 慢的话，用 jsDelivr 镜像（有 12 小时缓存，新版不一定立刻生效）：
 
 ```
-https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/zongzi-4.9.8.js
+https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/zongzi.js
 ```
 
 ## 更新
 
-插件里写了 `srcUrl` 指向这个地址，所以 MusicFree 里点「检查更新」就会拉最新版。
+插件里写了 `srcUrl` 指向上面那个固定地址，所以 MusicFree 里点「检查更新」就会拉最新版。
 
 > 必须版本号变大才会更新（App 用 `compare(oldVersion, newVersion, ">")` 判断）。
 
@@ -50,6 +50,12 @@ https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/zong
 ```bash
 ./publish.sh "更新说明"
 ```
+
+脚本会读源码里的 version、复制成 `zongzi.js` 和 `zongzi-<version>.js`、推送 GitHub，然后回读远程比对版本号和内容。
+
+## 历史
+
+2026-10-18 起弃用 Gitee：它会静默风控含特定字样的 js 文件，上传返回 200 而下载返回 451，整个仓库连带不可用。现在只走 GitHub。
 
 ## 免责
 
