@@ -6002,9 +6002,63 @@ const MIX_CONTRAST = {
 const DZ_COVER_TTL = 24 * 60 * 60 * 1000;
 const DZ_COVER_CACHE = {};
 
-/** 某个分类的 Deezer 封面（缓存 24h，一次抓 5 张轮着用） */
+/* 自绘封面（D:\workspace\zongzi-musicfree-plugin/covers）：
+   白发红瞳 Q 版小女孩 + 墨绿连衣裙 + 拼图波形 + 「拼好歌」手写标题，
+   一条 1080×1080 方图。走 jsDelivr，国内比 raw 快且能缓存。
+   没画的分类继续用 Deezer 的图兜底，不会出现空封面。 */
+const COVER_CDN = "https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/covers/";
+const MIX_COVERS = {
+  "华语": ["huayu.jpg"],
+  "古风": ["gufeng.jpg", "gufeng2.jpg"],
+  "爵士": ["jazz.jpg"],
+  "电子": ["electronic.jpg"],
+  "摇滚": ["rock.jpg"],
+  "夜晚": ["night.jpg"],
+  "深夜": ["night.jpg"],
+  "治愈": ["healing.jpg"],
+  "钢琴": ["piano.jpg"],
+  "轻音乐": ["piano.jpg"],
+  "流行": ["huayu.jpg"],
+};
+
+/* 拼单卡片上的一句话介绍：写单子里是什么歌，不写怎么挑出来的。 */
+const MIX_BLURB = {
+  "全部": "什么都有的一单，一天里能逛完好几种风格，顺着听不跳戏。",
+  "华语": "华语流行的横切面：慢情歌、都市感、热血一点的摇滚和几首老民谣。",
+  "流行": "当下最顺耳的那一挂，副歌一响就能跟上。",
+  "摇滚": "吉他和鼓往前推，别管歌词，先把音量拧大。",
+  "民谣": "木吉他配人声，词比编曲更重，适合一个人走夜路。",
+  "电子": "合成器铺底的流动感，一浪一浪往上推，适合开车和夜跑。",
+  "爵士": "钢琴、贝斯、轻鼓刷，适合开一盏灯慢慢听。",
+  "古风": "古筝与箫铺底，词里带山水旧事，安静但有余味。",
+  "轻音乐": "没有人声的一单，手上在做事、耳朵也不闲着。",
+  "钢琴": "只有琴键的一单，适合看书、写字、发呆。",
+  "夜晚": "音色都放软了，适合灯关一半的时候听。",
+  "深夜": "很轻的一单，人声靠后，乐器靠前。",
+  "治愈": "没有攻击性的一单，累了但还想听见点声音的时候打开。",
+  "粤语": "词咬得紧、情绪收得住，港乐那股劲儿还在。",
+  "欧美": "欧美主流的一单，副歌大、制作干净。",
+  "日语": "日系旋律优先，编曲细，容易上瘾。",
+  "韩语": "韩系主流一单，节奏亮、人声甜。",
+  "说唱": "押韵和鼓点顶在最前面的一单。",
+  "R&B/Soul": "夜里的转音和鼓机，适合戴耳机慢慢听。",
+  "伤感": "适合一个人待着的时候听，不劝你振作。",
+  "怀旧": "往前翻十年的歌，前奏一响就回到那个时候。",
+  "经典": "绕不开的老歌都在这一单里。",
+  "ACG": "番剧和游戏里的旋律，燃的和软的都有。",
+  "运动": "节奏贴着脚步走，撑完最后十分钟用。",
+  "驾车": "路上听的一单，副歌够大，不催眠。",
+  "浪漫": "慢拍情歌为主，适合两个人待着。",
+  "放松": "音量不用大，背景里有声音就够了。",
+};
+const mixBlurb = (cat) => MIX_BLURB[cat] ||
+  (cat + "这一类的今日份，风格集中，从头听下去不跳戏。");
+
+/** 某个分类的拼单封面：优先自绘那套，没有就回 Deezer 现搜（缓存 24h，一次 5 张） */
 async function dzCovers(cat) {
   const key = cat || "全部";
+  const own = MIX_COVERS[key];
+  if (own && own.length) return own.map((f) => COVER_CDN + f);
   const hit = DZ_COVER_CACHE[key];
   if (hit && Date.now() - hit.at < DZ_COVER_TTL) return hit.v;
   /* 降级链：分类词 → 泛流派词 → 空。宁可没图，也不能卡住整页。 */
@@ -6056,8 +6110,7 @@ async function mixEntries(cat, fallbackArt) {
       artwork: covers.length ? covers[(i - 1) % covers.length] : fb,
       worksNum: MIX_TRACKS,
       playCount: 0,
-      description: "自拼歌单：同一歌手最多 " + MIX_ARTIST_CAP +
-        " 首、整单打乱、同歌手不相邻、三分之二处插一首反差歌。",
+      description: mixBlurb(c),
       _provider: "mix",
     });
   }
@@ -6172,9 +6225,17 @@ async function mixSheetDetail(recipe) {
       artwork: covers.length ? covers[(seq - 1) % covers.length] : (musicList[0] && musicList[0].artwork) || "",
       worksNum: musicList.length,
       playCount: 0,
-      description: "共 " + musicList.length + " 首。同一歌手最多 " + MIX_ARTIST_CAP +
-        " 首、整单打乱、同歌手不相邻、三分之二处一首反差歌（来自「" +
-        (MIX_CONTRAST[cat] || "爵士") + "」）。",
+      description: (() => {
+        /* 介绍单子里有什么，不暴露怎么配比的。歌手名取前三，去重。 */
+        const names = [];
+        musicList.forEach((s) => {
+          const n = splitSingers(s.artist)[0];
+          if (n && names.indexOf(n) < 0) names.push(n);
+        });
+        const head = names.slice(0, 3).join("、");
+        return mixBlurb(cat) +
+          (head ? " 收录 " + head + " 等 " + musicList.length + " 首。" : " 共 " + musicList.length + " 首。");
+      })(),
     },
     musicList: musicList,
   };
@@ -9267,7 +9328,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.27",
+  version: "4.9.28",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。v4.9.25 接入 B 站鬼畜区：搜索并上 tids=119，榜单页多一组「B站鬼畜」，不进推荐页。v4.9.26 鬼畜取消整体下沉，按匹配度正常排序（原唱仍靠权威目录排第一）。v4.9.27 修 B 站播两秒跳歌：取流地址必须带 Referer，且改为整首预下载；同时修 48kbps 音源被误判成试听片段。",
