@@ -7,13 +7,13 @@
 MusicFree → 设置 → 插件 → 从网络安装，粘贴：
 
 ```
-https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/zongzi.js
+https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/zongzimusic.js
 ```
 
 国内直连 GitHub raw 慢的话，用 jsDelivr 镜像（有 12 小时缓存，新版不一定立刻生效）：
 
 ```
-https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/zongzi.js
+https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/zongzimusic.js
 ```
 
 ## 更新
@@ -30,7 +30,9 @@ https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/zongzi.js
 https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/versions/zongzi-4.9.18.js
 ```
 
-主目录只留一个固定名 `zongzi.js`（永远是最新版，也是 `srcUrl` 指向的地址），避免根目录越堆越乱。
+主目录只留一个固定名 `zongzimusic.js`（永远是最新版，也是 `srcUrl` 指向的地址），避免根目录越堆越乱。
+
+`zongzi.js` 仍会同步一份最新内容，只为兼容还没更新到 v4.9.20 的旧安装——等大家都迁过去就会停掉。
 
 ## 包含的平台
 
@@ -61,7 +63,7 @@ https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/vers
 ./publish.sh "更新说明"
 ```
 
-脚本会读源码里的 version、复制成 `zongzi.js` 和 `zongzi-<version>.js`、推送 GitHub，然后回读远程比对版本号和内容。
+脚本会读源码里的 version、复制成 `zongzimusic.js`、兼容用的 `zongzi.js`，以及 `versions/zongzi-<version>.js`、推送 GitHub，然后回读远程比对版本号和内容。
 
 ## 历史
 

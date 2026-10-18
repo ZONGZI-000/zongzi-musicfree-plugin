@@ -7885,7 +7885,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.19",
+  version: "4.9.20",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
@@ -7903,7 +7903,7 @@ module.exports = {
      「检查更新」不会再断链。每次发版记得改 version，否则 App 认为已是最新。
      国内直连 raw 慢时可换 jsDelivr 镜像（有 12 小时缓存，发版后不一定立刻生效）：
      https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/zongzi.js */
-  srcUrl: "https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/zongzi.js",
+  srcUrl: "https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/zongzimusic.js",
   userVariables: [
     {
       key: "feishuWebhook",

@@ -9,10 +9,10 @@ set -e
 
 SRC="D:/workspace/lx-music-sources/musicfree-plugin/plugin.js"
 DIR="D:/workspace/zongzi-musicfree-plugin"
-OUT="$DIR/zongzi.js"
+OUT="$DIR/zongzimusic.js"
 GH_USER="ZONGZI-000"
 GH_REPO="zongzi-musicfree-plugin"
-URL="https://raw.githubusercontent.com/$GH_USER/$GH_REPO/master/zongzi.js"
+URL="https://raw.githubusercontent.com/$GH_USER/$GH_REPO/master/zongzimusic.js"
 MSG="${1:-更新}"
 
 echo "==> 1/4 读版本号"
@@ -33,9 +33,13 @@ if ! cmp -s "$SRC" "$OUT"; then
 fi
 node -e "console.log('    ' + (require('fs').statSync('$OUT').size/1024).toFixed(1) + ' KB')"
 
-echo "==> 3/4 提交并推送（固定名 + 带版本号各一份）"
+echo "==> 3/4 提交并推送（固定名 + 兼容名 + 带版本号）"
 cd "$DIR"
-cp -f "$OUT" "$DIR/zongzi-$VERSION.js"
+cp -f "$OUT" "$DIR/versions/zongzi-$VERSION.js"
+# 兼容旧安装：老用户的 srcUrl 还指着 zongzi.js，
+# 只发新名他们就永远收不到这次更新（也就永远换不到新地址）。
+# 所以 zongzi.js 作为镜像一起发，等大家都迁过去再停。
+cp -f "$OUT" "$DIR/zongzi.js"
 git add -A
 if git diff --cached --quiet; then
   echo "    没有新改动，跳过提交"
@@ -71,6 +75,6 @@ echo "MusicFree 安装/更新地址（固定）："
 echo "   $URL"
 echo ""
 echo "国内连不上 raw 时的镜像："
-echo "   https://cdn.jsdelivr.net/gh/$GH_USER/$GH_REPO@master/zongzi.js"
+echo "   https://cdn.jsdelivr.net/gh/$GH_USER/$GH_REPO@master/zongzimusic.js"
 echo ""
 echo "去 MusicFree → 插件 → 粽子音源 → 检查更新"
