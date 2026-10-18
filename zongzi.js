@@ -1166,24 +1166,82 @@ async function neteaseArtistAliases(query) {
       }
     );
     const arts = (r.data && r.data.result && r.data.result.artists) || [];
-    for (let i = 0; i < Math.min(3, arts.length); i++) {
-      const a = arts[i];
-      const names = [a.name].concat(a.alias || [], a.transNames || [], a.alia || []);
-      // 置信度：查询词跟歌手名/别名至少要有 2 个字连续重合
-      let ok = false;
-      for (let j = 0; j < names.length; j++) {
-        if (lcsLen(q, names[j]) >= 2) { ok = true; break; }
+    /* 置信度不再只看「跟查询词有几个字重合」。
+       ⚠️ 踩过的坑：搜「彩虹乐队」，网易云歌手搜索第一条是 Rainbow
+          （跟查询词一个字都不重合，直接跳过），第二条却是「人造彩虹乐队」
+          —— 它跟查询词连续重合 4 个字，按「重合 ≥2」的规则会被判成答案，
+          于是拿一个野鸡乐队的名字去搜 B 站。
+       真正能证明「这串词指的是这位歌手」的信号在**歌曲搜索**里：
+       谁在结果里占压倒性多数。实测
+         摇晃帝国 → ゆらゆら帝国 11/20（55%）  ← 是乐队译名
+         晴天     → 最多 2/20（10%）          ← 是歌名
+         起风了   → 最多 3/20（15%）          ← 是歌名
+       所以先看歌曲结果里的占比，认出来之后再去歌手结果里取同名条目的
+       name / alias / transNames（译名、假名、罗马音都在里面）。 */
+    const sres = await axios_1.post(
+      "https://music.163.com/api/cloudsearch/pc",
+      "s=" + encodeURIComponent(q) + "&type=1&limit=20&offset=0",
+      {
+        timeout: 12000,
+        headers: Object.assign({}, NETEASE_HEADERS, {
+          "Content-Type": "application/x-www-form-urlencoded",
+        }),
+        validateStatus: () => true,
       }
-      if (!ok) continue;
-      // 只收「看起来是同一个东西」的别名，最多 4 个
-      for (let j = 0; j < names.length; j++) {
-        const n = String(names[j] || "").trim();
-        if (!n || n === q) continue;
-        if (lcsLen(q, n) < 2 && names[j] !== a.name) continue;
-        if (out.indexOf(n) < 0) out.push(n);
-        if (out.length >= 4) break;
+    );
+    const songs = (sres.data && sres.data.result && sres.data.result.songs) || [];
+    const cnt = {};
+    /* ⚠️ cloudsearch 版的字段名跟 /api/search/get 不一样：
+       歌手在 `ar` 里（还有 `tns` = 译名），不是 `artists`。
+       按 artists 取值会一路拿到空对象，反查永远返回空数组 ——
+       表面上不报错，功能却整条失效。两个都读一遍。 */
+    const songArs = {};
+    for (let i = 0; i < songs.length; i++) {
+      const ars = songs[i].ar || songs[i].artists || [];
+      for (let j = 0; j < ars.length; j++) {
+        const nm = String(ars[j].name || "");
+        if (!nm) continue;
+        cnt[nm] = (cnt[nm] || 0) + 1;
+        if (!songArs[nm]) songArs[nm] = ars[j];
       }
-      break;
+    }
+    const ranked = Object.keys(cnt).sort((x, y) => cnt[y] - cnt[x]);
+    const topName = ranked[0] || "";
+    const topCnt = topName ? cnt[topName] : 0;
+    /* 再卡一道「这串词是不是本来就是歌名」。
+       ⚠️ 只靠歌手占比不够：搜《海阔天空》，结果 18/20 的标题里都写着
+          「海阔天空」，其中 Beyond 占的份额也可能过线 ——
+          一旦解析成 Beyond，B 站就会拿歌手名去搜，
+          结果变成 Beyond 全部作品，用户要的那首歌被淹掉。
+       判据：**标题里含查询词的比例**。
+         海阔天空 18/20（90%） 晴天 16/20（80%） 起风了 20/20
+         摇晃帝国  0/20        周杰伦 0/20        米津玄师 0/20
+       过一半就当歌名查询，不做反查。 */
+    let titleHit = 0;
+    const qn = normTextZ(q);
+    for (let i = 0; i < songs.length; i++) {
+      if (normTextZ(String(songs[i].name || "")).indexOf(qn) >= 0) titleHit++;
+    }
+    const looksLikeSong = songs.length > 0 && titleHit * 2 >= songs.length;
+    // 至少 3 条、且占结果的 40% 以上，才认「这串词就是这位歌手」
+    if (!looksLikeSong && topName && topCnt >= 3 && topCnt * 10 >= songs.length * 4) {
+      const tn = normTextZ(topName);
+      for (let i = 0; i < arts.length; i++) {
+        const a = arts[i];
+        if (normTextZ(a.name) !== tn) continue;
+        const names = [a.name].concat(a.alias || [], a.transNames || [], a.alia || []);
+        /* 译名藏在**曲目**的 ar.tns 里（歌手对象的 tns 是 null）。
+           搜「摇晃帝国」时正是靠这里拿到「摇摆帝国」这个中文译法。 */
+        const sa = songArs[topName];
+        if (sa) names.push.apply(names, [].concat(sa.tns || [], sa.alias || [], sa.alia || []));
+        for (let j = 0; j < names.length; j++) {
+          const n = String(names[j] || "").trim();
+          if (!n || normTextZ(n) === normTextZ(q)) continue;
+          if (out.indexOf(n) < 0) out.push(n);
+          if (out.length >= 4) break;
+        }
+        break;
+      }
     }
   } catch (e) { /* 反查失败就当没有，不影响主流程 */ }
   cachePut("alias", q, "", out);
@@ -5260,6 +5318,9 @@ const RESOLVERS = {
 function compareRank(a, b) {
   // tier 越大越好（3 完全匹配 / 2 沾边 / 1 变体），降序
   if (a._tier !== b._tier) return (b._tier || 0) - (a._tier || 0);
+  // 相关性闸门降权（原因见 searchMusicAll 里 _rel 的注释）
+  const ra = a._rel || 0, rb = b._rel || 0;
+  if (ra !== rb) return rb - ra;
   // extra 越小越好（多出来的字数少）
   if (a._extra !== b._extra) return (a._extra || 0) - (b._extra || 0);
   /* auth 排在 bone 前面。
@@ -5286,6 +5347,15 @@ async function searchMusicAll(query, page) {
   if (page !== 1) return { isEnd: true, data: [] };
 
   const settled = [];
+
+  /* 原名/别名反查只发一次请求，三处共用：
+     ① B 站用原名去搜（B 站不认「摇晃帝国」这个译名）
+     ② YouTube 同上
+     ③ 最后的相关性闸门 —— 这一处最容易被忘：闸门只认原查询词的话，
+        拿原名搜回来的正确结果会被整批判成「跟查询无关」，
+        拦空之后又回退成「不筛」，噪声反而全都回来了。
+     （实测 2026-10-18：B 站 7 条全被拦，最后只剩咪咕的《摇晃》） */
+  const aliasPromise = neteaseArtistAliases(query).catch(() => []);
 
   function toItem(raw, provider) {
     return {
@@ -5347,7 +5417,7 @@ async function searchMusicAll(query, page) {
     jobs.push(
       // YouTube 也走一次原名反查：搜「摇晃帝国」在 YouTube 上是空手，
       // 换成反查到的「Yura Yura Teikoku」就能搜到。
-      neteaseArtistAliases(query).then((aliases) => {
+      aliasPromise.then((aliases) => {
         const anchors = [query].concat(aliases);
         const kws = aliases.length ? aliases.concat([query]) : [query];
         // 依次试，第一次拿到结果就停（避免多打请求拖慢整体）
@@ -5413,7 +5483,7 @@ async function searchMusicAll(query, page) {
       // ⚠️ 先做一次原名反查（网易云歌手接口），把译名/别名一起拿来搜。
       //    B 站不认「摇晃帝国」这个中文译名，只认「ゆらゆら帝国」；
       //    反查拿到原名后，B 站和 YouTube 都能搜到正确结果。
-      neteaseArtistAliases(query).then(async (aliases) => {
+      aliasPromise.then(async (aliases) => {
         const anchors = [query].concat(aliases);
         // 有原名就先拿原名搜（原名召回远好于译名），译名留着当兜底
         const kws = aliases.length ? aliases.concat([query]) : [query];
@@ -5522,6 +5592,13 @@ async function searchMusicAll(query, page) {
   // 它们 tier=1 但如果没有这道门槛，照样排在列表里占位。
   const qcore = coreTitle(toSimplified(query));
   const qflat = flatTitle(toSimplified(query));
+  /* 原名反查的结果在这里也要能看到 —— 下面那道「跟查询有关吗」的闸门
+     必须连同别名一起认，否则拿原名搜回来的 B 站/YouTube 结果会被
+     整批判成无关：搜「摇晃帝国」时 keep=0，于是回退成「一条都不筛」，
+     咪咕那六条《摇晃》反而全冒出来了。
+     query 先注册为真，别名兜在后面。 */
+  const aliasList = await aliasPromise;
+  const matchAnchors = [query].concat(aliasList);
   /* 整轮先判定「这次搜的是不是一个歌手名」。判定出来的话，
      后面所有单条打分都要换一套逻辑（见 relevanceTier / relevanceExtra）。 */
   const artistQuery = detectArtistQuery(query, filtered2);
@@ -5586,6 +5663,23 @@ async function searchMusicAll(query, page) {
             最后只剩 YouTube 那些标题里带名字的八卦视频。
             歌手对得上就是有关系的，轮不到标题说话。 */
       if (artistQuery || isArtistQuery(query, it.artist)) return true;
+      /* 0.5) 标题命中原名/别名也算有关。
+         B 站/YouTube 那两路是**拿原名搜的**，回来的标题里写的是
+         「ゆらゆら帝国」，跟用户输入的「摇晃帝国」一个字都不重合。
+         不认别名的话这两路的结果会被这道闸门全删 ——
+         而它们恰恰是这个功能唯一想要的产出。 */
+      if (aliasList.length && titleMatchesAnchors(it.title, matchAnchors, query)) return true;
+      /* 0.6) 演唱者字段命中别名也算（YouTube 的 Topic 频道条目、
+             B 站投稿标题里只写艺人名的情况） */
+      if (aliasList.length) {
+        const an2 = normTextZ(it.artist);
+        if (an2) {
+          for (let k = 0; k < aliasList.length; k++) {
+            const ak = normTextZ(aliasList[k]);
+            if (ak && an2.indexOf(ak) >= 0) return true;
+          }
+        }
+      }
       // 1) 标题包含完整查询（最理想）
       if (qcore && tcore && tcore.indexOf(qcore) >= 0) return true;
       if (qflat && tflat && tflat.indexOf(qflat) >= 0) return true;
@@ -5601,9 +5695,16 @@ async function searchMusicAll(query, page) {
       if (qcoreLen <= 2) return true;
       return false;
     })();
-    if (related) keep.push(it);
+    /* ⚠️ 这里以前是 `if (related) keep.push(it)` —— 直接把「跟查询沾不上边」
+       的条目删掉。删得太狠了：搜「摇晃帝国」时咪咕回的那批《摇晃》还算
+       挨着边的，一刀切下去连个兜底都没有；更糟的是万一闸门判错，
+       正确结果会被整批删光（见上面别名那段注释）。
+       用户的要求是「降权就行」，不是「不许出现」。
+       所以现在：全留下，只给它打 _rel=0 的标记，排序时压到相关条目后面。 */
+    it._rel = related ? 1 : 0;
+    keep.push(it);
   }
-  const relevant = keep.length ? keep : filtered2;
+  const relevant = keep;
   if (droppedNews) console.log("[粽子] 过滤非音乐内容 " + droppedNews + " 条");
 
   // ---- 热度：同一标题被几个平台收录 ----
@@ -5809,6 +5910,9 @@ async function searchMusicAll(query, page) {
     arr.sort((a, b) => {
       // ⚠️ tier 越大越好（3 完全匹配 / 1 变体），所以必须**降序**
       if (a._tier !== b._tier) return b._tier - a._tier;
+      // 相关性闸门降权（0 = 跟查询沾不上边，压到相关的后面，但不删）
+      const ra = a._rel || 0, rb = b._rel || 0;
+      if (ra !== rb) return rb - ra;
       if (a._extra !== b._extra) return a._extra - b._extra;
       /* Apple 歌手目录：证据最强的一层。
          它直接回答「这首是不是这个人唱片里的歌」——
@@ -6225,7 +6329,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.8",
+  version: "4.9.9",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
@@ -6242,7 +6346,7 @@ module.exports = {
      同一份内容换个文件名就能正常下载。所以发布文件名带版本号：
      某个具体文件被风控标记时，下次发版换个新名字就绕过去了。
      发版时记得同步改这里的版本号。 */
-  srcUrl: "https://gitee.com/zongziiiiiiiiiiiiiiiiiiiiiiiiiiii/zongzi-musicfree-plugin/raw/master/zongzi-4.9.8.js",
+  srcUrl: "https://gitee.com/zongziiiiiiiiiiiiiiiiiiiiiiiiiiii/zongzi-musicfree-plugin/raw/master/zongzi-4.9.9.js",
   userVariables: [
     {
       key: "feishuWebhook",
