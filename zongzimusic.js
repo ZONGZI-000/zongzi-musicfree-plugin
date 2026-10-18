@@ -5233,9 +5233,10 @@ async function kuwoSheetDetail(playlistId, page) {
  *     （trackCount 30 但 tracks 只有 10），完整列表在 trackIds 里。
  *     剩下的要靠 /api/song/detail 批量换元数据 —— trackIds 里只有 id。
  */
-async function neteaseSheetDetail(playlistId, page) {
+async function neteaseSheetDetail(playlistId, page, maxTracks) {
+  const cap = Number(maxTracks) > 0 ? Number(maxTracks) : 1000;
   const r = await axios_1.get(NETEASE_PLAYLIST_DETAIL, {
-    params: { id: playlistId, n: 1000 },
+    params: { id: playlistId, n: cap },
     timeout: 20000,
     headers: NETEASE_HEADERS,
     validateStatus: () => true,
@@ -5769,6 +5770,255 @@ async function recSheetPool(tagName) {
   const out = rotated.concat(rest);
   REC_POOL_CACHE[ck] = { at: Date.now(), v: out };
   return out;
+}
+
+/* ============================================================
+ * 「拼单」—— 自己拼的歌单
+ *
+ * 平台歌单有一个改不了的问题：顺序是平台排的，我们只能照单全收。
+ * 所以推荐页除了展示平台歌单，再自己拼几张：id 里写死生成配方，
+ * 点开时按配方当场抓歌、按四条规则重排。
+ *
+ *   mix:<分类>:<天序号>:<第几张>
+ *
+ * 四条规则（和粽子定的）：
+ *   1. 同一歌手最多 3 首
+ *   2. 整单打乱
+ *   3. 同一歌手的歌不相邻
+ *   4. 三分之二处插一首风格反差最大的歌（不放开头、不放结尾）
+ *
+ * 因为配方全在 id 里、抓取和排序都是纯函数，所以不需要任何存储，
+ * 同一天同一张每次点开内容完全一致。
+ * ============================================================ */
+const MIX_PREFIX = "mix:";
+const MIX_TRACKS = 30;          // 目标曲数
+const MIX_ARTIST_CAP = 3;       // 同一歌手最多几首
+const MIX_SRC_SHEETS = 4;       // 从几张源歌单里取材
+const MIX_SRC_LIMIT = 50;       // 每张源歌单取前多少首（只借元数据，不整张拉）
+const MIX_COUNT_PER_PAGE = 2;   // 推荐页每屏放几张拼单
+
+/** 分类 → Deezer 搜索词。拼单封面从这里取。
+    ⚠️ 只有这条路能一条条命中：拼音（gufeng）在 Deezer 是空的，
+       必须用英文风格词（guzheng）。全部 70 个分类 2026-10-18 实测过。 */
+const DZ_API = "https://api.deezer.com";
+const DZ_KW = {
+  "全部": "top charts", "华语": "chinese pop", "欧美": "western pop",
+  "日语": "japanese", "韩语": "korean", "粤语": "cantopop",
+  "流行": "pop", "摇滚": "rock", "民谣": "folk", "电子": "electronic",
+  "舞曲": "dance", "说唱": "hip hop", "轻音乐": "instrumental",
+  "爵士": "jazz", "乡村": "country", "R&B/Soul": "rnb soul",
+  "古典": "classical", "民族": "world music", "蓝调": "blues",
+  "拉丁": "latin", "New Age": "new age", "古风": "guzheng",
+  "后摇": "post rock", "英伦": "britpop", "金属": "metal", "朋克": "punk",
+  "雷鬼": "reggae", "Bossa Nova": "bossa nova", "清新": "indie pop",
+  "夜晚": "night", "学习": "study", "工作": "work", "运动": "workout",
+  "驾车": "driving", "校园": "campus", "旅行": "travel", "派对": "party",
+  "约会": "date night", "地铁": "commute", "散步": "city walk",
+  "酒吧": "bar", "咖啡馆": "cafe", "下午茶": "afternoon tea",
+  "午休": "nap", "清晨": "morning", "婚礼": "wedding",
+  "怀旧": "retro", "浪漫": "romantic", "伤感": "sad", "治愈": "healing",
+  "放松": "relax", "兴奋": "energetic", "快乐": "happy", "安静": "quiet",
+  "思念": "missing you", "孤独": "lonely", "感动": "emotional",
+  "影视原声": "soundtrack", "ACG": "anime", "游戏": "game soundtrack",
+  "儿童": "kids", "网络歌曲": "internet hits", "KTV": "karaoke",
+  "经典": "classic hits", "翻唱": "acoustic cover", "榜单": "top charts",
+  "吉他": "guitar", "钢琴": "piano", "器乐": "instrumental",
+  "综艺": "variety show", "70后": "70s", "80后": "80s",
+  "90后": "90s", "00后": "2000s", "情歌": "love songs", "城市": "city pop",
+  "现场音乐": "live music", "背景音乐": "easy listening",
+  "佛教音乐": "meditation", "DJ": "dj mix", "MC喊麦": "dance",
+  "闽南语": "taiwanese", "法语": "french music",
+};
+
+/** 反差分类：拼单里那首「换个口味」从这儿挑。刻意避开只换了语种、
+    骨子里还是同一种歌的分类（华语 → 粤语那种反差是假的）。 */
+const MIX_CONTRAST = {
+  "华语": "爵士", "流行": "后摇", "摇滚": "古典", "民谣": "电子",
+  "电子": "民谣", "爵士": "说唱", "古典": "舞曲", "说唱": "轻音乐",
+  "粤语": "金属", "欧美": "古风", "日语": "乡村", "韩语": "蓝调",
+  "古风": "雷鬼", "轻音乐": "朋克", "乡村": "电子", "金属": "民谣",
+  "后摇": "流行", "民谣": "雷鬼",
+};
+
+const DZ_COVER_TTL = 24 * 60 * 60 * 1000;
+const DZ_COVER_CACHE = {};
+
+/** 某个分类的 Deezer 封面（缓存 24h，一次抓 5 张轮着用） */
+async function dzCovers(cat) {
+  const key = cat || "全部";
+  const hit = DZ_COVER_CACHE[key];
+  if (hit && Date.now() - hit.at < DZ_COVER_TTL) return hit.v;
+  /* 降级链：分类词 → 泛流派词 → 空。宁可没图，也不能卡住整页。 */
+  const tries = [DZ_KW[key] || key, "pop", "rock"];
+  let out = [];
+  for (let i = 0; i < tries.length && !out.length; i++) {
+    try {
+      const r = await httpGet(DZ_API + "/search/playlist", { q: tries[i], limit: 5 }, {});
+      const arr = (r && r.data) || [];
+      out = arr.map((p) => p.picture_big || p.picture_medium || "").filter(Boolean);
+    } catch (e) { /* 换下一个词 */ }
+  }
+  DZ_COVER_CACHE[key] = { at: Date.now(), v: out };
+  return out;
+}
+
+const isMixId = (id) => String(id || "").indexOf(MIX_PREFIX) === 0;
+/* 分类名本身可能带冒号（QQ 独有的 q:闽南语），所以从右往前切：
+   最后两段一定是 <天序号> 和 <第几张>，剩下的整个是分类。 */
+function parseMixId(id) {
+  const body = String(id || "").slice(MIX_PREFIX.length);
+  const p = body.split(":");
+  const seq = Number(p.pop() || 1);
+  const day = Number(p.pop() || 0);
+  return { cat: p.join(":") || "全部", day: day, seq: seq };
+}
+
+/* QQ 独有的分类在 tag id 上带 q: 前缀（q:闽南语），
+   那是给取池用的，拼单的标题和封面关键词都不能带这个前缀。 */
+const mixCatName = (c) => String(c || "全部").replace(/^q:/, "");
+
+/** 推荐页顶部这几张拼单（封面异步拿，拿不到就退回池子里第一张的图，
+    保证不会出现没图的卡片） */
+async function mixEntries(cat, fallbackArt) {
+  const c = mixCatName(cat) || "全部";
+  const tag = cat || "全部";
+  const day = recDayKey();
+  let covers = [];
+  try { covers = await dzCovers(c); } catch (e) { covers = []; }
+  const fb = fallbackArt || "";
+  const out = [];
+  for (let i = 1; i <= MIX_COUNT_PER_PAGE; i++) {
+    out.push({
+      /* id 里存带前缀的 tag —— 取池时要靠它判断「这是 QQ 独有的分类」 */
+      id: MIX_PREFIX + tag + ":" + day + ":" + i,
+      platform: "粽子",
+      title: c + " · 今日拼单 " + (i === 1 ? "①" : "②"),
+      artist: "Alma 拼单",
+      artwork: covers.length ? covers[(i - 1) % covers.length] : fb,
+      worksNum: MIX_TRACKS,
+      playCount: 0,
+      description: "自拼歌单：同一歌手最多 " + MIX_ARTIST_CAP +
+        " 首、整单打乱、同歌手不相邻、三分之二处插一首反差歌。",
+      _provider: "mix",
+    });
+  }
+  return out;
+}
+
+/** 从某分类的当天池子里挑几张源歌单，把它们的前 N 首收成候选曲库 */
+async function mixSourceSongs(cat, day, seq, skipOrigin) {
+  const pool = await recSheetPool(cat);
+  if (!pool.length) return [];
+  const ordered = recDayOrder(pool, "mix|" + cat + "|" + seq, Math.floor(day / 30));
+  /* 优先网易（取流最稳），不够再补 QQ */
+  const ne = ordered.filter((x) => x.platform === "网易云" || x._provider === "netease");
+  const qq = ordered.filter((x) => x._provider === "qq");
+  const picks = ne.slice(0, MIX_SRC_SHEETS).concat(qq.slice(0, MIX_SRC_SHEETS)).slice(0, MIX_SRC_SHEETS);
+
+  const jobs = picks.map((p) => {
+    if (p._provider === "qq") {
+      return qqSheetDetail(p.id, 1).then((r) => ((r && r.musicList) || []).slice(0, MIX_SRC_LIMIT));
+    }
+    return neteaseSheetDetail(p.id, 1, MIX_SRC_LIMIT).then((r) => ((r && r.musicList) || []).slice(0, MIX_SRC_LIMIT));
+  });
+  const arrs = await Promise.all(jobs.map((j) => j.catch(() => [])));
+  const seen = {};
+  const out = [];
+  arrs.forEach((arr) => arr.forEach((s) => {
+    if (!s || !s.id || !s.title) return;
+    /* 跨歌单会撞同一首歌。用「标题+主歌手」当键，比 id 更能去重
+       （同一首在网易有不同版本 id）。 */
+    const k = normText(toSimplified(s.title)) + "|" + normText(splitSingers(s.artist)[0] || "");
+    if (seen[k]) return;
+    seen[k] = 1;
+    out.push(s);
+  }));
+  if (skipOrigin) return out.filter((s) => s._provider !== skipOrigin);
+  return out;
+}
+
+/** 按四条规则排一张拼单 */
+function mixArrange(songs, seed, contrast) {
+  const list = recShuffle(songs, seed);
+  /* 规则 1：同一歌手最多 MIX_ARTIST_CAP 首 */
+  const cnt = {};
+  const keep = [];
+  list.forEach((s) => {
+    const k = normText(splitSingers(s.artist)[0] || s.artist || "");
+    cnt[k] = (cnt[k] || 0) + 1;
+    if (cnt[k] <= MIX_ARTIST_CAP) keep.push(s);
+  });
+  /* 规则 3：同歌手不相邻。贪心 —— 每次从剩下的里挑第一个「不是上一个歌手」的。 */
+  const out = [];
+  const left = keep.slice();
+  let last = "";
+  while (left.length) {
+    let idx = 0;
+    for (let i = 0; i < left.length; i++) {
+      const k = normText(splitSingers(left[i].artist)[0] || left[i].artist || "");
+      if (k !== last) { idx = i; break; }
+    }
+    const pick = left.splice(idx, 1)[0];
+    last = normText(splitSingers(pick.artist)[0] || pick.artist || "");
+    out.push(pick);
+  }
+  /* 反差歌要算进总数，所以主体先少留一格的余量 */
+  const trimmed = out.slice(0, contrast ? MIX_TRACKS - 1 : MIX_TRACKS);
+  /* 规则 4：三分之二处插反差歌。不放开头（一上来就换口味太突然），
+     不放结尾（最后一首反差大会像歌单没排完）。 */
+  if (contrast) {
+    let pos = Math.floor(trimmed.length * 2 / 3);
+    const ck = normText(splitSingers(contrast.artist)[0] || "");
+    const at = (i) => (i >= 0 && i < trimmed.length ? normText(splitSingers(trimmed[i].artist)[0] || "") : "");
+    /* 别让它跟前一首撞歌手，最多挪两格 */
+    for (let t = 0; t < 2 && (at(pos - 1) === ck || at(pos) === ck); t++) pos += 1;
+    if (pos > 0 && pos < trimmed.length) trimmed.splice(pos, 0, contrast);
+  }
+  return trimmed;
+}
+
+/** 拼单详情：当场按配方抓歌、排序 */
+async function mixSheetDetail(recipe) {
+  const tag = recipe.cat || "全部";        // 带 q: 前缀，取池用
+  const cat = mixCatName(tag);             // 干净名，标题和封面关键词用
+  const day = recipe.day || recDayKey();
+  const seq = recipe.seq || 1;
+  const seed = ((day * 2654435761) ^ recHash("mix|" + cat + "|" + seq)) >>> 0;
+
+  const songs = await mixSourceSongs(tag, day, seq);
+  if (!songs.length) throw new Error("拼单：源曲库为空");
+
+  /* 反差歌：从「离得最远」的分类里拿一首，且不能是已经在单里的歌手 */
+  let contrast = null;
+  try {
+    const far = MIX_CONTRAST[cat] || "爵士";
+    const pool = await mixSourceSongs(far, day, seq + 7);
+    const used = {};
+    songs.forEach((s) => { used[normText(splitSingers(s.artist)[0] || "")] = 1; });
+    const cand = pool.filter((s) => !used[normText(splitSingers(s.artist)[0] || "")]);
+    if (cand.length) contrast = cand[day % cand.length];
+  } catch (e) { /* 拿不到反差歌就少一首，不影响整张 */ }
+
+  const musicList = mixArrange(songs, seed, contrast);
+  let covers = [];
+  try { covers = await dzCovers(cat); } catch (e) { covers = []; }
+
+  return {
+    isEnd: true,
+    sheetItem: {
+      id: MIX_PREFIX + tag + ":" + day + ":" + seq,
+      platform: "粽子",
+      title: cat + " · 今日拼单 " + (seq === 1 ? "①" : "②"),
+      artist: "Alma 拼单",
+      artwork: covers.length ? covers[(seq - 1) % covers.length] : (musicList[0] && musicList[0].artwork) || "",
+      worksNum: musicList.length,
+      playCount: 0,
+      description: "共 " + musicList.length + " 首。同一歌手最多 " + MIX_ARTIST_CAP +
+        " 首、整单打乱、同歌手不相邻、三分之二处一首反差歌（来自「" +
+        (MIX_CONTRAST[cat] || "爵士") + "」）。",
+    },
+    musicList: musicList,
+  };
 }
 
 /* ============================================================
@@ -8278,10 +8528,10 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.22",
+  version: "4.9.23",
   author: "粽子 & Alma",
   description:
-    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
+    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
   supportedSearchType: ["music", "album", "artist", "sheet"],
   // 音频缓存策略：no-cache = 每次播放都重新取地址（直链带时效签名，缓存必然过期）
   cacheControl: "no-cache",
@@ -8400,6 +8650,29 @@ module.exports = {
   getAlbumInfo: getAlbumDetail,
   getMusicSheetInfo: async function (sheetItem, page) {
     if (!sheetItem) return null;
+    /* 自己拼的歌单（mix:<分类>:<天>:<序号>）：id 里有完整配方，
+       当场抓歌、按规则重排，不依赖任何平台歌单。 */
+    if (isMixId(sheetItem.id)) {
+      try {
+        return await mixSheetDetail(parseMixId(sheetItem.id));
+      } catch (e) {
+        console.log("[粽子] 拼单失败: " + e.message);
+        return {
+          isEnd: true,
+          sheetItem: {
+            id: String(sheetItem.id),
+            platform: "粽子",
+            title: sheetItem.title || "",
+            artist: sheetItem.artist || "Alma 拼单",
+            artwork: sheetItem.artwork || "",
+            worksNum: 0,
+            playCount: 0,
+            description: "拼单失败，稍后再试。",
+          },
+          musicList: [],
+        };
+      }
+    }
     /* Apple 榜单里的歌单（applaylist:<区>:<pl.xxx>）：
        itunes lookup 对 pl. 开头的 id 直接 400，所以读歌单网页
        里内嵌的 serialized-server-data（实测 98 首完整，2 秒）。 */
@@ -8539,6 +8812,15 @@ module.exports = {
       const pool = await recSheetPool(name);
       const start = (p - 1) * REC_SHEET_PAGE_SIZE;
       const data = pool.slice(start, start + REC_SHEET_PAGE_SIZE);
+      /* 第一屏顶上放两张自己拼的。它们排在最前，但内容每天变、
+         顺序由我们自己定 —— 这正是平台歌单给不了的部分。
+         翻页时不再插，避免每页都冒出同一批拼单。 */
+      if (p === 1) {
+        let mix = [];
+        const fb = (data.find((x) => x.artwork) || {}).artwork || "";
+        try { mix = await mixEntries(name, fb); } catch (e) { mix = []; }
+        return { isEnd: start + REC_SHEET_PAGE_SIZE >= pool.length, data: mix.concat(data) };
+      }
       return { isEnd: start + REC_SHEET_PAGE_SIZE >= pool.length, data: data };
     } catch (e) {
       console.log("[粽子] 推荐歌单失败: " + e.message);
