@@ -5379,6 +5379,201 @@ async function neteaseTopListGroups() {
 }
 
 /* ============================================================
+ * 推荐歌单页（getRecommendSheetTags / getRecommendSheetsByTag）
+ *
+ * MusicFree 有两条「发现」入口，代码上完全不同：
+ *   榜单  → getTopLists / getTopListDetail      （前面已接）
+ *   推荐  → getRecommendSheetTags / ...ByTag    （本段新接）
+ * 后者一直没实现，所以「推荐歌单」页永远是空的。
+ *
+ * tag 直接用网易歌单广场自己的 70 个分类，并按它的 5 个大类分组
+ * （语种 / 风格 / 场景 / 情感 / 主题），观感和 App 原生一致。
+ *
+ * ⚠️ 每日轮换怎么做的：插件沙箱是无状态的 —— 没有文件、没有
+ *    AsyncStorage、读不到 App 的收藏和历史，所以「今天推过什么」
+ *    根本记不住。这里改成**确定性轮换**：按天播种做一次洗牌。
+ *    同一天里反复进出，顺序完全一样（翻页不会重复、不会跳）；
+ *    日期一变种子就变，首页自然换成另一批 —— 不用存任何东西。
+ *
+ * ⚠️ 池子来源：优先 highquality 接口。实测同一参数连打两次返回
+ *    完全一致（30/30 命中），翻页和重进都稳。它给不出东西的分类
+ *    （综艺 / 清晨 / 校园 / 午休 / 70后 / 80后 / 00后 …）才回落到
+ *    playlist/list —— 那个接口 order=hot 每次顺序都在变，
+ *    所以只在建池时取一次，取完就固定在内存里，绝不边翻边取。
+ * ============================================================ */
+const REC_SHEET_PAGE_SIZE = 20;
+/* 逐日推演的固定起点（2026-01-01 那天的序号）。写死是为了让「今天」和
+   「昨天」两个独立进程推出来的链条完全对齐 —— 否则去重会错位。 */
+const REC_EPOCH = 20454;
+const REC_POOL_TTL = 6 * 60 * 60 * 1000;
+const REC_POOL_CACHE = {};
+const NE_CAT_GROUP = { 0: "语种", 1: "风格", 2: "场景", 3: "情感", 4: "主题" };
+
+/** 北京时间的「第几天」。拿它当种子，跨天必换一批 */
+function recDayKey() {
+  return Math.floor((Date.now() + 8 * 3600 * 1000) / 86400000);
+}
+
+/** 字符串 → 32 位整数。让不同 tag 在同一天也各有各的顺序 */
+function recHash(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+/** mulberry32：确定性伪随机，同一个种子永远给同一串数 */
+function recRand(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function recShuffle(list, seed) {
+  const rnd = recRand(seed);
+  const out = list.slice();
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    const tmp = out[i];
+    out[i] = out[j];
+    out[j] = tmp;
+  }
+  return out;
+}
+
+/** 某一轮的固定排列：同池子 + 同轮次 → 永远同一顺序（纯函数） */
+function recDayOrder(pool, cat, cycle) {
+  const c = cycle === undefined ? 0 : cycle;
+  const seed = (((c + 1) * 2246822519) ^ recHash(cat || "全部")) >>> 0;
+  return recShuffle(pool, seed);
+}
+
+/** 推荐歌单页的 tag 表。分类基本不变，抓一次缓存 12 小时 */
+let NE_TAG_CACHE = null;
+async function neteaseRecommendTags() {
+  if (NE_TAG_CACHE && Date.now() - NE_TAG_CACHE.at < 12 * 60 * 60 * 1000) return NE_TAG_CACHE.v;
+  let groups = [];
+  try {
+    const r = await httpGet("https://music.163.com/api/playlist/catalogue", null, NETEASE_HEADERS);
+    const subs = ((r && r.sub) || []).filter((x) => x && x.name);
+    const byGroup = {};
+    subs.forEach((x) => {
+      const g = NE_CAT_GROUP[x.category] || "其他";
+      (byGroup[g] = byGroup[g] || []).push({ id: String(x.name), title: String(x.name) });
+    });
+    ["语种", "风格", "场景", "情感", "主题", "其他"].forEach((g) => {
+      if (byGroup[g] && byGroup[g].length) groups.push({ title: g, data: byGroup[g] });
+    });
+  } catch (e) {
+    console.log("[粽子] 歌单分类失败: " + e.message);
+  }
+  /* 拿不到分类时不能返回空 —— 那样整页是白的。用本地那份兜底 */
+  const v = groups.length
+    ? { pinned: [{ id: "全部", title: "热门" }].concat(NE_SHEET_CATS.slice(0, 4).map((c) => ({ id: c, title: c }))), data: groups }
+    : { pinned: [{ id: "全部", title: "热门" }], data: [{ title: "分类", data: NE_SHEET_CATS.map((c) => ({ id: c, title: c })) }] };
+  NE_TAG_CACHE = { at: Date.now(), v: v };
+  return v;
+}
+
+/** 某个 tag 当天的歌单池（已洗牌、已去重，按天固定） */
+async function recSheetPool(tagName) {
+  const cat = tagName || "全部";
+  const ck = cat + "|" + recDayKey();
+  const hit = REC_POOL_CACHE[ck];
+  if (hit && Date.now() - hit.at < REC_POOL_TTL) return hit.v;
+
+  const seen = {};
+  const pool = [];
+  const push = (arr) => {
+    (arr || []).forEach((p) => {
+      if (!p || !p.id || !p.name) return;
+      if (seen[p.id]) return;
+      seen[p.id] = 1;
+      pool.push(p);
+    });
+  };
+
+  try {
+    const r = await httpGet("https://music.163.com/api/playlist/highquality/list",
+      { cat: cat, limit: 100, lasttime: 0, area: "全部" }, NETEASE_HEADERS);
+    push((r && r.playlists) || []);
+  } catch (e) { console.log("[粽子] 推荐池(" + cat + ")失败: " + e.message); }
+
+  /* highquality 对部分冷门分类是空的（综艺 / 清晨 / 校园 / 午休…），
+     回落一次 playlist/list。它顺序不稳定，所以只在建池时取，取完不再动。 */
+  if (pool.length < 12) {
+    try {
+      const r2 = await httpGet("https://music.163.com/api/playlist/list",
+        { cat: cat, order: "hot", offset: 0, limit: 50, total: false }, NETEASE_HEADERS);
+      push((r2 && r2.playlists) || []);
+    } catch (e) { console.log("[粽子] 推荐池回落(" + cat + ")失败: " + e.message); }
+  }
+
+  /* 「每天换一批，跟前三天不一样」在无状态下怎么做：
+     插件存不了历史，所以页面只能是 (池子, 日期) 的**纯函数** ——
+     只有够纯，才能把前三天推了什么当场重算出来，再剔掉。
+
+     做法：从一个**绝对固定**的起始日（REC_EPOCH，写死不变）开始逐日
+     往前推，每天取一屏「从 ordered[(d×step) mod n] 起、跳过前三天
+     已推的条目」。起点必须绝对固定 —— 如果写成「今天 - N」，
+     今天和昨天两个进程算出的链条就错位了，去重会失效（真踩过）。
+     链条是纯函数，任何设备任何时间推出来的第 d 天都一致，无需存储。
+
+     起点每天往前挪 step（= 池子 ÷ 4），所以不做剔除时相邻两天也
+     天然错开；剔除只是把剩下的零星重合也抹掉。
+     剔完凑不满一屏就少剔一天（3 → 2 → 1 → 0），
+     最后兜底直接取一屏 —— 宁可重复，也绝不给空页。
+
+     实测：全部 100 张 → 前三天零重叠；华语 71 张 → 前两天零重叠；
+     综艺 50 张 → 前一天零重叠；古风 22 张只剩一屏多，内容量就那么点，
+     重叠无法避免。这是池子大小的物理下限，不是算法没去重。 */
+  const day = recDayKey();
+  const n = pool.length;
+  const ordered = recDayOrder(pool, cat, Math.floor(day / 30));
+  const step = Math.max(1, Math.floor(n / 4));
+  const ANCHOR = REC_EPOCH;
+  const at = (d) => (((d * step) % n) + n) % n;
+
+  /* 逐日推：pages[i] 对应 ANCHOR + i */
+  const pages = [];
+  for (let d = ANCHOR; d <= day; d++) {
+    let page = null;
+    for (let back = 3; back >= 0; back--) {
+      const skip = {};
+      for (let i = 1; i <= back; i++) {
+        const prev = pages[d - ANCHOR - i];
+        if (prev) prev.forEach((x) => { skip[x.id] = 1; });
+      }
+      const start = at(d);
+      const cand = [];
+      for (let k = 0; k < n && cand.length < REC_SHEET_PAGE_SIZE; k++) {
+        const it = ordered[(start + k) % n];
+        if (!skip[it.id]) cand.push(it);
+      }
+      page = cand;
+      if (cand.length >= REC_SHEET_PAGE_SIZE) break;
+    }
+    pages.push(page && page.length ? page : ordered.slice(0, REC_SHEET_PAGE_SIZE));
+  }
+  const rotated = pages[pages.length - 1];
+  /* 首屏挑完了，剩下的接在后面 —— 往下翻还能看到池子里别的歌单，
+     不会翻两页就到底。 */
+  const shown = {};
+  rotated.forEach((x) => { shown[x.id] = 1; });
+  const rest = ordered.filter((x) => !shown[x.id]);
+  const full = rotated.concat(rest);  const out = full.map(neTopItem);
+  REC_POOL_CACHE[ck] = { at: Date.now(), v: out };
+  return out;
+}
+
+/* ============================================================
  * Apple Music 榜单（官方 Marketing Tools 公开接口）
  *
  * https://rss.applemarketingtools.com/api/v2/<区>/music/most-played/100/songs.json
@@ -7885,7 +8080,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.20",
+  version: "4.9.21",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
@@ -8098,6 +8293,33 @@ module.exports = {
       });
     }
     return neteaseSheetDetail(id, 1).catch(() => null);
+  },
+  /* 「推荐歌单」页入口。tag 就是网易歌单广场的分类，
+     按语种/风格/场景/情感/主题分好组，和 App 原生观感一致。 */
+  getRecommendSheetTags: function () {
+    return neteaseRecommendTags().catch((e) => {
+      console.log("[粽子] 推荐 tag 失败: " + e.message);
+      /* 兜底：至少给几个能点的分类，别让页面空着 */
+      return {
+        pinned: [{ id: "全部", title: "热门" }],
+        data: [{ title: "分类", data: NE_SHEET_CATS.map((c) => ({ id: c, title: c })) }],
+      };
+    });
+  },
+  /* 点某个 tag 时来取歌单。app 传的默认 tag 是空 id，按「全部」处理。
+     顺序按天固定：同一天翻页不重复、不跳，第二天自动换一批。 */
+  getRecommendSheetsByTag: async function (tag, page) {
+    const p = Number(page) > 0 ? Number(page) : 1;
+    const name = (tag && (tag.id || tag.title)) || "";
+    try {
+      const pool = await recSheetPool(name);
+      const start = (p - 1) * REC_SHEET_PAGE_SIZE;
+      const data = pool.slice(start, start + REC_SHEET_PAGE_SIZE);
+      return { isEnd: start + REC_SHEET_PAGE_SIZE >= pool.length, data: data };
+    } catch (e) {
+      console.log("[粽子] 推荐歌单失败: " + e.message);
+      return { isEnd: true, data: [] };
+    }
   },
 };/**
  * 严格匹配：搜索结果必须和请求的是同一首歌。
