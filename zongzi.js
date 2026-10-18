@@ -5397,7 +5397,7 @@ const APPLE_CHART_BASE = "https://rss.applemarketingtools.com/api/v2";
 
 /** 参与的地区。只挑华语用户真的会看的，全上会让榜单页太长 */
 const APPLE_CHART_REGIONS = [
-  ["cn", "中国"], ["hk", "香港"], ["tw", "台湾"], ["jp", "日本"],
+  ["cn", "中国"], ["hk", "香港"], ["tw", "台灣"], ["jp", "日本"],
   ["kr", "韩国"], ["us", "美国"], ["gb", "英国"], ["sg", "新加坡"],
 ];
 
@@ -7885,7 +7885,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.16",
+  version: "4.9.17",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
