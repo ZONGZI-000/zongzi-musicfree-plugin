@@ -6022,6 +6022,424 @@ async function mixSheetDetail(recipe) {
 }
 
 /* ============================================================
+ * 评论（getMusicComments）
+ *
+ * MusicFree 客户端里有「查看评论」入口（歌曲菜单里），
+ * 但它不在官方插件文档里 —— 是客户端 core/panels/types/musicComment 直接
+ * 调 plugin.methods.getMusicComments(musicItem, page)，
+ * 只要插件实例上有这个方法，菜单里那项就会自己出现（源码里按
+ * supportedMethods.has("getMusicComments") 判断显隐）。
+ *
+ * 返回结构（src/types/media.d.ts 的 IComment）：
+ *   { nickName, avatar, comment, like, createAt, location, replies? }
+ *
+ * 两个数据源：
+ *   网易云  匿名可用，实测一首歌 197 万条，offset 正常翻页
+ *   YouTube 走 innertube next，先用 watch 页 HTML 里的 ytInitialData
+ *           找到 comment-item-section 的 token，再换
+ *           frameworkUpdates.entityBatchUpdate 里的评论实体
+ *
+ * ⚠️ 其余平台（QQ/酷狗/咪咕/酷我/B站…）自己没有公开评论接口，
+ *    所以走「按歌名+歌手反查网易同一首歌」的路子 —— 评论本来就该跟着
+ *    这首歌走，而不是跟着某个平台的 copy 走。
+ * ============================================================ */
+const NE_COMMENT_API = "https://music.163.com/api/v1/resource/comments/";
+const NE_COMMENT_TTL = 10 * 60 * 1000;
+const NE_COMMENT_CACHE = {};
+/* 网易的评论分页是 offset 制，一页固定 20 条（给多了也只回 20）。
+   客户端按 page 翻，我们换算成 offset。 */
+const NE_COMMENT_PAGE = 20;
+
+/** 网易一条评论 → IComment */
+function neCommentItem(c) {
+  const u = c.user || {};
+  return {
+    id: String(c.commentId || ""),
+    nickName: u.nickname || "网易云用户",
+    avatar: u.avatarUrl || "",
+    comment: String(c.content || ""),
+    like: Number(c.likedCount || 0),
+    createAt: Number(c.time || 0),
+    location: (c.ipLocation && c.ipLocation.location) || "",
+    /* 楼层回复。网易只给「被回复的那一条」，不是完整对话树，
+       所以这里挂成一层的 replies，够看，不做假的多层展开。 */
+    replies: (c.beReplied || []).filter((r) => r && r.content).map((r) => ({
+      id: String(r.beRepliedCommentId || ""),
+      nickName: (r.user && r.user.nickname) || "网易云用户",
+      comment: String(r.content || ""),
+      createAt: 0,
+      like: 0,
+    })),
+  };
+}
+
+/** 拉网易某首歌的评论。hotFirst=true 时把热评排在最前面 */
+async function neteaseComments(songId, page, hotFirst) {
+  const p = Number(page) > 0 ? Number(page) : 1;
+  const offset = (p - 1) * NE_COMMENT_PAGE;
+  const ck = "ne|" + songId + "|" + offset;
+  const hit = NE_COMMENT_CACHE[ck];
+  if (hit && Date.now() - hit.at < NE_COMMENT_TTL) return hit.v;
+
+  const r = await httpGet(NE_COMMENT_API + "R_SO_4_" + songId,
+    { limit: NE_COMMENT_PAGE, offset: offset }, NETEASE_HEADERS);
+  if (!r || r.code !== 200) throw new Error("网易评论: code " + (r && r.code));
+
+  const seen = {};
+  const out = [];
+  const push = (c) => {
+    const it = neCommentItem(c);
+    if (!it.comment) return;             // 空内容（已删除）跳过
+    if (it.id && seen[it.id]) return;
+    if (it.id) seen[it.id] = 1;
+    out.push(it);
+  };
+  /* 第一页把热评顶上去。热评和普通流有重合，靠 id 去重
+     （实测 15 条热评里只有 1 条出现在前 20 条普通流里）。 */
+  if (hotFirst) (r.hotComments || []).forEach(push);
+  (r.comments || []).forEach(push);
+
+  const total = Number(r.total || 0);
+  const v = {
+    isEnd: offset + NE_COMMENT_PAGE >= total || !(r.more || r.comments && r.comments.length),
+    data: out,
+  };
+  NE_COMMENT_CACHE[ck] = { at: Date.now(), v: v };
+  return v;
+}
+
+/* ---------------- YouTube ---------------- */
+const YT_WEB = { clientName: "WEB", clientVersion: "2.20240101.00.00", hl: "zh-CN", gl: "US" };
+const YT_WEB_UA = UA;
+const YT_COMMENT_TTL = 10 * 60 * 1000;
+/* 存的是「下一条链」：第一页的 token 要从 watch 页现找，
+   之后每页的 token 靠上一页响应带回来 —— 所以缓存里同时存 token。 */
+const YT_COMMENT_CACHE = {};
+
+function ytWebCtx() {
+  return { client: YT_WEB };
+}
+
+async function ytNext(continuation) {
+  const r = await axios_1.post(
+    "https://www.youtube.com/youtubei/v1/next?prettyPrint=false",
+    JSON.stringify({ context: ytWebCtx(), continuation: continuation }),
+    { timeout: 25000, headers: { "User-Agent": YT_WEB_UA, "Content-Type": "application/json" }, validateStatus: () => true }
+  );
+  return r.data || {};
+}
+
+/** 从响应里捞所有评论实体（它们躺在 frameworkUpdates 的 mutations 里） */
+function ytCollectComments(data) {
+  const out = [];
+  const fu = data && data.frameworkUpdates;
+  const muts = (fu && fu.entityBatchUpdate && fu.entityBatchUpdate.mutations) || [];
+  muts.forEach((m) => {
+    const p = m && m.payload && m.payload.commentEntityPayload;
+    if (!p) return;
+    const pr = p.properties || {};
+    const au = p.author || {};
+    const tb = p.toolbar || {};
+    const likeText = tb.likeCountNotliked || tb.likeCountLiked || "";
+    out.push({
+      id: String(pr.commentId || ""),
+      nickName: au.displayName || "YouTube 用户",
+      avatar: au.avatarThumbnailUrl || "",
+      comment: String((pr.content && pr.content.content) || ""),
+      /* YouTube 只给「10万」这种约数，不是精确数，能转就转 */
+      like: ytCountToNum(likeText),
+      createAt: 0,
+      location: "",
+      _time: pr.publishedTime || "",
+    });
+  });
+  return out;
+}
+
+/** 「10万」/「1.2K」/「1,234」→ 数字。转不出来就 0（宁可显 0，不显示 NaN） */
+function ytCountToNum(s) {
+  const t = String(s || "").replace(/,/g, "").trim();
+  if (!t) return 0;
+  const m = t.match(/^([\d.]+)\s*([万亿KkMm]?)/);
+  if (!m) return 0;
+  const n = Number(m[1]);
+  if (!isFinite(n)) return 0;
+  const unit = m[2];
+  const mul = unit === "万" ? 10000 : unit === "亿" ? 1e8
+    : /[Kk]/.test(unit) ? 1000 : /[Mm]/.test(unit) ? 1e6 : 1;
+  return Math.round(n * mul);
+}
+
+/** 下一段 continuation token。只认评论区那个 target，
+    否则会挑到「相关视频」的 token，翻出来全是别的视频。 */
+function ytNextToken(data) {
+  const eps = (data && data.onResponseReceivedEndpoints) || [];
+  for (let i = 0; i < eps.length; i++) {
+    const rc = eps[i] && eps[i].reloadContinuationItemsCommand;
+    if (!rc || rc.targetId !== "engagement-panel-comments-section") continue;
+    const cs = rc.continuationItems || [];
+    for (let j = cs.length - 1; j >= 0; j--) {
+      const t = cs[j] && cs[j].continuationItemRenderer;
+      const cm = t && t.continuationEndpoint && t.continuationEndpoint.continuationCommand;
+      if (cm && cm.token) return cm.token;
+    }
+  }
+  return null;
+}
+
+/** 拉 YouTube 某视频的评论。page 1 现找入口，之后顺着 token 走 */
+async function youtubeComments(videoId, page) {
+  const p = Number(page) > 0 ? Number(page) : 1;
+  const ck = "yt|" + videoId + "|" + p;
+  const hit = YT_COMMENT_CACHE[ck];
+  if (hit && Date.now() - hit.at < YT_COMMENT_TTL) return hit.v;
+
+  let token = null;
+  if (p === 1) {
+    /* 第一页：评论区的入口 token 只在 watch 页的 ytInitialData 里。
+       直接打 /next 拿不到（ANDROID client 直接 400，WEB 的响应里也没有），
+       这个坑踩过，别改成纯 API 调用。 */
+    const r = await axios_1.get(
+      "https://www.youtube.com/watch?v=" + encodeURIComponent(videoId) + "&hl=zh-CN",
+      { timeout: 30000, headers: { "User-Agent": YT_WEB_UA }, validateStatus: () => true }
+    );
+    const html = String(r.data || "");
+    const m = html.match(/ytInitialData\s*=\s*(\{.+?\});/s);
+    if (!m) throw new Error("yt: 无 ytInitialData");
+    const init = JSON.parse(m[1]);
+    (function walk(o) {
+      if (!o || typeof o !== "object" || token) return;
+      if (Array.isArray(o)) { o.forEach(walk); return; }
+      const sec = o.itemSectionRenderer;
+      if (sec && sec.sectionIdentifier === "comment-item-section") {
+        const mm = JSON.stringify(sec).match(/"token":"([^"]+)"/);
+        if (mm) token = mm[1];
+        return;
+      }
+      for (const k of Object.keys(o)) walk(o[k]);
+    })(init);
+    if (!token) throw new Error("yt: 该视频没有评论区");
+  } else {
+    const prev = YT_COMMENT_CACHE["yt|" + videoId + "|" + (p - 1)];
+    token = prev && prev.next;
+    if (!token) throw new Error("yt: 翻页令牌丢失，请重新打开");
+  }
+
+  const data = await ytNext(token);
+  const list = ytCollectComments(data).filter((c) => c.comment);
+  const next = ytNextToken(data);
+
+  const v = {
+    isEnd: !next,
+    data: list.map((c) => {
+      delete c._time;
+      return c;
+    }),
+  };
+  YT_COMMENT_CACHE[ck] = { at: Date.now(), v: v, next: next };
+  return v;
+}
+
+/* ---------------- Bilibili ---------------- */
+/* 完全匿名可用（实测 BV1GJ411x7h7 有 23.7 万条）。
+   ⚠️ oid 可以直接传 bvid（实测 code 0），不用先转 aid —— 少一次请求。
+   sort=1 是按热度，评论区第一屏就是精华。 */
+const BILI_REPLY_API = "https://api.bilibili.com/x/v2/reply";
+const BILI_COMMENT_TTL = 10 * 60 * 1000;
+const BILI_COMMENT_CACHE = {};
+const BILI_COMMENT_PAGE = 20;
+
+function biliCommentItem(r) {
+  const m = r.member || {};
+  const ct = r.content || {};
+  return {
+    id: String(r.rpid_str || r.rpid || ""),
+    nickName: m.uname || "B站用户",
+    avatar: m.avatar || "",
+    comment: String(ct.message || ""),
+    like: Number(r.like || 0),
+    createAt: Number(r.ctime || 0) * 1000,      // B站给秒，统一成毫秒
+    location: "",
+    /* B站第一屏就带 3 条楼中楼。只挂这一层，不递归 —— 深翻会变成
+       一个视频打好几十次请求，评论区不该这么用。 */
+    replies: (r.replies || []).filter((x) => x && x.content && x.content.message).map(biliCommentItem),
+  };
+}
+
+async function bilibiliComments(bvid, page) {
+  const p = Number(page) > 0 ? Number(page) : 1;
+  const ck = "bili|" + bvid + "|" + p;
+  const hit = BILI_COMMENT_CACHE[ck];
+  if (hit && Date.now() - hit.at < BILI_COMMENT_TTL) return hit.v;
+
+  const r = await axios_1.get(BILI_REPLY_API, {
+    params: { type: 1, oid: bvid, pn: p, ps: BILI_COMMENT_PAGE, sort: 1 },
+    timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
+  });
+  const d = r.data || {};
+  if (d.code !== 0) throw new Error("bili reply: " + d.code + " " + (d.message || ""));
+  const box = d.data || {};
+  const list = (box.replies || []).map(biliCommentItem).filter((c) => c.comment);
+  const count = Number((box.page && box.page.count) || 0);
+
+  const v = {
+    isEnd: !list.length || (count > 0 && p * BILI_COMMENT_PAGE >= count),
+    data: list,
+  };
+  BILI_COMMENT_CACHE[ck] = { at: Date.now(), v: v };
+  return v;
+}
+
+/* ---------------- 跨平台：反查网易同一首 ---------------- */
+
+/** 反查缓存。key 是「歌名|主歌手」。命中过一次就记住那个网易 id。 */
+const NE_LOOKUP_TTL = 6 * 60 * 60 * 1000;
+const NE_LOOKUP_CACHE = {};
+
+/**
+ * 评论反查专用的宽松匹配：标题照旧严格，歌手放宽成「整串互相包含」。
+ *
+ * 只放宽歌手、不放宽标题，是因为歌手名在跨平台之间本来就写法各异
+ * （冯沁苑(买辣椒也用券) / 买辣椒也用券 / 买辣椒），
+ * 而标题一旦放宽，翻唱和 remix 立刻就会混进来。
+ */
+function sameSongLooseArtist(it, want) {
+  /* 标题规则原样复用：先挡听书、分集编号，再比对核心字符 */
+  const rawTitle = it.title || "";
+  if (!want.name || !rawTitle) return false;
+  if (isAudiobookTitle(rawTitle)) return false;
+  if (EPISODE_RE.test(rawTitle)) return false;
+  const t = coreTitle(toSimplified(rawTitle));
+  const q = coreTitle(toSimplified(want.name));
+  if (!t || !q) return false;
+  if (!(t === q || t.indexOf(q) >= 0 || q.indexOf(t) >= 0)) return false;
+
+  /* 歌手：拿**未经 normText 的原始串**比包含关系。
+     ⚠️ normText 也会剥括号，所以这里不能用它 ——
+        「冯沁苑(买辣椒也用券)」被它变成「冯沁苑」，别名又丢一次。
+     所以只做最轻的清洗：去空白、统一大小写、全角括号转半角。 */
+  const clean = (x) => String(x || "")
+    .replace(/（/g, "(").replace(/）/g, ")")
+    .replace(/\s+/g, "").toLowerCase();
+  const a = clean(it.artist);
+  const s = clean(splitSingers(want.singer)[0] || "");
+  if (!a || !s) return false;
+  return a.indexOf(s) >= 0 || s.indexOf(a) >= 0;
+}
+
+/**
+ * 在网易搜到「和这首同一首歌」，拿它的 songId。
+ *
+ * 为什么要反查：QQ / 酷狗 / 咪咕 / 酷我 / B站 都没有公开评论接口，
+ * 但同一首歌在网易云基本都有条目，评论跟着歌走才对。
+ * 匹配沿用 isDefinitelySameSong（为「兜底」写的严格版）—— 这里宁可找不到，
+ * 也不能把《稻香》的评论挂到《稻香(深情版)》上。
+ * 但它有个对评论场景不合适的硬伤：核心标题会剔掉括号，歌手只认第一个。
+ *   《起风了》原唱在网易写作「冯沁苑(买辣椒也用券)」，coreTitle 剩下「冯沁苑」，
+ *   而 QQ 那边歌手是「买辣椒也用券」，两边一对，直接判不通过 ——
+ *   明明就是同一首。所以这里额外补一条「整串包含」的歌手判定，
+ *   标题仍然走严格规则，不会放过翻唱。
+ */
+async function neteaseIdFor(musicItem) {
+  const want = {
+    name: musicItem.title || "",
+    singer: musicItem.artist || "",
+  };
+  if (!want.name) return null;
+  const key = normText(toSimplified(want.name)) + "|" + normText(splitSingers(want.singer)[0] || "");
+  const hit = NE_LOOKUP_CACHE[key];
+  if (hit && Date.now() - hit.at < NE_LOOKUP_TTL) return hit.v;
+
+  let found = null;
+  /* ⚠️ 必须用 cloudsearch，不能用 COCO / search/get/web。
+     实测同一首歌：
+       cloudsearch  「起风了 买辣椒也用券」→ 第 1 条就是正版
+       COCO / web   「起风了 买辣椒也用券」→ 全是 remix 和翻唱，正版被挤没了
+     cloudsearch 是网易搜索接口里召回最全的一个，而且匿名可用（要带 appver 才不返回空）。 */
+  try {
+    const r = await httpGet("https://music.163.com/api/cloudsearch/pc",
+      { s: (want.name + " " + (splitSingers(want.singer)[0] || "")).trim(), type: 1, limit: 30, offset: 0 },
+      Object.assign({ Cookie: "appver=2.0.2" }, NETEASE_HEADERS));
+    const songs = ((r && r.result && r.result.songs) || []);
+    /* 不取「第一个通过的就走」—— 搜索结果里 (Acoustic) / (治愈版) / (Live)
+       这类同歌手变体会排在同一首正版前面，先到先得就会挂错评论。
+       改成给每条打分，最后取分最高的那个：
+         3 分：通过严格匹配，且标题一字不差（最理想，通常就是正版）
+         2 分：通过严格匹配
+         1 分：只有歌手宽松匹配（标题剥掉括号后才对得上）
+       同分保留排在前面的（搜索相关度天然有序）。 */
+    let best = 0;
+    for (let i = 0; i < songs.length; i++) {
+      const s = songs[i];
+      const it = {
+        id: String(s.id || ""),
+        title: s.name || "",
+        artist: ((s.ar || []).map((a) => a.name).join("/")) || "",
+      };
+      let score = 0;
+      if (isDefinitelySameSong(it, want)) {
+        score = coreTitle(toSimplified(it.title)) === coreTitle(toSimplified(want.name)) &&
+                String(it.title).replace(/\s+/g, "") === String(want.name).replace(/\s+/g, "") ? 3 : 2;
+      } else if (sameSongLooseArtist(it, want)) {
+        score = 1;
+      }
+      if (score > best) { best = score; found = it.id; }
+      if (best === 3) break;   // 再高也就 3 分，提前收工
+    }
+  } catch (e) { /* 查不到就认栽，返回空列表 */ }
+
+  NE_LOOKUP_CACHE[key] = { at: Date.now(), v: found };
+  return found;
+}
+
+/** 主入口：按平台分发 */
+async function musicComments(musicItem, page) {
+  if (!musicItem) return { isEnd: true, data: [] };
+  const provider = musicItem._provider || "";
+
+  if (provider === "youtube") {
+    try {
+      return await youtubeComments(String(musicItem.id || ""), page);
+    } catch (e) {
+      console.log("[粽子] YouTube 评论失败: " + e.message);
+      return { isEnd: true, data: [] };
+    }
+  }
+
+  /* B站自己有完整评论区，别绕去网易 —— 它那边往往是原视频，
+     评论比网易的歌曲页面还热闹（一首歌 20 多万条很常见）。 */
+  if (provider === "bilibili") {
+    try {
+      return await bilibiliComments(String(musicItem.id || ""), page);
+    } catch (e) {
+      console.log("[粽子] Bilibili 评论失败: " + e.message);
+      /* 拿不到就退到网易反查，别直接给空 */
+    }
+  }
+
+  /* 网易系（含从网易搜到的歌）直接查 */
+  if (provider === "netease") {
+    try {
+      return await neteaseComments(String(musicItem.id || ""), page, Number(page) <= 1);
+    } catch (e) {
+      console.log("[粽子] 网易评论失败: " + e.message);
+      return { isEnd: true, data: [] };
+    }
+  }
+
+  /* 其他平台：先反查网易同一首。
+     ⚠️ 反查只在第一页做，之后从缓存拿 —— 否则每次翻页都多打一次搜索。 */
+  try {
+    const neId = await neteaseIdFor(musicItem);
+    if (!neId) return { isEnd: true, data: [] };
+    return await neteaseComments(neId, page, Number(page) <= 1);
+  } catch (e) {
+    console.log("[粽子] 跨平台评论失败: " + e.message);
+    return { isEnd: true, data: [] };
+  }
+}
+
+/* ============================================================
  * Apple Music 榜单（官方 Marketing Tools 公开接口）
  *
  * https://rss.applemarketingtools.com/api/v2/<区>/music/most-played/100/songs.json
@@ -8528,10 +8946,10 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.23",
+  version: "4.9.24",
   author: "粽子 & Alma",
   description:
-    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
+    "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
   supportedSearchType: ["music", "album", "artist", "sheet"],
   // 音频缓存策略：no-cache = 每次播放都重新取地址（直链带时效签名，缓存必然过期）
   cacheControl: "no-cache",
@@ -8648,6 +9066,9 @@ module.exports = {
   getMediaSource: getMediaSource,
   getLyric: getLyric,
   getAlbumInfo: getAlbumDetail,
+  /* 评论区。方法名固定叫 getMusicComments —— 客户端是硬编码调的，
+     不是按 supportedMethods 里任选一个（见歌曲菜单面板）。 */
+  getMusicComments: musicComments,
   getMusicSheetInfo: async function (sheetItem, page) {
     if (!sheetItem) return null;
     /* 自己拼的歌单（mix:<分类>:<天>:<序号>）：id 里有完整配方，
