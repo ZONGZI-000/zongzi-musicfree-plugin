@@ -5935,10 +5935,10 @@ async function recSheetPool(tagName) {
  * 「拼单」—— 自己拼的歌单
  *
  * 平台歌单有一个改不了的问题：顺序是平台排的，我们只能照单全收。
- * 所以推荐页除了展示平台歌单，再自己拼几张：id 里写死生成配方，
+ * 所以推荐页除了展示平台歌单，再自己拼一张：id 里写死生成配方，
  * 点开时按配方当场抓歌、按四条规则重排。
  *
- *   mix:<分类>:<天序号>:<第几张>
+ *   mix:<分类>:<天序号>:<序号>（现在只出第一张，序号恒为 1）
  *
  * 四条规则（和粽子定的）：
  *   1. 同一歌手最多 3 首
@@ -5954,7 +5954,7 @@ const MIX_TRACKS = 30;          // 目标曲数
 const MIX_ARTIST_CAP = 3;       // 同一歌手最多几首
 const MIX_SRC_SHEETS = 4;       // 从几张源歌单里取材
 const MIX_SRC_LIMIT = 50;       // 每张源歌单取前多少首（只借元数据，不整张拉）
-const MIX_COUNT_PER_PAGE = 2;   // 推荐页每屏放几张拼单
+const MIX_COUNT_PER_PAGE = 1;   // 推荐页每屏放几张拼单（只放一张，没必要两张）
 
 /** 分类 → Deezer 搜索词。拼单封面从这里取。
     ⚠️ 只有这条路能一条条命中：拼音（gufeng）在 Deezer 是空的，
@@ -6019,6 +6019,8 @@ const MIX_COVERS = {
   "钢琴": ["piano.jpg"],
   "轻音乐": ["piano.jpg"],
   "流行": ["huayu.jpg"],
+  "说唱": ["rap.jpg"],
+  "R&B/Soul": ["rnb.jpg"],
 };
 
 /* 拼单的介绍：写清这是什么风格、大概从哪儿来的，不写怎么配比的。
@@ -6171,8 +6173,8 @@ async function mixEntries(cat, fallbackArt) {
       /* id 里存带前缀的 tag —— 取池时要靠它判断「这是 QQ 独有的分类」 */
       id: MIX_PREFIX + tag + ":" + day + ":" + i,
       platform: "粽子",
-      title: c + " · 今日拼单 " + (i === 1 ? "①" : "②"),
-      artist: "Alma 拼单",
+      title: c + " · 拼好歌",
+      artist: "拼好歌",
       artwork: covers.length ? covers[(i - 1) % covers.length] : fb,
       worksNum: MIX_TRACKS,
       playCount: 0,
@@ -6287,8 +6289,8 @@ async function mixSheetDetail(recipe) {
     sheetItem: {
       id: MIX_PREFIX + tag + ":" + day + ":" + seq,
       platform: "粽子",
-      title: cat + " · 今日拼单 " + (seq === 1 ? "①" : "②"),
-      artist: "Alma 拼单",
+      title: cat + " · 拼好歌",
+      artist: "拼好歌",
       artwork: covers.length ? covers[(seq - 1) % covers.length] : (musicList[0] && musicList[0].artwork) || "",
       worksNum: musicList.length,
       playCount: 0,
@@ -9398,7 +9400,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.29",
+  version: "4.9.30",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单），推荐页带自拼歌单，支持查看评论。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。v4.9.25 接入 B 站鬼畜区：搜索并上 tids=119，榜单页多一组「B站鬼畜」，不进推荐页。v4.9.26 鬼畜取消整体下沉，按匹配度正常排序（原唱仍靠权威目录排第一）。v4.9.27 修 B 站播两秒跳歌：取流地址必须带 Referer，且改为整首预下载；同时修 48kbps 音源被误判成试听片段。",
@@ -9546,7 +9548,7 @@ module.exports = {
             id: String(sheetItem.id),
             platform: "粽子",
             title: sheetItem.title || "",
-            artist: sheetItem.artist || "Alma 拼单",
+            artist: sheetItem.artist || "拼好歌",
             artwork: sheetItem.artwork || "",
             worksNum: 0,
             playCount: 0,
@@ -9722,9 +9724,9 @@ module.exports = {
       const pool = await recSheetPool(name);
       const start = (p - 1) * REC_SHEET_PAGE_SIZE;
       const data = pool.slice(start, start + REC_SHEET_PAGE_SIZE);
-      /* 第一屏顶上放两张自己拼的。它们排在最前，但内容每天变、
+      /* 第一屏顶上放一张自己拼的。它排在最前，但内容每天变、
          顺序由我们自己定 —— 这正是平台歌单给不了的部分。
-         翻页时不再插，避免每页都冒出同一批拼单。 */
+         翻页时不再插，避免每页都冒出同一张拼单。 */
       if (p === 1) {
         let mix = [];
         const fb = (data.find((x) => x.artwork) || {}).artwork || "";
