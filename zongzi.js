@@ -538,7 +538,19 @@ function httpPost(url, body, headers) {
 /**
  * 验活。extraHeaders 用于需要特定 Referer 的 CDN（B站要求 Referer: bilibili.com）
  */
-async function verifyPlayable(url, extraHeaders) {
+/* 探活结果缓存：同一个 URL 只探一次。
+   之所以要缓存，是因为「验活」和「验完整度」要的是同一个响应 ——
+   Range 请求已经带回了 Content-Range，总字节数就躺在响应头里，
+   再为完整性多发一次请求纯属浪费。5 分钟过期，跟直链签名寿命同步。 */
+const _audioProbeCache = {};
+
+/** 探一次音频地址：{ ok, total }
+ *  ok    = 魔数是真音频（ID3/MP3/Ogg/FLAC/ftyp/WebM）
+ *  total = 音频总字节数；拿不到（服务端不给 Content-Range）= 0 */
+async function probeAudio(url, extraHeaders) {
+  const hit = _audioProbeCache[url];
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.v;
+  const out = { ok: false, total: 0 };
   try {
     const r = await axios_1.get(url, {
       timeout: 12000,
@@ -546,21 +558,53 @@ async function verifyPlayable(url, extraHeaders) {
       headers: Object.assign({ "User-Agent": UA, Range: "bytes=0-2047" }, extraHeaders || {}),
       validateStatus: () => true,
     });
-    if (!r.data) return false;
-    const b = new Uint8Array(r.data);
-    if (b.length < 8) return false;
-    const x = (i) => b[i] || 0;
-    if (x(0) === 0x49 && x(1) === 0x44 && x(2) === 0x33) return true;           // ID3
-    if (x(0) === 0xff && (x(1) === 0xfb || x(1) === 0xf3 || x(1) === 0xf2)) return true; // MP3
-    if (x(0) === 0x4f && x(1) === 0x67 && x(2) === 0x67) return true;           // OggS
-    if (x(0) === 0x66 && x(1) === 0x4c && x(2) === 0x61) return true;           // fLaC
-    if (x(4) === 0x66 && x(5) === 0x74 && x(6) === 0x79 && x(7) === 0x70) return true; // ftyp
-    // ⚠️ WebM: EBML 头 1A 45 DF A3。
-    //    YouTube 的 opus 音频全是 webm，漏了这个判断会把它们全判成「不可播」，
-    //    然后错误地退回 m4a —— 这是 Topic 曲目播放失败的直接原因。
-    if (x(0) === 0x1a && x(1) === 0x45 && x(2) === 0xdf && x(3) === 0xa3) return true;
-    return false;
-  } catch (e) { return false; }
+    if (r.data) {
+      const b = new Uint8Array(r.data);
+      const x = (i) => b[i] || 0;
+      if (b.length >= 8) {
+        if (x(0) === 0x49 && x(1) === 0x44 && x(2) === 0x33) out.ok = true;           // ID3
+        if (x(0) === 0xff && (x(1) === 0xfb || x(1) === 0xf3 || x(1) === 0xf2)) out.ok = true; // MP3
+        if (x(0) === 0x4f && x(1) === 0x67 && x(2) === 0x67) out.ok = true;           // OggS
+        if (x(0) === 0x66 && x(1) === 0x4c && x(2) === 0x61) out.ok = true;           // fLaC
+        if (x(4) === 0x66 && x(5) === 0x74 && x(6) === 0x79 && x(7) === 0x70) out.ok = true; // ftyp
+        // ⚠️ WebM: EBML 头 1A 45 DF A3。
+        //    YouTube 的 opus 音频全是 webm，漏了这个判断会把它们全判成「不可播」，
+        //    然后错误地退回 m4a —— 这是 Topic 曲目播放失败的直接原因。
+        if (x(0) === 0x1a && x(1) === 0x45 && x(2) === 0xdf && x(3) === 0xa3) out.ok = true;
+      }
+      // 206 响应头里的 Content-Range 形如 "bytes 0-2047/960887"
+      const cr = String((r.headers && r.headers["content-range"]) || "");
+      const m = cr.match(/\/\s*(\d+)\s*$/);
+      if (m) out.total = parseInt(m[1], 10) || 0;
+    }
+  } catch (e) { /* 探不到就当不可播 */ }
+  _audioProbeCache[url] = { at: Date.now(), v: out };
+  return out;
+}
+
+async function verifyPlayable(url, extraHeaders) {
+  return (await probeAudio(url, extraHeaders)).ok;
+}
+
+/** 「只给了试听片段」判据
+ *
+ *  实测（2026-10-18）：QQ 音乐对 VIP 曲目会返回 200 正常、魔数是 MP3 的地址，
+ *  但整段只有 60 秒。《晴天》时长 269s，拿到的文件只有 960887 字节，
+ *  折合 3.5 KB/s（≈28kbps）—— 连 48kbps 都装不下，只能是片段。
+ *  旧代码只验「能不能播」，于是把它当成功返回，跨平台兜底根本没机会上场。
+ *
+ *  判据用「每秒钟多少字节」而不是「够不够某个码率」：
+ *  码率是服务端自己标称的，会撒谎；字节总数 ÷ 时长是硬算出来的。
+ *  低于 48kbps（6KB/s）在音乐里不存在，低于这个必然是片段/截断。
+ *  时长未知的条目一律放行，宁可放过也不冤枉。 */
+const MIN_BYTES_PER_SEC = 6 * 1024; // ≈48kbps
+
+async function isPreviewOnly(url, durationMs) {
+  const ms = Number(durationMs) || 0;
+  if (ms <= 0) return false;
+  const p = await probeAudio(url);
+  if (!p.total) return false;
+  return p.total / (ms / 1000) < MIN_BYTES_PER_SEC;
 }
 
 /** 把各平台五花八门的时长写法统一成毫秒。
@@ -6813,7 +6857,23 @@ async function resolveMediaSource(musicItem, quality) {
   const q = QUALITY_MAP[quality] || "128k";
   const want = { name: musicItem.title, singer: musicItem.artist, album: musicItem.album };
   const provider = musicItem._provider || LABEL_TO_PROVIDER[musicItem.platform] || "netease";
+  const durMs = Number(musicItem.duration) || 0;
   const errors = [];
+  // 拿到过、但只是试听片段的地址。全平台都只给片段时，退回用它 ——
+  // 片段总比「点击报错」好，至少能听个开头。
+  let previewOnly = null;
+
+  /* 本平台和兜底都要过同一道关：能不能播、是不是完整。
+     抽成闭包是为了让两条路径完全同构 —— 之前只在兜底里做校验，
+     结果本平台「能播但是 60 秒试听」就一路过关了。 */
+  const accept = async (u, who) => {
+    if (await isPreviewOnly(u, durMs)) {
+      previewOnly = previewOnly || u;
+      errors.push(who + ": 只给试听片段");
+      return null;
+    }
+    return u;
+  };
 
   // 1) 本平台
   const resolver = RESOLVERS[provider];
@@ -6823,7 +6883,8 @@ async function resolveMediaSource(musicItem, quality) {
     } else {
       try {
         const u = await resolver(musicItem.id, want, q);
-        return { url: u };
+        const okUrl = await accept(u, provider);
+        if (okUrl) return { url: okUrl };
       } catch (e) {
         markDead(provider, musicItem.id);
         errors.push(provider + ": " + e.message);
@@ -6849,9 +6910,18 @@ async function resolveMediaSource(musicItem, quality) {
       //    出现过「元数据是 YouTube 的歌、兜底却给了 B 站另一首歌」的事故。
       //    所以这里再要求 resolver 把「命中曲目」带回来，做最后一道闸。
       const u = await fn(null, want, q);
-      console.log("[粽子] 兜底命中: " + provider + " → " + p + " 《" + want.name + "》");
-      return { url: u };
+      const okUrl = await accept(u, "兜底" + p);
+      if (okUrl) {
+        console.log("[粽子] 兜底命中: " + provider + " → " + p + " 《" + want.name + "》");
+        return { url: okUrl };
+      }
     } catch (e) { errors.push("兜底" + p + ": " + e.message); }
+  }
+
+  // 3) 全平台都只给片段 → 退回片段，别让用户点了报错
+  if (previewOnly) {
+    console.log("[粽子] 全平台仅试听: 《" + want.name + "》");
+    return { url: previewOnly };
   }
 
   // 全平台都没拿到 → 把这首歌记进黑名单，下次搜索直接不显示它
@@ -7413,7 +7483,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.15",
+  version: "4.9.16",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
