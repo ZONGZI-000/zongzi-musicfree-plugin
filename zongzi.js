@@ -807,12 +807,25 @@ const MEDIA_VIDEO_RE = /幕后|幕後|花絮|混剪|首播|预告|預告|抢先�
 
 /** 查询词整串是否就是这位歌手的名字（搜「周杰伦」而不是搜某首歌）。
  *  ⚠️ 只认整串、且长度 ≥2，避免「起风了 买辣椒也用券」这种组合串误判。 */
+/* 反查确认过的「查询词 → 同一身份的其它名字」。
+ * 有了它，「IGU Band」这种**一个字都不重合**的英文名才认得出是歌手：
+ * 结果里 artist 写着「那我懂你意思了」，光靠字符串包含永远判不出来。 */
+const ARTIST_ALIAS = {};
+
 function isArtistQuery(query, artist) {
   const qn = normTextZ(query);
   if (!qn || qn.length < 2) return false;
   const an = singerNorm(toSimplified(artist));
   if (!an) return false;
-  return an.indexOf(qn) >= 0;
+  if (an.indexOf(qn) >= 0) return true;
+  const als = ARTIST_ALIAS[qn];
+  if (als && als.length) {
+    for (let i = 0; i < als.length; i++) {
+      const k = normTextZ(als[i]);
+      if (k && an.indexOf(k) >= 0) return true;
+    }
+  }
+  return false;
 }
 
 /* ============================================================
@@ -1234,6 +1247,123 @@ async function qqArtistProbe(q) {
   return res;
 }
 
+/* ============================================================
+ * 第三路：Apple Music 的**歌手身份桥**
+ *
+ * QQ 的括号译名只覆盖「中文译名 ↔ 原名」，而且它经常根本没有这个歌手
+ * （QQ 搜「那我懂你意思了」直接返回 0 条，搜「IGU Band」返回一堆非洲乐队）。
+ * Apple 侧有另一条更硬的路：**artistId 是跨语言、跨商店的唯一身份**。
+ *
+ *   搜艺人「IGU Band」→ 专辑结果归到 artistId=798583449
+ *   → 拿这个 id 去 hk / tw / us / jp 四个商店 lookup
+ *   → 四个区回来的 artistName 都是「那我懂你意思了」
+ *   英文名 ↔ 中文名就这么对上了。
+ *
+ * 实测（2026-10-18）：
+ *   IGU Band          → 那我懂你意思了
+ *   彩虹乐队           → L'Arc-en-Ciel
+ *   米津玄师           → 米津玄師 / Kenshi Yonezu
+ *   落日飞车           → 落日飛車 / Sunset Rollercoaster
+ *   Yura Yura Teikoku → ゆらゆら帝国
+ *
+ * ⚠️ 必须防误判，否则「搜歌名」会变成「搜歌手」，整页结果全跑偏：
+ *   ① 歌曲结果里标题含查询词的比例过半 → 这词是歌名，直接放弃
+ *        晴天 12/12   稻香 11/12   起风了 12/12   夜曲 8/11
+ *   ② 专辑结果必须集中在同一个 artistId（≥2 张且占结果 25% 以上）
+ *        搜「后来」，10 张专辑分给 7 个歌手 → 不认
+ *   ③ 该 artistId 得和「艺人实体搜索」的第一名对得上，或者它的名字本身
+ *      包含查询词 —— 两条都不满足就不认
+ *        「草东」→ 专辑第一名是 Dear Jane，对不上 → 放弃
+ * ⚠️ 全部并发、各自带超时，最慢的一步也算在「反查总预算」里，
+ *    不会因为 Apple 抽风拖慢搜索。
+ * ============================================================ */
+const APPLE_BRIDGE_OK = {};
+
+async function appleArtistAliases(query) {
+  const q = String(query || "").trim();
+  if (!q) return [];
+  const ck = cacheGet("aliasApple", q, "");
+  if (ck) return ck;
+  const qn = normTextZ(q);
+  const names = [];
+  try {
+    const albP = itunesGet("/search", { term: q, entity: "album", limit: 10, country: "hk" }, 3000);
+    const artP = itunesGet("/search", { term: q, entity: "musicArtist", limit: 3, country: "hk" }, 3000);
+    const songP = itunesGet("/search", { term: q, entity: "song", limit: 12, country: "hk" }, 3000);
+    const [alb, art, sg] = await Promise.all([albP, artP, songP]);
+    const albums = (alb && alb.results) || [];
+    const songs = (sg && sg.results) || [];
+    const arts = (art && art.results) || [];
+
+    /* ① 歌名否决：搜索结果里标题几乎都写着查询词 → 这是首歌，不是人 */
+    let titleHit = 0;
+    for (let i = 0; i < songs.length; i++) {
+      if (normTextZ(songs[i].trackName).indexOf(qn) >= 0) titleHit++;
+    }
+    if (songs.length >= 3 && titleHit * 2 >= songs.length) {
+      cachePut("aliasApple", q, "", names);
+      return names;
+    }
+
+    /* ② 专辑按 artistId 归并，挑出压倒性的那一位 */
+    const byId = {};
+    for (let i = 0; i < albums.length; i++) {
+      const id = albums[i].artistId;
+      if (!id) continue;
+      const k = String(id);
+      if (!byId[k]) byId[k] = { name: String(albums[i].artistName || ""), n: 0 };
+      byId[k].n++;
+    }
+    const ids = Object.keys(byId);
+    ids.sort((a, b) => byId[b].n - byId[a].n);
+    const domId = ids[0] || "";
+    const domN = domId ? byId[domId].n : 0;
+    const share = albums.length ? domN / albums.length : 0;
+
+    const artId = arts[0] && arts[0].artistId ? String(arts[0].artistId) : "";
+    const artName = (arts[0] && arts[0].artistName) || "";
+
+    /* ③ 两条证据至少中一条才认这个 id */
+    let pickId = "";
+    if (domId && domN >= 2 && share >= 0.25 && (domId === artId || normTextZ(byId[domId].name).indexOf(qn) >= 0)) {
+      pickId = domId;                       // 专辑压倒性 + 艺人实体对得上
+    } else if (artId && artName && normTextZ(artName).indexOf(qn) >= 0) {
+      pickId = artId;                       // 艺人实体自己就含查询词
+    } else if (domId && domN >= 2 && share >= 0.8) {
+      pickId = domId;                       // 专辑几乎全归一个人
+    }
+    if (!pickId) {
+      cachePut("aliasApple", q, "", names);
+      return names;
+    }
+
+    /* ④ 拿 artistId 去四个商店取本地化名字 —— 这一步才是「翻译」的来源 */
+    const ccs = ["hk", "tw", "us", "jp"];
+    const lookups = await Promise.all(ccs.map((cc) =>
+      itunesGet("/lookup", { id: pickId, entity: "album", limit: 3, country: cc }, 3000).catch(() => null)
+    ));
+    for (let i = 0; i < lookups.length; i++) {
+      const rs = (lookups[i] && lookups[i].results) || [];
+      for (let j = 0; j < rs.length; j++) {
+        if (rs[j].wrapperType !== "artist") continue;
+        const n = String(rs[j].artistName || "").trim();
+        if (!n) continue;
+        if (normTextZ(n) === qn) continue;                    // 跟查询词同名，没信息量
+        if (names.indexOf(n) >= 0) continue;
+        names.push(n);
+      }
+    }
+    /* 桥接成功 = 至少拿到一个跟查询词不同的名字，这个 id 就是权威身份。
+       记到 ALIAS_AUTH 里，让 searchArtist / searchAlbum 优先用它。 */
+    if (names.length && !ALIAS_AUTH[qn]) {
+      ALIAS_AUTH[qn] = names.slice();
+      APPLE_BRIDGE_OK[qn] = 1;
+    }
+  } catch (e) { /* 拿不到就当没有，主流程不受影响 */ }
+  cachePut("aliasApple", q, "", names);
+  return names;
+}
+
 async function neteaseArtistAliases(query, qqPre) {
   const q = String(query || "").trim();
   if (!q) return [];
@@ -1243,6 +1373,11 @@ async function neteaseArtistAliases(query, qqPre) {
   /* ⚠️ 网易云那两发请求和 QQ 那一路**并发**跑。
      以前是串行的，等于白等 2 秒 —— 两边互不依赖。 */
   const qqP = qqPre ? Promise.resolve(qqPre) : qqArtistProbe(q).catch(() => ({ names: [], authoritative: false, exact: false }));
+  /* Apple 那一路也一起发出去。它是唯一能覆盖「英文名 ↔ 中文名」的源
+     （QQ 搜「那我懂你意思了」直接空手，「IGU Band」又给一堆无关乐队）。
+     ⚠️ 一定并发、不能 await 在这里 —— 三条反查互不依赖，
+        串起来就是白等 3~5 秒。 */
+  const appleP = appleArtistAliases(q).catch(() => []);
   try {
     // ⚠️ 用 POST 打 /api/cloudsearch/pc，不要用 GET /api/search/get/web。
     //    实测 2026-10-18：GET 版连续请求几次就返回
@@ -1353,12 +1488,14 @@ async function neteaseArtistAliases(query, qqPre) {
   const qq = await qqP.catch(() => ({ names: [], authoritative: false, exact: false }));
   const qqNames = qq.names || [];
   const qqAuthoritative = !!qq.authoritative;
+  const appleNames = (await appleP.catch(() => [])) || [];
 
   /* 合并：
      - QQ 权威 → 只用 QQ 的（网易云的推断可能是错的）
-     - 否则 → QQ 的名字排前面，网易云的（原名/假名/罗马音）跟在后面
+     - 否则 → Apple 的排最前（artistId 跨商店验证过，中文译名/英文名都在里面），
+              然后 QQ 的，最后网易云那套推断
      最多 6 个，多了只会拖慢 B 站那几轮关键词尝试。 */
-  const pool = qqAuthoritative ? qqNames : qqNames.concat(out);
+  const pool = qqAuthoritative ? qqNames : appleNames.concat(qqNames, out);
   const merged = [];
   const qn1 = normTextZ(q);
   for (let i = 0; i < pool.length; i++) {
@@ -1408,22 +1545,36 @@ async function aliasCandidates(query) {
     arr.push(n);
   };
   const names = [q];
+  /* ⚠️ QQ 和 Apple 两家**并发**问，别串行 —— 串起来就是白等 2~4 秒，
+     而歌手页/专辑页是高频操作，用户会直接感觉到「插件变慢了」。 */
+  const qqP = qqArtistProbe(q).catch(() => ({ names: [], authoritative: false, exact: false }));
+  const appleP = appleArtistAliases(q).catch(() => []);
   let qq = { names: [], authoritative: false, exact: false };
-  try { qq = await qqArtistProbe(q); } catch (e) { /* 空 */ }
+  try { qq = await qqP; } catch (e) { /* 空 */ }
+  const appleNames = (await appleP.catch(() => [])) || [];
   /* QQ 说「查询词就是本名」→ 没有别名可找，直接用原查询。
      再问网易云只会白花 2 秒，还可能被它的推断带偏
      （实测搜「彩虹乐队」它推的是 Rainbow，完全另一支乐队）。 */
   if (qq.exact && !qq.authoritative) {
-    return { q: q, names: names, auth: [], cheap: true };
+    return { q: q, names: names, auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: true };
   }
   if (qq.authoritative) {
     for (let i = 0; i < qq.names.length; i++) push(names, qq.names[i]);
-    return { q: q, names: names.slice(0, 5), auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: true };
+    for (let i = 0; i < appleNames.length; i++) push(names, appleNames[i]);
+    return { q: q, names: names.slice(0, 6), auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: true };
   }
-  // QQ 一无所获 → 才动用网易云那条慢路径（拿假名/罗马音/译名）
+  /* Apple 桥接成功 → 身份已经被 artistId 跨四个商店确认过，
+     不必再花 2 秒问网易云（它给的「推断」还可能把话带偏）。
+     ⚠️ 这条判断放在 QQ 之后：QQ 的括号译名是平台显式声明，优先级最高。 */
+  if (appleNames.length) {
+    for (let i = 0; i < appleNames.length; i++) push(names, appleNames[i]);
+    for (let i = 0; i < qq.names.length; i++) push(names, qq.names[i]);
+    return { q: q, names: names.slice(0, 6), auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: true };
+  }
+  // QQ / Apple 都没线索 → 才动用网易云那条慢路径（拿假名/罗马音/译名）
   const al = await neteaseArtistAliases(q, qq).catch(() => []);
   for (let i = 0; i < (al || []).length; i++) push(names, al[i]);
-  return { q: q, names: names.slice(0, 5), auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: false };
+  return { q: q, names: names.slice(0, 6), auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: false };
 }
 
 /** 这条结果的歌手名，是不是「查询词或它的别名」之一。
@@ -5966,6 +6117,16 @@ async function searchMusicAll(query, page) {
      query 先注册为真，别名兜在后面。 */
   const aliasList = await aliasPromise;
   const matchAnchors = [query].concat(aliasList);
+  /* 反查到的别名注册成「同一身份」，供 isArtistQuery 使用。
+     ⚠️ 这一步必须在 detectArtistQuery 之前 ——
+        实测搜「IGU Band」：B 站/YouTube 拿别名「那我懂你意思了」搜回来 12 条，
+        artist 字段全是「那我懂你意思了」，跟查询词一个字都不重合，
+        不注册的话一条都判不成「这是他的歌」，
+        最后被网易云那堆《Puta Bandida》《Bandido Não Namora》压在后面。 */
+  if (aliasList.length) {
+    const ak = normTextZ(query);
+    if (ak) ARTIST_ALIAS[ak] = aliasList.slice();
+  }
   /* 整轮先判定「这次搜的是不是一个歌手名」。判定出来的话，
      后面所有单条打分都要换一套逻辑（见 relevanceTier / relevanceExtra）。 */
   const artistQuery = detectArtistQuery(query, filtered2);
@@ -6248,7 +6409,16 @@ async function searchMusicAll(query, page) {
         }));
       }
       if (conn.length) {
-        for (let i = 0; i < conn.length; i++) relevant.push(conn[i]);
+        for (let i = 0; i < conn.length; i++) {
+          /* ⚠️ 这些条目是**补全阶段**加进来的，没走过上面那道相关性闸门，
+             _rel 一直是 undefined（=0），排序时会被当成「跟查询沾不上边」，
+             压在网易云/QQ 那堆分词噪声后面。
+             实测搜「IGU Band」：YouTube 补进来的 20 首真歌全排在
+             《Puta Bandida》(DJ IGU BEATS) 后面。
+             它们来自 Apple 为该歌手验证过的目录，天然就是相关的 → 直接给 1。 */
+          conn[i]._rel = 1;
+          relevant.push(conn[i]);
+        }
         appleFilled = conn.length;
         console.log("[粽子] Apple 目录补全 " + conn.length + " 首官方音源");
       }
@@ -6696,7 +6866,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.12",
+  version: "4.9.13",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
