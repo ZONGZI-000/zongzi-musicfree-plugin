@@ -5475,11 +5475,178 @@ async function neteaseRecommendTags() {
     console.log("[粽子] 歌单分类失败: " + e.message);
   }
   /* 拿不到分类时不能返回空 —— 那样整页是白的。用本地那份兜底 */
-  const v = groups.length
+  let v = groups.length
     ? { pinned: [{ id: "全部", title: "热门" }].concat(NE_SHEET_CATS.slice(0, 4).map((c) => ({ id: c, title: c }))), data: groups }
     : { pinned: [{ id: "全部", title: "热门" }], data: [{ title: "分类", data: NE_SHEET_CATS.map((c) => ({ id: c, title: c })) }] };
+
+  /* QQ 那边还有一批网易完全没有的分类（闽南语 / 情歌 / 现场音乐 /
+     DJ / 婚礼 …）。这些没法并进上面的组，单独挂一个「QQ 独有」。
+     它们的 id 带 q: 前缀，取池时只走 QQ，不会去问网易要不存在的东西。 */
+  if (shouldUseQQSheet()) {
+    v.data = v.data.concat([{
+      title: "QQ 独有",
+      data: QQ_ONLY_CATS.map((c) => ({ id: "q:" + c, title: c })),
+    }]);
+  }
+
   NE_TAG_CACHE = { at: Date.now(), v: v };
   return v;
+}
+
+/* ============================================================
+ * QQ 音乐歌单广场（第二个数据源）
+ *
+ * 网易那边只有它自己的一套分类，加上 QQ 之后，同一个 tag 能凑到
+ * 两边各自的歌单，池子直接翻倍 —— 池子越大，「每天换一批还跟前三天
+ * 不重」才越撑得住（古风那种只剩 22 张的分类，就是被池子大小卡住的）。
+ *
+ * 三个接口全部匿名可用（2026-10-18 实测）：
+ *   分类配置  fcg_get_diss_tag_conf     5 组 64 个分类（带 usable 标记）
+ *   分类歌单  fcg_get_diss_by_tag       每页 30 张，sin/ein 翻页
+ *   歌单详情  fcg_ucc_getcdinfo_byids   歌曲全量 + songmid + 封面 + 时长
+ *
+ * ⚠️ 两边的分类命名不一样（华语/国语、说唱/嘻哈、民族/中国传统…），
+ *    所以下面必须有一张对照表，不能直接拿名字当 id 用。
+ * ⚠️ 歌单 id 两边都是纯数字，**会撞**。所以 QQ 的一律加 qq: 前缀。
+ * ============================================================ */
+const QQ_DISS_CONF = "https://c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_tag_conf.fcg";
+const QQ_DISS_BY_TAG = "https://c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_by_tag.fcg";
+const QQ_CD_INFO = "https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg";
+const QQ_REC_HEADERS = { "User-Agent": UA, Referer: "https://y.qq.com/" };
+
+/* 网易分类名 → QQ categoryId。没列到的就是「QQ 那边没有对应分类」，
+   只取网易那一份，不做合并 —— 硬凑（比如拿「夜店」顶「散步」）
+   会推出牛头不对马嘴的歌单。 */
+const QQ_CAT_ALIAS = {
+  // 语种
+  "华语": 165, "欧美": 167, "日语": 169, "韩语": 168, "粤语": 166,
+  // 风格
+  "流行": 6, "摇滚": 11, "民谣": 28, "电子": 24, "舞曲": 14, "说唱": 153,
+  "轻音乐": 15, "爵士": 21, "乡村": 18, "R&B/Soul": 8, "古典": 27,
+  "民族": 219, "蓝调": 22, "世界音乐": 220, "拉丁": 25, "New Age": 164,
+  "古风": 194, "后摇": 218,
+  // 场景
+  "夜晚": 102, "学习": 101, "工作": 94, "运动": 99, "驾车": 85, "校园": 16,
+  "旅行": 81, "派对": 103, "约会": 76,
+  // 情感
+  "怀旧": 136, "浪漫": 59, "伤感": 52, "治愈": 116, "放松": 122,
+  "兴奋": 126, "快乐": 117, "安静": 122, "思念": 68, "孤独": 55,
+  // 主题
+  "影视原声": 133, "ACG": 39, "儿童": 131, "网络歌曲": 146,
+  "KTV": 141, "经典": 136, "器乐": 202, "吉他": 202, "钢琴": 202,
+  // QQ 独有（tag id 带 q: 前缀，只走 QQ）
+  "闽南语": 203, "法语": 204, "拉丁语": 205, "情歌": 148, "城市": 196,
+  "现场音乐": 197, "背景音乐": 199, "佛教音乐": 200, "UP主": 201,
+  "MC喊麦": 226, "DJ": 14, "婚礼": 222, "咖啡馆": 223, "跳舞": 224,
+};
+
+/* QQ 独有分类：网易那边没有，单独列一组，id 加 q: 让取池只走 QQ */
+const QQ_ONLY_CATS = ["闽南语", "法语", "情歌", "城市", "现场音乐",
+  "背景音乐", "佛教音乐", "UP主", "MC喊麦", "DJ", "婚礼", "咖啡馆"];
+
+/** 开关：默认开。关掉后推荐歌单页只剩网易那一份 */
+function shouldUseQQSheet() {
+  try {
+    const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
+    const v = vars.qqRecommendSheets;
+    if (v === undefined || v === null || v === "") return true;
+    return !(v === "0" || v === "false" || v === "off");
+  } catch (e) { return true; }
+}
+
+/** 歌单 id 加前缀，避免和网易的纯数字 id 撞车 */
+const qqSheetId = (id) => "qq:" + String(id);
+const isQQSheetId = (id) => String(id || "").indexOf("qq:") === 0;
+const qqSheetRawId = (id) => String(id || "").replace(/^qq:/, "");
+
+/** QQ 歌单封面是 http，https 同样能取（实测 200），统一换成 https 免混流拦截 */
+const qqImg = (u) => String(u || "").replace(/^http:\/\//i, "https://");
+
+const QQ_SHEET_TTL = 6 * 60 * 60 * 1000;
+/** 某个 QQ 分类下的歌单（两页共 60 张）。结果缓存，避免翻页反复打 */
+async function qqSheetList(catId) {
+  const ck = "qq|" + catId;
+  const hit = REC_POOL_CACHE[ck];
+  if (hit && Date.now() - hit.at < QQ_SHEET_TTL) return hit.v;
+
+  const out = [];
+  const seen = {};
+  for (let p = 0; p < 2; p++) {
+    try {
+      const r = await httpGet(QQ_DISS_BY_TAG, {
+        picmid: 1, rnd: Math.random(), g_tk: 5381, format: "json",
+        inCharset: "utf8", outCharset: "utf-8",
+        categoryId: catId, sortId: 5, sin: p * 30, ein: p * 30 + 29,
+      }, QQ_REC_HEADERS);
+      // 同上：httpGet 给的就是响应体，分类列表直接在 data.list 里
+      const list = (r && r.data && r.data.list) || [];
+      if (!list.length) break;
+      list.forEach((x) => {
+        if (!x || !x.dissid || !x.dissname) return;
+        const id = qqSheetId(x.dissid);
+        if (seen[id]) return;
+        seen[id] = 1;
+        out.push({
+          id: id,
+          platform: "QQ音乐",
+          title: x.dissname,
+          artist: (x.creator && x.creator.name) || "",
+          artwork: qqImg(x.imgurl),
+          worksNum: Number(x.songnum || 0),
+          playCount: Number(x.listenum || 0),
+          description: x.introduction || "",
+          _provider: "qq",
+        });
+      });
+    } catch (e) {
+      console.log("[粽子] QQ歌单分类(" + catId + ")失败: " + e.message);
+      break;
+    }
+  }
+  REC_POOL_CACHE[ck] = { at: Date.now(), v: out };
+  return out;
+}
+
+/** QQ 歌单详情。一次给全量歌曲（实测 374 首的歌单也是全量返回），不用翻页 */
+async function qqSheetDetail(disstid, page) {
+  const raw = qqSheetRawId(disstid);
+  const r = await httpGet(QQ_CD_INFO, {
+    type: 1, json: 1, utf8: 1, onlysong: 0, disstid: raw,
+    format: "json", g_tk: 5381, inCharset: "utf8", outCharset: "utf-8",
+    notice: 0, platform: "yqq.json", needNewCode: 0,
+  }, { "User-Agent": UA, Referer: "https://y.qq.com/n/yqq/playlist/" + raw + ".html" });
+  // httpGet 返回的就是响应体本身（它已经 .then(r => r.data) 了），
+  // 所以这里直接读 cdlist —— 写成 r.data.cdlist 会少一层，永远拿不到。
+  const cd = r && r.cdlist && r.cdlist[0];
+  if (!cd) throw new Error("QQ歌单：无 cdlist");
+
+  const musicList = (cd.songlist || []).map((s) => ({
+    id: String(s.songmid || ""),
+    platform: "QQ音乐",
+    title: s.songname || s.songorig || "",
+    artist: ((s.singer || []).map((a) => a.name).join("/")) || "",
+    album: s.albumname || "",
+    artwork: s.albummid
+      ? "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + s.albummid + ".jpg"
+      : "",
+    duration: Number(s.interval || 0) * 1000,
+    _provider: "qq",
+  })).filter((x) => x.id && x.title);
+
+  return {
+    isEnd: true,
+    sheetItem: {
+      id: qqSheetId(raw),
+      platform: "QQ音乐",
+      title: cd.dissname || "",
+      artist: (cd.creator && cd.creator.name) || "",
+      artwork: qqImg(cd.logo),
+      worksNum: Number(cd.songnum || musicList.length),
+      playCount: Number(cd.visitnum || cd.listenum || 0),
+      description: cd.desc || "",
+    },
+    musicList: musicList,
+  };
 }
 
 /** 某个 tag 当天的歌单池（已洗牌、已去重，按天固定） */
@@ -5489,32 +5656,63 @@ async function recSheetPool(tagName) {
   const hit = REC_POOL_CACHE[ck];
   if (hit && Date.now() - hit.at < REC_POOL_TTL) return hit.v;
 
+  /* 池子统一存「已经转好的展示条目」（id/title/platform/…），
+     两个源在建池这一步就各自归一，后面洗牌、轮换、去重、
+     回给 App 全都只认一种结构，不用再分是谁的数据。 */
   const seen = {};
   const pool = [];
+  const pushItem = (it) => {
+    if (!it || !it.id || !it.title) return;
+    if (seen[it.id]) return;
+    seen[it.id] = 1;
+    pool.push(it);
+  };
   const push = (arr) => {
-    (arr || []).forEach((p) => {
-      if (!p || !p.id || !p.name) return;
-      if (seen[p.id]) return;
-      seen[p.id] = 1;
-      pool.push(p);
-    });
+    (arr || []).forEach((p) => { if (p && p.id && p.name) pushItem(neTopItem(p)); });
   };
 
-  try {
-    const r = await httpGet("https://music.163.com/api/playlist/highquality/list",
-      { cat: cat, limit: 100, lasttime: 0, area: "全部" }, NETEASE_HEADERS);
-    push((r && r.playlists) || []);
-  } catch (e) { console.log("[粽子] 推荐池(" + cat + ")失败: " + e.message); }
+  /* QQ 那一份单独收。它的 id 带 qq: 前缀，跟网易的纯数字 id 天然不撞，
+     所以能安全地并进同一个池子 —— 洗牌、按天轮换、去重全都不用改。 */
+  const useQQ = shouldUseQQSheet();
+  /* tag 的两种特殊写法：
+       q:xxx → 只有 QQ 有，网易那边根本不存在，别去问它
+       全部   → 网易用「全部」，QQ 没有这个 categoryId，
+                用「流行」当大盘代表（它本来就是 QQ 最大的那一格） */
+  const qqOnly = cat.indexOf("q:") === 0;
+  const qqKey = qqOnly ? cat.slice(2) : cat === "全部" ? "流行" : cat;
+  const qqCatId = useQQ ? QQ_CAT_ALIAS[qqKey] : undefined;
+  const wantNE = !qqOnly;
+
+  const tasks = [];
+  if (useQQ && qqCatId) tasks.push(qqSheetList(qqCatId));
+
+  if (wantNE) {
+    try {
+      const r = await httpGet("https://music.163.com/api/playlist/highquality/list",
+        { cat: cat, limit: 100, lasttime: 0, area: "全部" }, NETEASE_HEADERS);
+      push((r && r.playlists) || []);
+    } catch (e) { console.log("[粽子] 推荐池(" + cat + ")失败: " + e.message); }
+  }
+
+  if (tasks.length) {
+    try {
+      const arrs = await Promise.all(tasks);
+      arrs.forEach((arr) => { (arr || []).forEach((x) => pushItem(x)); });
+    } catch (e) { console.log("[粽子] QQ推荐池(" + cat + ")失败: " + e.message); }
+  }
 
   /* highquality 对部分冷门分类是空的（综艺 / 清晨 / 校园 / 午休…），
      回落一次 playlist/list。它顺序不稳定，所以只在建池时取，取完不再动。 */
-  if (pool.length < 12) {
+  if (wantNE && pool.length < 12) {
     try {
       const r2 = await httpGet("https://music.163.com/api/playlist/list",
         { cat: cat, order: "hot", offset: 0, limit: 50, total: false }, NETEASE_HEADERS);
       push((r2 && r2.playlists) || []);
     } catch (e) { console.log("[粽子] 推荐池回落(" + cat + ")失败: " + e.message); }
   }
+
+  /* 两个源全军覆没时直接给空，别让后面的取模算出 NaN */
+  if (!pool.length) return [];
 
   /* 「每天换一批，跟前三天不一样」在无状态下怎么做：
      插件存不了历史，所以页面只能是 (池子, 日期) 的**纯函数** ——
@@ -5568,7 +5766,7 @@ async function recSheetPool(tagName) {
   const shown = {};
   rotated.forEach((x) => { shown[x.id] = 1; });
   const rest = ordered.filter((x) => !shown[x.id]);
-  const full = rotated.concat(rest);  const out = full.map(neTopItem);
+  const out = rotated.concat(rest);
   REC_POOL_CACHE[ck] = { at: Date.now(), v: out };
   return out;
 }
@@ -8080,7 +8278,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.21",
+  version: "4.9.22",
   author: "粽子 & Alma",
   description:
     "九源聚合 + 四类搜索（单曲/专辑/歌手/歌单）。网易云 / QQ / 酷狗 / 咪咕 / 酷我 / JOOX / YouTube / Bilibili / 咪咕直出，取流带跨平台兜底。Bilibili 免费且音质最高（实测 319kbps m4a）。",
@@ -8186,6 +8384,11 @@ module.exports = {
       hint: "填 1 开启、0 关闭。接入苹果官方公开的 Marketing Tools 榜单 feed（不用登录、不用 key），榜单页会多出「Apple 热门歌曲」8 个地区 × 100 首，以及中国/美国/日本的热门专辑和歌单各 50 张。曲目和封面直接来自苹果，音频走跨平台兜底。",
     },
     {
+      key: "qqRecommendSheets",
+      name: "推荐歌单并入 QQ 音乐（默认开）",
+      hint: "填 1 开启、0 关闭。开启后「推荐歌单」页每个分类会同时取网易云和 QQ 两边的歌单，池子大一倍，每天换一批更不容易撞；另外多出一组「QQ 独有」分类（闽南语、情歌、现场音乐、DJ、婚礼等网易没有的）。关掉就只用网易云那一份。",
+    },
+    {
       key: "jooxCookie",
       name: "JOOX Cookie（可选）",
       hint: "登录 joox.com 后，把浏览器里 joox.com 域下的全部 cookie 粘进来（含 session_key / user_type / wmid 等 HttpOnly 项）。留空则 JOOX 不参与。",
@@ -8224,6 +8427,27 @@ module.exports = {
         },
         musicList: musicList,
       };
+    }
+    if (sheetItem._provider === "qq" && isQQSheetId(sheetItem.id)) {
+      try {
+        return await qqSheetDetail(sheetItem.id, page);
+      } catch (e) {
+        console.log("[粽子] QQ歌单详情失败: " + e.message);
+        return {
+          isEnd: true,
+          sheetItem: {
+            id: String(sheetItem.id),
+            platform: "QQ音乐",
+            title: sheetItem.title || "",
+            artist: sheetItem.artist || "",
+            artwork: sheetItem.artwork || "",
+            worksNum: sheetItem.worksNum || 0,
+            playCount: sheetItem.playCount || 0,
+            description: sheetItem.description || "",
+          },
+          musicList: [],
+        };
+      }
     }
     if (sheetItem._provider === "netease" || sheetItem.platform === "网易云") {
       try {
