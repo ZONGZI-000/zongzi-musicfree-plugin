@@ -11648,7 +11648,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.10",
+  version: "4.10.11",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -12220,7 +12220,7 @@ function md5Hex(str) {
  * ============================================================ */
 (function () {
   ["search", "getAlbumInfo", "getMusicSheetInfo", "getArtistWorks", "getTopLists",
-   "getRecommendSheetsByTag", "getMusicComments"].forEach(function (name) {
+   "getTopListDetail", "getRecommendSheetsByTag", "getMusicComments"].forEach(function (name) {
     const fn = module.exports[name];
     if (typeof fn !== "function") return;
     module.exports[name] = function () {
