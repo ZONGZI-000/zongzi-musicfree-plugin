@@ -4288,13 +4288,18 @@ function artistConsensus(list, query) {
   // 只有一条同名结果时没有共识可言，别乱加分
   if (keys.length === 1 && weight[top] < 2) return null;
 
-  return function (item) {
+  const fn = function (item) {
     const a = singerNorm(item.artist || "");
     if (!a) return -5;                    // 没歌手信息，略降
     if (a === top) return 90;
     if (a.indexOf(top) >= 0 || top.indexOf(a) >= 0) return 60;
     return -25;                           // 明确是别人 → 压到同名条目的最底部
   };
+  /* 把共识歌手挂到函数上：调用方要拿它做「同名翻唱整体沉底」的分组
+     （见 searchAlbum 里 rankByName 之后那段）。 */
+  fn.top = top;
+  fn.weight = weight;
+  return fn;
 }
 
 /* ============================================================
@@ -4517,6 +4522,89 @@ async function kugouArtistWorks(singerId, page, type, size) {
     data: list.map(kugouSongToItem).filter((x) => x.id && x.title),
   };
 }
+
+
+/** QQ 按歌手名搜歌，只留歌手字段真的对得上的那些。
+ *
+ *  ⚠️ 为什么不用 musicu 的 GetSingerSongList：2026-10-20 实测
+ *     singerId / singerMid / 两者都传，全部返回 code 500003；
+ *     老接口 fcg_v8_singer_track_cp.fcg 直接 404。
+ *     soso 的 t=0（搜歌）还活着，而且按歌手名搜出来的前 30 条
+ *     全是这个人的代表作（实测周杰伦：晴天/发如雪/搁浅/一路向北/枫…），
+ *     足够当歌手页第一页。 */
+async function qqSearchSongsByArtist(name, page, rn) {
+  const nm = singerNorm(name);
+  if (!nm) return [];
+  const pg = Math.max(1, page || 1);
+  try {
+    const r = await axios_1.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp", {
+      params: { w: name, t: 0, p: pg, n: 30, format: "json" },
+      timeout: 8000,
+      headers: { "User-Agent": UA, Referer: "https://y.qq.com/" },
+      validateStatus: () => true,
+    });
+    const so = (r.data && r.data.data && r.data.data.song) || {};
+    const list = so.list || [];
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+      const x = list[i];
+      const singers = x.singer || [];
+      let hit = false;
+      for (let j = 0; j < singers.length; j++) {
+        const s = singerNorm(singers[j].name);
+        if (!s) continue;
+        if (s === nm || s.indexOf(nm) >= 0 || nm.indexOf(s) >= 0) { hit = true; break; }
+      }
+      if (!hit) continue;
+      out.push({
+        id: String(x.songmid || ""),
+        platform: "QQ音乐",
+        title: x.songname || "",
+        artist: singers.map((s) => s.name).join("/"),
+        album: x.albumname || "",
+        artwork: x.albummid ? "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + x.albummid + ".jpg" : "",
+        duration: Number(x.interval || 0) * 1000,
+        _provider: "qq",
+      });
+    }
+    return out.filter((x) => x.id && x.title);
+  } catch (e) { return []; }
+}
+
+/** QQ 按歌手名搜专辑。soso 的 t=1（专辑）已经返回空列表，
+ *  这里改用搜歌拿到的 albummid 去聚合 —— 同一位歌手的歌大多集中在
+ *  他自己的正规专辑里，聚合出来就是一串可用专辑。 */
+async function qqSearchAlbumByName(name, page) {
+  if ((page || 1) > 1) return [];
+  const songs = await qqSearchSongsByArtist(name, 1, 60);
+  const byAlbum = {};
+  const order = [];
+  for (let i = 0; i < songs.length; i++) {
+    const s = songs[i];
+    const am = String(s.artwork || "").match(/T002R300x300M000([0-9A-Za-z]+)/);
+    const mid = am ? am[1] : "";
+    const key = (s.album || "") + "|" + mid;
+    if (!s.album || !mid) continue;
+    if (!byAlbum[key]) { byAlbum[key] = { mid: mid, title: s.album, artist: s.artist, n: 0 }; order.push(key); }
+    byAlbum[key].n++;
+  }
+  return order.map((k) => {
+    const a = byAlbum[k];
+    return {
+      id: "qqal:" + a.mid,
+      platform: "QQ音乐",
+      title: a.title,
+      artist: a.artist,
+      artwork: "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + a.mid + ".jpg",
+      date: "",
+      description: "",
+      worksNum: a.n,
+      _provider: "qq",
+      _kind: "album",
+    };
+  });
+}
+
 
 /* ============================================================
  * 「这次搜的是个歌手名」—— 用酷狗歌手库判定
@@ -5245,6 +5333,51 @@ async function searchAlbum(query, page) {
     }
   }
 
+  /* ---- 同名翻唱整体沉底（放在权威目录提权**之后**）----
+     实测搜「叶惠美」返回 29 条，前 6 名里 5 条是同名翻唱专辑：
+       叶惠美 / 周婕纶 7 首、叶惠美 / Jue Wang 19 首、王珏子乔 18 首、
+       夜未央&小可 10 首、周杰伦《叶惠美》吉他翻唱版 / 涛李TAOLEE 3 首
+     它们跟正版（11 首）名字一模一样，纯按名字匹配度打分完全打平，
+     只能靠曲目数分先后 —— 于是 19 首的翻唱合集反而压过 11 首的正版。
+
+     这里把「名字跟查询词一致、但歌手不是正主」的整批挪到后面（**不删**，
+     想听翻唱还能往下翻）。正主从两处取，谁有信谁：
+       ① Apple 权威目录（albumAuth）—— 最强，它直接说「这歌/这专辑是谁的」
+       ② artistConsensus 的共识歌手 —— 兜底
+     ⚠️ 两处都拿不到正主时**整段跳过**：搜「晴天」这种同名歌一堆的查询，
+        搞不好「正主」本身就错，宁可保持原顺序也别乱动。 */
+  const _owner = (albumAuth && albumAuth.artist ? singerNorm(albumAuth.artist) : "")
+    || (function () {
+      const c = artistConsensus(out, eq);
+      return c && c.top ? c.top : "";
+    })();
+  if (_owner) {
+    const qz2 = normTextZ(eq);
+    const same = [];
+    const rest2 = [];
+    for (let i = 0; i < data.length; i++) {
+      const x = data[i];
+      const xa = singerNorm(x.artist || "");
+      const xz = normTextZ(x.title || "");
+      /* 「同名」只认**名字完全一致**（归一化后）：
+         翻唱合集通常就叫《叶惠美》，跟正版一模一样。
+         ⚠️ 别放宽到 indexOf —— 那样《天青色心湖》《橘子画卷》（歌手恰好叫叶惠美）
+            也会被当成同名翻唱拉下去，可它们压根不是这张专辑。 */
+      /* 除了名字完全一致，还认「名字里含查询词 + 带翻唱字样」的那种：
+         实测《周杰伦<叶惠美>吉他翻唱版》就是这么写的，名字不相等，
+         但它在用户眼里就是同一张专辑的翻唱版，一样该往后排。 */
+      const isSameNamed = xz === qz2 ||
+        (qz2.length >= 2 && xz.indexOf(qz2) >= 0 && /翻唱|cover|伴奏|纯音乐|純音樂|吉他|钢琴|鋼琴|remix|dj/i.test(String(x.title || "")));
+      const isOwner = !!xa && (xa === _owner || xa.indexOf(_owner) >= 0);
+      if (isSameNamed && !isOwner) same.push(x);
+      else rest2.push(x);
+    }
+    if (same.length && rest2.length) {
+      data = rest2.concat(same);
+      console.log("[粽子] 同名翻唱沉底 " + same.length + " 条（正主：" + _owner + "）");
+    }
+  }
+
   /* 合并放在**排序之后**（理由见 dedupeAlbumList 的注释：放前面会削掉共识票数） */
   data = dedupeAlbumList(data);
   return { isEnd: out.length < KUWO_PAGE_SIZE, data: data };
@@ -5269,11 +5402,18 @@ async function searchArtist(query, page) {
     miguSearchTyped(query, "singer", page, 10).catch(() => ({ total: 0, list: [] })),
     // 冷门独立乐团在酷我/咪咕根本没有条目，只有 YouTube 的官方 Topic 频道路过
     page === 1 ? ytSearchRaw(query).catch(() => []) : Promise.resolve([]),
+    /* 网易云 / 酷狗 / QQ 三路补进来（2026-10-20）。
+       原来只有酷我+咪咕，搜「周杰伦」只回一条、搜「五月天」还冒出山寨号。
+       ⚠️ 三路都带超时：QQ 实测 1.4~1.5 秒，跟酷我同批并发不会拖慢整次搜索
+          （它本来就是最慢那个）；网易云 130~250ms、酷狗 ~300ms。 */
+    neteaseSearchArtist(query, page, 10).catch(() => []),
+    kugouSearchSinger(query, page, 10).catch(() => []),
+    qqSearchArtist(query, page, 10).catch(() => []),
   ]);
 
   const pick = await pickEffectiveName(query, aliasP).catch(() => ({ name: query, via: "", names: [query] }));
   const eq = pick.name;
-  let [kw, mg, yt] = await baseP;
+  let [kw, mg, yt, ne, kgs, qqs] = await baseP;
 
   /* 什么时候要拿原名重搜：
      - QQ 明确声明过（authoritative）：一定换 —— 译名条目在原查询下
@@ -5289,14 +5429,17 @@ async function searchArtist(query, page) {
      酷我/咪咕是真正的歌手库，它们空 = 平台不认这个名字。 */
   const isEmpty = !kw.list.length && !mg.list.length;
   if (eq !== query && (isAuth || isEmpty)) {
-    const [kw2, mg2, yt2] = await Promise.all([
+    const [kw2, mg2, yt2, ne2, kgs2, qqs2] = await Promise.all([
       kuwoSearchTyped(eq, "artist", page, KUWO_PAGE_SIZE).catch(() => ({ total: 0, list: [] })),
       miguSearchTyped(eq, "singer", page, 10).catch(() => ({ total: 0, list: [] })),
       page === 1 ? ytSearchRaw(eq).catch(() => []) : Promise.resolve([]),
+      neteaseSearchArtist(eq, page, 10).catch(() => []),
+      kugouSearchSinger(eq, page, 10).catch(() => []),
+      qqSearchArtist(eq, page, 10).catch(() => []),
     ]);
     console.log("[粽子] 歌手「" + query + "」" + (isAuth ? "有权威原名" : "原查询无结果")
       + " → 改用「" + eq + "」重搜");
-    kw = kw2; mg = mg2; yt = yt2;
+    kw = kw2; mg = mg2; yt = yt2; ne = ne2; kgs = kgs2; qqs = qqs2;
   }
 
   /* 过滤用的名字集合：原名 + 原查询 + 其余别名。
@@ -5373,6 +5516,80 @@ async function searchArtist(query, page) {
       _provider: "miguapi",
     });
   }
+
+  /* ---- 网易云 / 酷狗 / QQ 三路（2026-10-20 补）----
+     跟酷我/咪咕走同一道闸：名字必须对上，否则这三家会捎回来一堆
+     「相关歌手」和蹭词山寨号（实测搜「周杰伦」，QQ 顺带回了
+     Lara梁心颐、张惠妹；酷狗回了 8 个「周杰伦战队」式的号）。
+
+     ⚠️ 作品数这里有坑：
+       网易云 musicSize 是"参与过的曲目总数"（周杰伦 581），
+       酷我 SONGNUM 是 1708 —— 两家口径不同，但都比 0 靠谱，
+       所以直接采信，只做「比已有值大就更新」而不覆盖。
+       QQ 的 songNum 口径跟酷我接近，同样处理。 */
+
+  for (let i = 0; i < (ne || []).length; i++) {
+    const a = ne[i];
+    /* ⚠️ 名字闸只能挡「非拉丁前缀」那种（东北周杰伦），挡不住
+       「周杰伦.」「周杰伦♚」—— 它们归一化后以查询词结尾，前缀是标点。
+       这类的共同特征是**几乎没作品**（网易云实测各 1~20 首，本尊 581 首）。
+       所以再加一道：名字不完全等于查询词的，作品数得够看。 */
+    if (singerNorm(a.name) !== singerNorm(String(query).trim()) &&
+        !nameSet.some((n) => singerNorm(n) === singerNorm(a.name)) &&
+        Number(a.worksNum || 0) < 50) continue;
+    if (!a.id || seen["ne:" + a.id]) continue;
+    if (!artistNameOk(a.name, nameSet, query)) continue;
+    // 精确匹配才留全名，别名命中只是「可能」，压到后面由排序器决定
+    seen["ne:" + a.id] = 1;
+    out.push({
+      id: "neart:" + a.id,
+      platform: "网易云",
+      name: a.name,
+      avatar: a.avatar,
+      worksNum: a.worksNum,
+      albumNum: a.albumNum,
+      fans: 0,
+      description: "",
+      _provider: "netease",
+    });
+  }
+
+  for (let i = 0; i < (kgs || []).length; i++) {
+    const a = kgs[i];
+    if (!a.id || seen["kg:" + a.id]) continue;
+    if (!artistNameOk(a.name, nameSet, query)) continue;
+    seen["kg:" + a.id] = 1;
+    out.push({
+      id: "kgs:" + a.id,
+      platform: "酷狗",
+      name: a.name,
+      avatar: a.avatar,
+      worksNum: 0,
+      albumNum: 0,
+      fans: 0,
+      description: "",
+      _provider: "kugou",
+    });
+  }
+
+  for (let i = 0; i < (qqs || []).length; i++) {
+    const a = qqs[i];
+    if (!a.id || seen["qq:" + a.id]) continue;
+    if (!artistNameOk(a.name, nameSet, query)) continue;
+    seen["qq:" + a.id] = 1;
+    out.push({
+      id: "qqa:" + a.mid,          // 取流一路都用 mid，不用数字 id
+      platform: "QQ音乐",
+      name: a.name,
+      avatar: a.avatar,
+      worksNum: a.worksNum,
+      albumNum: a.albumNum,
+      fans: 0,
+      description: "",
+      _provider: "qq",
+    });
+  }
+
 
   /* YouTube 兜底：冷门独立乐团在酷我/咪咕整个库里没有条目 ——
      搜「IGU Band」酷我回 0 条、咪咕回一堆同名无关的乐队。
@@ -5525,11 +5742,27 @@ function dedupeArtists(list) {
     if (!k) continue;
     const prev = byName[k];
     if (!prev) {
+      /* ⚠️ 合并会丢掉别的源的 id —— 而每个源的作品是分开拉的
+         （酷我 id / neart:<id> / kgs:<id> / qqa:<mid>）。
+         这里把所有来源登记到 _alts 上，歌手页会挨个去取、合并去重，
+         这样搜「周杰伦」点进去既有酷我的 1708 首，也有网易云/QQ 那边
+         酷我缺的曲目（版权分流，各家都不全）。 */
+      a._alts = [{ id: a.id, platform: a.platform, provider: a._provider }];
       byName[k] = a;
       order.push(k);
       continue;
     }
-    if (score(a) > score(prev)) byName[k] = a;
+    if (!prev._alts) prev._alts = [{ id: prev.id, platform: prev.platform, provider: prev._provider }];
+    let dup = false;
+    for (let j = 0; j < prev._alts.length; j++) if (prev._alts[j].id === a.id) { dup = true; break; }
+    if (!dup) prev._alts.push({ id: a.id, platform: a.platform, provider: a._provider });
+    if (score(a) > score(prev)) {
+      // 换主条目，但 _alts 要带走
+      a._alts = prev._alts;
+      for (let j = 0; j < a._alts.length; j++) if (a._alts[j].id === a.id) { a._alts.splice(j, 1); break; }
+      a._alts.unshift({ id: a.id, platform: a.platform, provider: a._provider });
+      byName[k] = a;
+    }
   }
   return order.map((k) => byName[k]);
 }
@@ -5648,6 +5881,165 @@ async function neteaseSearchSheet(query, page, size) {
       _official: /官方|云音乐|精选|网易/i.test((p.creator && p.creator.nickname) || "") ? 1 : 0,
     })).filter((x) => x.id && x.title);
   } catch (e) { return []; }
+}
+
+/* ============================================================
+ * 歌手搜索 —— 补齐网易云 / 酷狗 / QQ 三路
+ *
+ * 为什么补（2026-10-20）：原来只接了酷我 / 咪咕 / YouTube，
+ *   搜「周杰伦」只回一条，搜「五月天」冒出来的还是「五月天饭团」这种山寨号。
+ *   三家真歌手库缺两块：港台／独立音乐（网易云强）和
+ *   冷门但有正规发行的（酷狗／QQ 强）。
+ *
+ * ⚠️ 三家的「歌手搜索」都会带回**相关歌手**（风格相近推荐）和
+ *    蹭词的山寨号。实测搜「周杰伦」：
+ *      网易云 → 周杰伦 / 周杰伦. / Jay / 周杰伦♚ / 周杰伦jay / 东北周杰伦 …
+ *      酷狗   → 周杰伦 / 十分想见周杰伦 / 情敌周杰伦 / 周杰伦战队 …
+ *      QQ     → 周杰伦 / Lara梁心颐 / 张惠妹 …（后两条纯推荐）
+ *    所以三路都必须过同一道名字闸，判据跟酷我一致：
+ *      A. 归一化后**完全等于**查询词（含繁简/别名）
+ *      B. 以查询词**结尾**，且前面那段不含中文
+ *         （「Jay Chou 周杰伦」可以，「东北周杰伦」「周杰伦战队」不行）
+ * ============================================================ */
+
+/** 名字是不是「这个人」。三家歌手库共用的那道闸。 */
+function artistNameOk(name, nameSet, query) {
+  const nn = singerNorm(name);
+  if (!nn) return false;
+  for (let i = 0; i < nameSet.length; i++) {
+    const qn = singerNorm(nameSet[i]);
+    if (!qn) continue;
+    if (nn === qn) return true;
+    if (nn.length > qn.length && nn.slice(nn.length - qn.length) === qn) {
+      const prefix = nn.slice(0, nn.length - qn.length);
+      // 前缀必须是拉丁字母/数字/标点，「东北周杰伦」这种中文前缀一律不要
+      if (prefix && !/[一-鿿]/.test(prefix)) return true;
+    }
+  }
+  return false;
+}
+
+/** 网易云歌手搜索。实测 130~250ms，是三家最快的。 */
+async function neteaseSearchArtist(query, page, size) {
+  try {
+    const r = await axios_1.get(NETEASE_SEARCH_WEB, {
+      params: {
+        s: query, type: 100,
+        offset: ((page || 1) - 1) * (size || 10),
+        limit: size || 10,
+      },
+      timeout: 8000,
+      headers: NETEASE_HEADERS,
+      validateStatus: () => true,
+    });
+    const ar = (r.data && r.data.result && r.data.result.artists) || [];
+    return ar.map((a) => ({
+      id: String(a.id || ""),
+      name: String(a.name || ""),
+      // 网易云的 alias 是「周董」「Jay Chou」这类，过滤时要一起认
+      alias: Array.isArray(a.alias) ? a.alias : [],
+      avatar: a.picUrl || a.img1v1Url || "",
+      worksNum: Number(a.musicSize || 0),
+      albumNum: Number(a.albumSize || 0),
+    })).filter((x) => x.id && x.name);
+  } catch (e) { return []; }
+}
+
+/** 酷狗歌手搜索。返回只有 singername / singerid，作品数要另查。 */
+async function kugouSearchSinger(query, page, size) {
+  try {
+    const r = await axios_1.get(KUGOU_SINGER_SEARCH, {
+      params: { format: "json", keyword: String(query || "").trim(), page: page || 1, pagesize: size || 10 },
+      timeout: 8000,
+      headers: { "User-Agent": KUGOU_UA_M },
+      validateStatus: () => true,
+    });
+    const arr = (r.data && (r.data.data || r.data.info)) || [];
+    return arr.map((a) => ({
+      id: String(a.singerid || ""),
+      name: String(a.singername || ""),
+      avatar: kugouImg(a.imgurl || "", 240),
+      worksNum: 0,
+    })).filter((x) => x.id && x.name);
+  } catch (e) { return []; }
+}
+
+/** QQ 音乐歌手搜索。带 songNum / albumNum，字段最全，但实测 1.4~1.5 秒。 */
+async function qqSearchArtist(query, page, size) {
+  if ((page || 1) > 1) return [];
+  try {
+    const r = await axios_1.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp", {
+      params: { w: query, t: 9, p: 1, n: size || 10, format: "json" },
+      timeout: 4000,
+      headers: { "User-Agent": UA, Referer: "https://y.qq.com/" },
+      validateStatus: () => true,
+    });
+    const sl = (r.data && r.data.data && r.data.data.singer && r.data.data.singer.list) || [];
+    return sl.map((a) => ({
+      id: String(a.singerID || ""),
+      mid: String(a.singerMID || ""),
+      name: String(a.singerName || ""),
+      avatar: a.singerPic || "",
+      worksNum: Number(a.songNum || 0),
+      albumNum: Number(a.albumNum || 0),
+    })).filter((x) => x.id && x.name);
+  } catch (e) { return []; }
+}
+
+/** 网易云歌手作品（歌曲 / 专辑）。
+ *  歌手条目 id 形如 neart:6452。两个接口实测 135ms / 229ms。 */
+async function neteaseArtistWorks(artistId, page, type, rn) {
+  const ps = rn || 30;
+  const pg = page || 1;
+  if (type === "album") {
+    const r = await axios_1.get("https://music.163.com/api/artist/albums/" + encodeURIComponent(artistId), {
+      params: { limit: ps, offset: (pg - 1) * ps },
+      timeout: 12000,
+      headers: NETEASE_HEADERS,
+      validateStatus: () => true,
+    });
+    const d = r.data || {};
+    const list = d.hotAlbums || [];
+    return {
+      isEnd: !d.more || !list.length,
+      data: list.map((a) => ({
+        id: String(a.id || ""),
+        platform: "网易云",
+        title: a.name || "",
+        artist: (a.artist && a.artist.name) || "",
+        artwork: a.picUrl || "",
+        date: a.publishTime ? new Date(Number(a.publishTime)).toISOString().slice(0, 10) : "",
+        description: "",
+        worksNum: Number(a.size || 0),
+        _provider: "netease",
+      })).filter((x) => x.id && x.title),
+    };
+  }
+  /* ⚠️ /api/artist/songs 是**被砍过的**（返回 200 但 songs 为空），
+     真正的接口是 /api/v1/artist/songs，字段名也不一样：
+     artists / album / duration（音频原字段），不是 ar / al / dt。 */
+  const r = await axios_1.get("https://music.163.com/api/v1/artist/songs", {
+    params: { id: artistId, limit: ps, offset: (pg - 1) * ps, order: "hot" },
+    timeout: 12000,
+    headers: NETEASE_HEADERS,
+    validateStatus: () => true,
+  });
+  const d = r.data || {};
+  const songs = d.songs || [];
+  const total = Number(d.total || 0);
+  return {
+    isEnd: !songs.length || pg * ps >= total,
+    data: songs.map((t) => ({
+      id: String(t.id || ""),
+      platform: "网易云",
+      title: t.name || "",
+      artist: ((t.artists || []).map((a) => a.name).join("/")) || "",
+      album: (t.album && t.album.name) || "",
+      artwork: (t.album && t.album.picUrl) || "",
+      duration: Number(t.duration || 0),
+      _provider: "netease",
+    })).filter((x) => x.id && x.title),
+  };
 }
 
 /* 主题歌单的关键词：车载 / DJ / 助眠 / 纯音乐…… 这类标题说明歌单是按
@@ -6401,13 +6793,13 @@ const DZ_COVER_CACHE = {};
 /* 自绘封面（D:\workspace\zongzi-musicfree-plugin/covers）：
    白发红瞳 Q 版小女孩 + 墨绿连衣裙 + 拼图波形 + 「拼好歌」手写标题，
    一条 1080×1080 方图。走 jsDelivr，国内比 raw 快且能缓存。
-   没画的分类继续用 Deezer 的图兜底，不会出现空封面。 */
+   现在每个分类都有自绘图；万一表里漏了某个新分类，才回落到 Deezer。 */
 const COVER_CDN = "https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/covers/";
 const MIX_COVERS = {
-  /* 只有 11 张自绘图，但网易目录有 70 个分类，加上 QQ 独有的那几个。
-     所以不追求「一类一图」，而是按耳感和气质贴到最接近的那一张上 ——
-     有图总比现搜强：Deezer 在国内经常连不通，一旦卡住就是 4 秒起步的空窗。
-     等出图额度恢复，缺的那几张再单独补，补完只要改这里一行。 */
+  /* 18 张自绘图，够铺满网易那 70 个分类加上 QQ 独有的那几个。
+     一个分类一张，贴身就贴；剩下的不再现搜 Deezer。
+     Deezer 在国内经常连不通，一旦卡住就是 4 秒起步的空窗，所以能自绘就不碰它。
+     */
   "全部": ["rnb.jpg"],
   "热门": ["rnb.jpg"],
 
@@ -6420,6 +6812,7 @@ const MIX_COVERS = {
   "榜单": ["huayu.jpg"],
   "翻唱": ["huayu.jpg"],
   "网络歌曲": ["huayu.jpg"],
+  "UP主": ["huayu.jpg"],
   "综艺": ["huayu.jpg"],
   "90后": ["huayu.jpg"],
   "快乐": ["huayu.jpg"],
@@ -6471,17 +6864,19 @@ const MIX_COVERS = {
   "伤感": ["night.jpg"],
   "午休": ["night.jpg"],
 
+  /* 民谣那张：木箱鼓、木吉他、麦穗与落叶，乡野黄昏 */
+  "民谣": ["folk.jpg"],
+  "乡村": ["folk.jpg"],
+  "散步": ["folk.jpg"],
+
   /* 治愈那张：抱猫、落叶、暖米色，不设防的一单 */
   "治愈": ["healing.jpg"],
   "放松": ["healing.jpg"],
   "清新": ["healing.jpg"],
-  "民谣": ["healing.jpg"],
   "清晨": ["healing.jpg"],
   "校园": ["healing.jpg"],
   "儿童": ["healing.jpg"],
-  "散步": ["healing.jpg"],
   "旅行": ["healing.jpg"],
-  "乡村": ["healing.jpg"],
   "New Age": ["healing.jpg"],
   "婚礼": ["healing.jpg"],
 
@@ -6494,12 +6889,26 @@ const MIX_COVERS = {
   "工作": ["piano.jpg"],
   "影视原声": ["piano.jpg"],
   "感动": ["piano.jpg"],
+  "背景音乐": ["bgm.jpg"],
+
+  /* 派对那张：彩带、气球、迪斯科球 */
+  "派对": ["party.jpg"],
+
+  /* 约会那张：烛光、玫瑰、晚霞窗边 */
+  "约会": ["date.jpg"],
+
+  /* 咖啡馆那张：拉花、速写本、街景窗 */
+  "咖啡馆": ["cafe.jpg"],
+
+  /* 佛教音乐那张：莲花、远山、一炷香 */
+  "佛教音乐": ["zen.jpg"],
 
   /* 说唱那张：砖墙涂鸦、喷漆罐 */
   "说唱": ["rap.jpg"],
   "MC喊麦": ["rap.jpg"],
 
   /* R&B 那张：黄昏城市、黑胶唱机，转音和鼓机 */
+  "城市": ["city.jpg"],
   "R&B/Soul": ["rnb.jpg"],
   "欧美": ["rnb.jpg"],
   "韩语": ["rnb.jpg"],
@@ -8291,6 +8700,90 @@ async function getAlbumDetail(albumItem, page) {
      找到了就能听，找不到至少知道这张专辑有哪几首。 */
   /* Apple 榜单里的专辑（apalbum:<区>:<专辑id>）：曲目直接读专辑页，
      因为 itunes lookup 对一部分专辑返回 0 首（实测《太阳之子》五个区全空）。 */
+  /* QQ 专辑（qqal:<albumMid>）—— 曲目用 fcg_v8_album_info_cp，
+     实测一次就回整张（《叶惠美》11 首，含 interval），不用翻页。 */
+  if (String(id).indexOf("qqal:") === 0) {
+    const mid = String(id).slice(5);
+    if (!mid) return null;
+    try {
+      const r = await axios_1.get("https://c.y.qq.com/v8/fcg-bin/fcg_v8_album_info_cp.fcg", {
+        params: { albummid: mid, format: "json", g_tk: 1, platform: "yqq.json", needNewCode: 0 },
+        timeout: 15000,
+        headers: { "User-Agent": UA, Referer: "https://y.qq.com/" },
+        validateStatus: () => true,
+      });
+      const d = (r.data && r.data.data) || {};
+      const list = d.list || [];
+      if (!list.length) return null;
+      const musicList = list.map((x) => ({
+        id: String(x.songmid || ""),
+        platform: "QQ音乐",
+        title: x.songname || "",
+        artist: ((x.singer || []).map((s) => s.name).join("/")) || d.singername || "",
+        album: x.albumname || d.name || "",
+        artwork: x.albummid ? "https://y.gtimg.cn/music/photo_new/T002R300x300M000" + x.albummid + ".jpg" : "",
+        duration: Number(x.interval || 0) * 1000,
+        _provider: "qq",
+      })).filter((x) => x.id && x.title);
+      return {
+        isEnd: true,
+        albumItem: {
+          id: String(id),
+          platform: "QQ音乐",
+          title: d.name || albumItem.title || "",
+          artist: d.singername || albumItem.artist || "",
+          artwork: musicList[0] && musicList[0].artwork || albumItem.artwork || "",
+          date: String(d.aDate || "").slice(0, 10) || albumItem.date || "",
+          description: String(d.desc || ""),
+          worksNum: musicList.length,
+        },
+        musicList: musicList,
+      };
+    } catch (e) { return null; }
+  }
+
+
+  /* 网易云专辑（id 是纯数字）。⚠️ 用 /api/v1/album/，
+     老的 /api/album/ 返回 200 但 album 是 undefined（实测 2026-10-20）。 */
+  if (albumItem._provider === "netease" && /^d+$/.test(String(id))) {
+    try {
+      const r = await axios_1.get("https://music.163.com/api/v1/album/" + encodeURIComponent(String(id)), {
+        timeout: 15000,
+        headers: NETEASE_HEADERS,
+        validateStatus: () => true,
+      });
+      const d = r.data || {};
+      const al = d.album || {};
+      const songs = d.songs || [];
+      if (!songs.length) return null;
+      const musicList = songs.map((t) => ({
+        id: String(t.id || ""),
+        platform: "网易云",
+        title: t.name || "",
+        artist: ((t.ar || t.artists || []).map((a) => a.name).join("/")) || "",
+        album: (t.al && t.al.name) || al.name || "",
+        artwork: (t.al && t.al.picUrl) || al.picUrl || "",
+        duration: Number(t.dt || t.duration || 0),
+        _provider: "netease",
+      })).filter((x) => x.id && x.title);
+      return {
+        isEnd: true,
+        albumItem: {
+          id: String(id),
+          platform: "网易云",
+          title: al.name || albumItem.title || "",
+          artist: ((al.artists || []).map((a) => a.name).join("/")) || albumItem.artist || "",
+          artwork: al.picUrl || albumItem.artwork || "",
+          date: al.publishTime ? new Date(Number(al.publishTime)).toISOString().slice(0, 10) : (albumItem.date || ""),
+          description: al.description || "",
+          worksNum: musicList.length,
+        },
+        musicList: musicList,
+      };
+    } catch (e) { /* 失败就往下走，交给通用兜底 */ }
+  }
+
+
   if (String(id).indexOf("apalbum:") === 0) {
     const parts = String(id).split(":");
     const cc = parts[1] || "cn";
@@ -8567,8 +9060,62 @@ async function kuwoSheetsByAlbum(albumId) {
 async function getArtistWorksOf(artistItem, page, type) {
   const id = artistItem && artistItem.id;
   if (!id) return { isEnd: true, data: [] };
+
+
   const pn = (page || 1) - 1;
   const rn = 30;
+  /* ---- 多源合并：同名歌手在酷我 / 网易云 / 酷狗 / QQ 上的 id 完全不同，
+     各家曲库有版权分流，谁也不全。dedupeArtists 把每条来源登记进 _alts，
+     这里挨个去取、按「歌名 + 歌手」去重合并 —— 这样点进「周杰伦」
+     既有酷我的 1708 首里能播的，也有网易云/QQ 独家收录的。
+     ⚠️ 只在第 1 页做全量合并：后面几页各自翻各自的，合并会把页码算乱。 */
+  if (artistItem._alts && artistItem._alts.length > 1) {
+    const alts = artistItem._alts;
+    let merged = [];
+    if (type === "album") {
+      const parts = await Promise.all(alts.map((alt) => {
+        const sub = Object.assign({}, artistItem, { id: alt.id, platform: alt.platform, _provider: alt.provider, _alts: null });
+        if (sub.id === artistItem.id) return getArtistWorksOf(sub, 1, "album").catch(() => ({ data: [] }));
+        return getArtistWorksOf(sub, 1, "album").catch(() => ({ data: [] }));
+      }));
+      const seenA = {};
+      for (let i = 0; i < parts.length; i++) {
+        const arr = (parts[i] && parts[i].data) || [];
+        for (let j = 0; j < arr.length; j++) {
+          const x = arr[j];
+          const k = normAlbumName(x.title || "") + "|" + singerNorm(x.artist || "");
+          if (!x.title || seenA[k]) continue;
+          seenA[k] = 1;
+          merged.push(x);
+        }
+      }
+      // 曲目多的优先（正版专辑），其余保持来源顺序
+      merged.sort((a, b) => Number(b.worksNum || 0) - Number(a.worksNum || 0));
+      const beginA = ((page || 1) - 1) * rn;
+      return { isEnd: beginA + rn >= merged.length, data: merged.slice(beginA, beginA + rn) };
+    }
+    const parts = await Promise.all(alts.map((alt) => {
+      const sub = Object.assign({}, artistItem, { id: alt.id, platform: alt.platform, _provider: alt.provider, _alts: null });
+      return getArtistWorksOf(sub, 1, "music").catch(() => ({ data: [] }));
+    }));
+    const seenT = {};
+    for (let i = 0; i < parts.length; i++) {
+      const arr = (parts[i] && parts[i].data) || [];
+      for (let j = 0; j < arr.length; j++) {
+        const x = arr[j];
+        if (!x.title) continue;
+        /* 同一首在不同平台都有一份 —— 保留先出现的那个（酷我在前，
+           它取流成功率最高），后面同名同歌手的直接丢，免得列表里
+           出现五条《晴天》只有音源标签不同。 */
+        const k = normTextZ(x.title) + "|" + singerNorm(String(x.artist || "").split("/")[0]);
+        if (seenT[k]) continue;
+        seenT[k] = 1;
+        merged.push(x);
+      }
+    }
+    const begin = ((page || 1) - 1) * rn;
+    return { isEnd: begin + rn >= merged.length, data: merged.slice(begin, begin + rn) };
+  }
 
   /* Apple 目录歌手条目（id 形如 apart:1223943074）—— 平台全都没有这个人，
      只有 Apple 有。专辑和曲目都走 appleArtistWorks（带 1 小时缓存）。 */
@@ -8582,6 +9129,47 @@ async function getArtistWorksOf(artistItem, page, type) {
   /* YouTube 歌手条目（id 形如 ytch:IGU Band）—— 这类是酷我/咪咕都查不到、
      只能靠 Topic 频道兜底的冷门艺人。作品直接按「频道名」在 YouTube 搜，
      只收该频道的曲目。 */
+  /* 网易云歌手条目（neart:<artistId>）→ 走 /api/v1/artist/songs 和
+     /api/artist/albums，实测 135ms / 229ms。 */
+  if (String(id).indexOf("neart:") === 0) {
+    const artistId = String(id).slice(6);
+    if (!artistId) return { isEnd: true, data: [] };
+    try {
+      return await neteaseArtistWorks(artistId, page, type === "album" ? "album" : "music", rn);
+    } catch (e) { return { isEnd: true, data: [] }; }
+  }
+
+  /* 酷狗歌手条目（kgs:<singerId>）→ 直接按 singerid 查，不用再拿名字猜。 */
+  if (String(id).indexOf("kgs:") === 0) {
+    const sid = String(id).slice(4);
+    if (!sid) return { isEnd: true, data: [] };
+    try {
+      const r = await kugouArtistWorks(sid, page, type === "album" ? "album" : "music", rn);
+      if (r.data.length) return r;
+    } catch (e) { /* 落到下面的通用链路 */ }
+  }
+
+  /* QQ 歌手条目（qqa:<singerMid>）。
+     ⚠️ QQ 的歌手作品接口（musicu 的 GetSingerSongList / GetSingerAlbum）
+        2026-10-20 实测全部返回 code 500003（接口已死），singer_track_cp 也 404。
+        所以这里退回「按歌手名搜歌」，再按歌手字段过滤 ——
+        实测搜「周杰伦」前 30 条全是他的（晴天/发如雪/搁浅/一路向北/枫…），
+        足够当歌手页的第一页。专辑那一路退回按名字搜专辑再过滤。 */
+  if (String(id).indexOf("qqa:") === 0) {
+    const nm = String(artistItem.name || "");
+    if (!nm) return { isEnd: true, data: [] };
+    const wantN = singerNorm(nm);
+    try {
+      if (type === "album") {
+        const al = await qqSearchAlbumByName(nm, page);
+        return { isEnd: al.length < rn, data: al };
+      }
+      const songs = await qqSearchSongsByArtist(nm, page, rn);
+      return { isEnd: songs.length < rn, data: songs };
+    } catch (e) { return { isEnd: true, data: [] }; }
+  }
+
+
   if (String(id).indexOf("ytch:") === 0) {
     if (page !== 1) return { isEnd: true, data: [] };
     const chName = String(artistItem.name || "");
@@ -11000,7 +11588,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.6",
+  version: "4.10.7",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
