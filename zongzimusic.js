@@ -1231,6 +1231,35 @@ function normTextZ(s) {
   return normText(toSimplified(String(s || "")));
 }
 
+/** 两个标题的相似度 0~1（逐字编辑距离）。
+ *
+ *  ⚠️ 为什么需要它：iTunes 繁体库里同一个歌名会换字 ——
+ *     「印第安老斑鸠」在 Apple 里写作「印地安老斑鳩」（第/地、鸠/鳩），
+ *     严格相等或 indexOf 全都对不上，于是被当成「查无此歌」，
+ *     权威目录这一层就白跑了。归一化只处理繁简，处理不了这种用字差异。
+ */
+function titleSimZ(a, b) {
+  const clean = (x) => normTextZ(x).replace(/[^0-9a-z一-鿿]/g, "");
+  const x = clean(a), y = clean(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  if (x.indexOf(y) >= 0 || y.indexOf(x) >= 0) {
+    return Math.min(x.length, y.length) / Math.max(x.length, y.length);
+  }
+  if (x.length * y.length > 400) return 0;
+  const m = x.length, n = y.length;
+  let prev = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (x[i - 1] === y[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return 1 - prev[n] / Math.max(m, n);
+}
+
 /* ------------------------------------------------------------
  * 「多词必须全中」校验。
  *
@@ -2382,6 +2411,9 @@ async function authorityHint(query, topArtist, pre) {
       if (k) candSet[k] = 1;
     }
 
+    /* 歌名比对用模糊相似度（0.72 是实测分界：真同名 ≥0.83，不相干多数 <0.5）。
+       Apple 繁体库里同一个歌名会换字，严格包含对不上就整条丢掉了。 */
+    const SIM_MIN = 0.72;
     let best = null;
     let bestSc = -1;
     for (let i = 0; i < tracks.length; i++) {
@@ -2389,8 +2421,10 @@ async function authorityHint(query, topArtist, pre) {
       const tn = normText(toSimplified(tk.trackName || ""));
       if (!tn) continue;
       let sc = 0;
-      if (tn === probe) sc += 100;
+      const sim = titleSimZ(tk.trackName || "", q);
+      if (tn === probe || sim >= 0.995) sc += 100;
       else if (tn.indexOf(probe) >= 0 || probe.indexOf(tn) >= 0) sc += 40;
+      else if (sim >= SIM_MIN) sc += 30;
       else continue;                       // 歌名不对的不要
       // 排行榜越靠前越像正主（iTunes 自己的相关性排序）
       sc -= i * 2;
@@ -2401,8 +2435,14 @@ async function authorityHint(query, topArtist, pre) {
       if (tka && candSet[tka]) sc += 50;
       // Live / 伴奏 / 翻唱专辑降权，但**不排除** ——
       // 有些歌只在 Live 专辑里存在（用户搜的就是那个版本）
-      if (/live|演唱会|演唱會|remix|dj|伴奏|karaoke/i.test(String(tk.collectionName || ""))) sc -= 60;
-      if (/翻唱|cover/i.test(String(tk.collectionName || ""))) sc -= 60;
+      /* ⚠️ 版本词要连**歌名**一起看，不能只看专辑名：
+         实测搜「印第安老斑鸠」，Apple 首条是《謝謝儂 + 印第安老斑鳩 (Live)》，
+         收录在《中國新歌聲第二季 第1期》—— 专辑名里没有 live，
+         这版综艺合唱拿了最高分，权威目录就指向了合辑。 */
+      const verRaw = String(tk.collectionName || "") + " " + String(tk.trackName || "");
+      if (/live|演唱会|演唱會|remix|伴奏|karaoke/i.test(verRaw)) sc -= 60;
+      if (/翻唱|cover/i.test(verRaw)) sc -= 60;
+      if (/[+＋]/.test(String(tk.trackName || ""))) sc -= 30;
       if (sc > bestSc) { bestSc = sc; best = tk; }
     }
 
@@ -2436,7 +2476,11 @@ function authorityScore(item, auth) {
   const t = normText(toSimplified(item.title || ""));
   const at = normText(toSimplified(auth.title || ""));
   if (!t || !at) return 0;
-  if (t !== at && t.indexOf(at) < 0 && at.indexOf(t) < 0) return 0;  // 不是同一首，不加不扣
+  /* ⚠️ 「是不是同一首」的闸门也得模糊比：
+     Apple 把「印第安老斑鸠」写作「印地安老斑鳩」，严格包含一判就返回 0，
+     整条权威打分全是 0，原唱周杰伦那条（歌手完全一致，本该 +40）
+     就跟翻唱混在一起，谁先返回谁在前。 */
+  if (t !== at && t.indexOf(at) < 0 && at.indexOf(t) < 0 && titleSimZ(item.title, auth.title) < 0.8) return 0;
 
   const albumRaw = String(item.album || "");
   const album = normText(toSimplified(albumRaw));
@@ -4523,30 +4567,50 @@ async function kugouSingerAlbumTotal(singerId) {
  *     不能因为网络抖一下就把正经歌手查询废掉。
  */
 const SONGQ_CACHE = {};
-async function songQueryRatio(query) {
+/** 这个词在 Apple 里长什么样：{ n, title, artist }
+ *
+ *  n      = 返回的曲目条数（太少说明两个比例都没意义）
+ *  title  = 歌名命中率 —— 高 = 这是**歌名**
+ *  artist = 歌手命中率 —— 高 = 这是**歌手名**
+ *
+ *  ⚠️ 两个比例必须一起看：
+ *     歌名查询里歌手字段是各路翻唱者，歌手命中率≈0；
+ *     歌手查询里歌手字段必然反复出现同一个名字，命中率≈1。
+ *     实测（2026-10-20，20 个歌名 artist ≤0.12，11 个歌手 ≥0.84）。
+ *     只看标题命中率会漏：Apple 把「印第安老斑鸠」写作「印地安老斑鳩」，
+ *     严格比对只有 1/9，可它明明是歌名 —— 歌手命中 0.00 一眼就分开了。
+ */
+async function queryShape(query) {
   const q = String(query || "").trim();
-  if (!q) return -1;
+  const none = { n: 0, title: -1, artist: -1 };
+  if (!q) return none;
   const ck = normTextZ(q);
   const hit = SONGQ_CACHE[ck];
   if (hit && Date.now() - hit.at < APPLE_CAT_TTL) return hit.v;
 
-  let ratio = -1;
+  let shape = none;
   try {
     const sres = await itunesSearchAny("/search", { term: q, entity: "song", limit: 25 });
     const res = ((sres && sres.results) || []).filter((x) => x.wrapperType === "track");
-    // 结果太少说明不了问题（搜冷门词可能就回 1~2 条）
-    if (res.length >= 8) {
-      const qn = normTextZ(q);
-      let n = 0;
+    if (res.length) {
+      const qn = ck.replace(/[^0-9a-z一-鿿]/g, "");
+      let t = 0, a = 0;
       for (let i = 0; i < res.length; i++) {
-        if (normTextZ(res[i].trackName || "").indexOf(qn) >= 0) n++;
+        if (titleSimZ(res[i].trackName || "", q) >= 0.8) t++;
+        const art = normTextZ(res[i].artistName || "").replace(/[^0-9a-z一-鿿]/g, "");
+        if (art && qn && (art.indexOf(qn) >= 0 || titleSimZ(art, qn) >= 0.8)) a++;
       }
-      ratio = n / res.length;
+      shape = { n: res.length, title: t / res.length, artist: a / res.length };
     }
-  } catch (e) { ratio = -1; }
+  } catch (e) { shape = none; }
 
-  SONGQ_CACHE[ck] = { at: Date.now(), v: ratio };
-  return ratio;
+  SONGQ_CACHE[ck] = { at: Date.now(), v: shape };
+  return shape;
+}
+
+async function songQueryRatio(query) {
+  const sh = await queryShape(query);
+  return sh.n >= 8 ? sh.title : -1;
 }
 
 /** 这个词更像「一首歌的名字」而不是「一位歌手」。 */
@@ -4614,10 +4678,15 @@ async function detectSingerQuery(query) {
          那是专辑名) 和「七里香」(0.60) 落进中间地带。
          取 0.55 当分界：歌名不会被误判成歌手，歌手也不会被误判成歌名。
          查不到 Apple（0 条）时无从证伪，维持原判。 */
-      const titleRatio = await songQueryRatio(query);
-      if (titleRatio >= 0.55) {
+      /* ⚠️ 判据换成 queryShape 的双比例：
+         实测「印第安老斑鸠」Apple 写作「印地安老斑鳩」，标题严格命中 0.11，
+         旧判据（≥0.55）直接放行 → 认成歌手「印第安老斑鸠」
+         （酷狗真有一个 3 张专辑的同名号），专辑页整个变成他那些
+         《淋湿嘴角》《眉间情意曲》。歌手命中率 0.00 一眼能证伪。 */
+      const shq = await queryShape(query);
+      if (shq.n >= 6 && shq.title >= 0.25 && shq.artist <= 0.35) {
         console.log("[粽子]「" + nm + "」名下 " + total + " 张专辑，但这个词是歌名（标题命中 "
-          + titleRatio.toFixed(2) + "）→ 不按歌手查询处理");
+          + shq.title.toFixed(2) + " / 歌手命中 " + shq.artist.toFixed(2) + "）→ 不按歌手查询处理");
         break;
       }
       result = { id: sid, name: nm, albumTotal: total };
@@ -5136,6 +5205,34 @@ async function searchAlbum(query, page) {
         const fresh = marked.filter((c) => c && !seenId[c.platform + "|" + c.id]);
         if (fresh.length) data = fresh.concat(data);
       } catch (e) { /* 补不进来就算了，不影响主结果 */ }
+    }
+
+    /* ---- 专辑名对不上时的退路：按**权威歌手**排队 ----
+       ⚠️ 实测搜「印第安老斑鸠」，Apple 给的是
+          「印地安老斑鳩 / 周杰倫 / 专辑《杰倫》10 首」——
+          可这张专辑在酷狗/酷我上叫《Jay》，名字怎么比都比不上，
+          于是 29 条里头三位是《印第安老斑鸠》王肖百(8首)、宋辰(1首)、小傲(1首)
+          这些同名翻唱，周杰伦《Jay》被压在 4~8 位。
+
+          这时候专辑名不可靠，但**歌手**可靠：用户搜歌名，
+          最该看到的就是「原唱把这首歌收录在哪张专辑」。
+          所以把权威歌手名下的专辑整体提到前面，
+          组内用酷狗原始顺序（酷狗的专辑搜索本来就是按「这张专辑里有这首歌」
+          排的，《Jay》在第 1 位），曲目数多的优先。 */
+    if (!marked.length && authArtistN) {
+      for (let i = 0; i < data.length; i++) {
+        const x = data[i];
+        const xa = singerNorm(x.artist);
+        if (!xa) continue;
+        if (xa === authArtistN || xa.indexOf(authArtistN) >= 0 || authArtistN.indexOf(xa) >= 0) {
+          x._authAlbum = 2;
+          marked.push(x);
+        }
+      }
+      if (marked.length) {
+        console.log("[粽子] 专辑名对不上（" + albumAuth.album + "）→ 按权威歌手「"
+          + albumAuth.artist + "」提权 " + marked.length + " 张");
+      }
     }
 
     // 提到最前：曲目数多的在前（正版专辑曲目最多，也最能代表这张专辑）
@@ -9481,7 +9578,9 @@ async function searchMusicAll(query, page) {
       if (aliasList.length && titleMatchesAnchors(it.title, matchAnchors, query)) return true;
       /* 0.6) 演唱者字段命中别名也算（YouTube 的 Topic 频道条目、
              B 站投稿标题里只写艺人名的情况） */
-      if (aliasList.length) {
+      /* ⚠️ titleQueryFlag 时不认：蹭歌号的歌手字段写的就是查询词本身，
+         认了的话「爷爷泡的茶」那五条毫不相干的曲子会被判成相关。 */
+      if (aliasList.length && !titleQueryFlag) {
         const an2 = normTextZ(it.artist);
         if (an2) {
           for (let k = 0; k < aliasList.length; k++) {
@@ -10901,7 +11000,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.5",
+  version: "4.10.6",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
