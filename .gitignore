@@ -5,3 +5,5 @@ _*.js
 # 本地备份
 *.bak-*
 node_modules
+_cur.diff
+*.diff
