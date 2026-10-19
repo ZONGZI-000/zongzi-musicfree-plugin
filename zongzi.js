@@ -951,6 +951,37 @@ function detectArtistQuery(query, items) {
   return "";
 }
 
+/** 「这一轮其实是在搜歌名」的否决判据。
+ *
+ *  ⚠️ 踩过的大坑（2026-10-19 实测搜「印第安老斑鸠」）：
+ *     周杰伦那首《印第安老斑鸠》是歌名，但酷我/咪咕上有一批网络歌手
+ *     直接把这个歌名当**艺名**用（artist 字段就写着「印第安老斑鸠」），
+ *     于是 detectArtistQuery 命中 → 整轮按「搜歌手」排序 →
+ *     这批人的《马》《偏爱》《过火》《童年的纸飞机》全拿了 3 档，
+ *     把周杰伦原曲挤到第 8 位之后，用户看到的就是满屏不相干的歌。
+ *
+ *  判据：「标题正好等于查询词、但歌手不是查询词」的条目 ≥3 条，
+ *  说明这串字本身是个歌名，别人在翻唱它，而不是一个歌手名。
+ *  ⚠️ 必须排除「歌手就是查询词」的条目：搜「周杰伦」时那条《周杰伦》
+ *     (标题恰好等于歌手名) 不能算反证，否则真歌手搜索会被自己否决掉。
+ */
+function isTitleQuery(query, items) {
+  const qf = flatTitle(query), qc = coreTitle(query);
+  if (!qf) return false;
+  const list = items || [];
+  let n = 0;
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i];
+    if (isArtistQuery(query, it.artist)) continue;
+    const tf = flatTitle(it.title), tc = coreTitle(it.title);
+    if ((tf && tf === qf) || (tc && tc === qc)) {
+      n++;
+      if (n >= 3) return true;
+    }
+  }
+  return false;
+}
+
 /** 只数命中条数，不做判定。给「要不要去问 Apple」当门槛用 ——
  *  命中 ≥2 说明这串词大概率是个人名，值得花 100ms 查一次权威曲库。 */
 function countArtistHits(query, items) {
@@ -964,7 +995,7 @@ function countArtistHits(query, items) {
   return hit;
 }
 
-function relevanceTier(title, query, artist, artistQuery) {
+function relevanceTier(title, query, artist, artistQuery, titleQuery) {
   const raw = String(title || "").trim();
   const q = String(query || "").trim();
   if (!raw || !q) return 1;
@@ -983,7 +1014,11 @@ function relevanceTier(title, query, artist, artistQuery) {
      歌手的名字出现在 artist 字段里，才是「这是他的歌」的正经证据。
      ⚠️ artistQuery 是整轮判定结果（detectArtistQuery），逐条判断会漏掉
         「artist 是频道名、但确实是八卦视频」那一类。 */
-  const isAQ = artistQuery || isArtistQuery(q, artist);
+  /* ⚠️ titleQuery 为真时（这串字其实是歌名，只是有人拿它当艺名），
+     整条「搜歌手」逻辑都要跳过 —— 否则那个冒名歌手名下的
+     《马》《偏爱》《过火》照样靠 isArtistQuery 拿 3 档，
+     否决整轮判定等于白否决。 */
+  const isAQ = !titleQuery && (artistQuery || isArtistQuery(q, artist));
   if (isAQ) {
     /* 资讯视频直接踢到 0 档 —— 比「变体/伴奏/DJ」还低。
        搜歌手名时，标题里既没有歌名、又满是「热搜/破防/出征」的，
@@ -9362,13 +9397,24 @@ async function searchMusicAll(query, page) {
   }
   /* 整轮先判定「这次搜的是不是一个歌手名」。判定出来的话，
      后面所有单条打分都要换一套逻辑（见 relevanceTier / relevanceExtra）。 */
-  const artistQuery = detectArtistQuery(query, filtered2);
+  /* ⚠️ 再加一道否决：这串字如果同时是「一堆条目都在翻唱的歌名」，
+     那就不能当歌手名处理（原因见 isTitleQuery 的注释）。 */
+  let artistQuery = detectArtistQuery(query, filtered2);
+  /* ⚠️ 这道否决不看 detectArtistQuery 有没有命中 ——
+     实测「印第安老斑鸠」时整轮判定是空（只有 2 条 artist 命中），
+     但逐条的 isArtistQuery 照样把那批冒名歌手顶到 3 档，
+     所以必须单独算一次，同时在 relevanceTier 里也要用它拦一道。 */
+  const titleQueryFlag = isTitleQuery(query, filtered2);
+  if (titleQueryFlag) {
+    console.log("[粽子] 「" + query + "」既是歌名又有人拿它当艺名 → 按歌名搜索");
+    artistQuery = "";
+  }
   /* 判定没成立、但已经有 ≥2 条结果的歌手字段包含整串查询词时，
      说明「这多半是个人名」，只是这次返回的官方曲不够多（YouTube 每次给的
      Topic 条目在 3~7 条之间抖）。这种时候仍然去问一次 Apple 曲库：
      查到了就用目录把冒名的清掉，查不到就算了 —— 判定本身不改，
      仅仅是多给它一次「证明自己」的机会，避免同一个词有时干净有时一锅粥。 */
-  const artistHits = countArtistHits(query, filtered2);
+  const artistHits = titleQueryFlag ? 0 : countArtistHits(query, filtered2);
   const keep = [];
   let droppedNews = 0;
   for (let i = 0; i < filtered2.length; i++) {
@@ -9806,7 +9852,7 @@ async function searchMusicAll(query, page) {
     it._live = isLiveVersion(it.title, albumOf(it));
     const key = normText(it.title) + "|" + normText(splitSingers(it.artist)[0] || "") +
       (it._live ? "|LIVE" : "|STUDIO");
-    it._tier = relevanceTier(it.title, query, it.artist, artistQuery);
+    it._tier = relevanceTier(it.title, query, it.artist, artistQuery, titleQueryFlag);
     /* 专辑名查询命中的曲目（见上面 _albq 那段）提到最高档。
        ⚠️ 变体词（live/remix/翻唱…）不提，否则专辑的翻唱版会跟原曲抢位。 */
     if (it._albq && !VARIANT_RE.test(it.title) && !isCoverTitle(it.title)) it._tier = 3;
