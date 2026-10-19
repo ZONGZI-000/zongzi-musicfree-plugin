@@ -3857,6 +3857,14 @@ async function miguApiSearch(keyword, size) {
     // ⚠️ 咪咕的字段叫 singers，不是 singerList —— 写错的话 artist 会是空字符串，
     //    后果不只是显示难看：去重 key 里的歌手位变空，不同歌手的同名曲会被并成一条。
     artist: (((v.singers || v.singerList || [])[0]) || {}).name || "",
+    /* ⚠️ albums 这个字段一直都在，只是没人接。
+       实测 2026-10-19 搜「叶惠美」：咪咕回的 11 条全是这张专辑里的正经曲目
+       （东风破 / 晴天 / 以父之名…），但 album 被写成空串，
+       于是「这条跟查询有没有关系」只能靠标题判断 ——
+       标题里根本没有「叶惠美」四个字，全部被判成无关（_rel=0）压到最后，
+       前面顶着一堆「叶惠美评周杰伦新歌MV」「周杰伦母亲叶惠美罕露面」的解说视频。
+       接上之后，搜专辑名时这些曲目能凭专辑名对上号。 */
+    album: (((v.albums || [])[0]) || {}).name || "",
     artwork: ((v.imgItems || [])[0] || {}).img || "",
     duration: miguDurationMs(v),
     lyricUrl: v.lyricUrl || "",
@@ -9463,6 +9471,70 @@ async function searchMusicAll(query, page) {
   const relevant = keep;
   if (droppedNews) console.log("[粽子] 过滤非音乐内容 " + droppedNews + " 条");
 
+  /* ============================================================
+   * 搜的是专辑名时，把这张专辑的曲目捞到前面
+   *
+   * 实测（2026-10-19 搜「叶惠美」）：咪咕直出回的 8 首原曲
+   * （以父之名 / 晴天 / 三年二班…）排在 19 位之后，
+   * 前面全是「叶惠美评周杰伦新歌MV」「周杰伦母亲叶惠美罕露面」
+   * 这类解说/资讯视频。原因：曲目标题里不含专辑名，
+   * 被判成「跟查询沾不上边」（tier=1），而视频标题里正好有三个字（tier=2）。
+   *
+   * 判据：结果里至少 3 条的**专辑名**跟查询一模一样。
+   * 满足就认为这是一次「搜专辑」，把这张专辑的**主艺人**的曲目提到 tier3。
+   *
+   * ⚠️ 一定要按主艺人过滤，不能只看专辑名：
+   *    搜「叶惠美」时网易云有一张**同名翻唱专辑**
+   *    （artist=王珏子乔，6 首，专辑名也叫《叶惠美》），
+   *    只看专辑名会把这些翻唱一起顶到最前面。
+   *    主艺人取「这些条目里出现次数最多的歌手」（周杰伦 8 首 vs 王珏子乔 6 首）。
+   * ============================================================ */
+  (function () {
+    const qf = flatTitle(query), qc = coreTitle(query);
+    if (!qf) return;
+    const artCount = {};
+    let albHit = 0;
+    for (let i = 0; i < relevant.length; i++) {
+      const alb = albumOf(relevant[i]);
+      if (!alb) continue;
+      if (flatTitle(alb) !== qf && coreTitle(alb) !== qc) continue;
+      albHit++;
+      const a = normText(splitSingers(relevant[i].artist)[0] || "");
+      if (a) artCount[a] = (artCount[a] || 0) + 1;
+    }
+    if (albHit < 3) return;
+    let topN = "", topC = 0;
+    for (const k in artCount) {
+      if (artCount[k] > topC) { topC = artCount[k]; topN = k; }
+    }
+    if (!topN || topC < 3) return;
+
+    /* ⚠️ 「专辑和同名主打歌」必须先分辨，否则搜《年轮说》这种
+       会把整张专辑的《观众》《与我无关》《单》全顶到前面，
+       用户明明只是想听那一首歌。
+       判据看**主艺人名下**有没有一首歌就叫这个名字：
+         搜「年轮说」→ 杨丞琳的《年轮说》标题正好等于查询词 →
+                        这是主打歌，按搜歌处理，整段跳过
+         搜「叶惠美」→ 周杰伦名下没有叫《叶惠美》的歌 →
+                        这是专辑名，曲目置顶
+       ⚠️ 只看主艺人，不看所有条目：搜「范特西」时网易云有个
+          YoungNine4 的《范特西》，那是别人的同名歌，不能因此否决。 */
+    for (let i = 0; i < relevant.length; i++) {
+      if (normText(splitSingers(relevant[i].artist)[0] || "") !== topN) continue;
+      const tc = coreTitle(relevant[i].title);
+      if (tc && (tc === qc || flatTitle(relevant[i].title) === qf)) return;
+    }
+    let boosted = 0;
+    for (let i = 0; i < relevant.length; i++) {
+      const a = normText(splitSingers(relevant[i].artist)[0] || "");
+      if (a !== topN) continue;
+      relevant[i]._albq = 1;
+      relevant[i]._rel = 1;
+      boosted++;
+    }
+    console.log("[粽子] 识别为专辑名，专辑曲目置顶 " + boosted + " 条");
+  })();
+
   // ---- 热度：同一标题被几个平台收录 ----
   const titleHits = {};
   for (let i = 0; i < relevant.length; i++) {
@@ -9735,6 +9807,9 @@ async function searchMusicAll(query, page) {
     const key = normText(it.title) + "|" + normText(splitSingers(it.artist)[0] || "") +
       (it._live ? "|LIVE" : "|STUDIO");
     it._tier = relevanceTier(it.title, query, it.artist, artistQuery);
+    /* 专辑名查询命中的曲目（见上面 _albq 那段）提到最高档。
+       ⚠️ 变体词（live/remix/翻唱…）不提，否则专辑的翻唱版会跟原曲抢位。 */
+    if (it._albq && !VARIANT_RE.test(it.title) && !isCoverTitle(it.title)) it._tier = 3;
     it._extra = relevanceExtra(it.title, query, it.artist, artistQuery);
     it._bone = officialBone(it.title, it.artist, it.platform, query, artistQuery);
     it._hot = hotScore(it.playCount);
@@ -10780,7 +10855,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.3",
+  version: "4.10.4",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
