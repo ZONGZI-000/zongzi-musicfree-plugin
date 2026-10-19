@@ -1075,14 +1075,47 @@ function officialBone(raw, artist, platform, query, artistQuery) {
   // 内地数字平台上的同名单曲：原唱常常没版权，页面里剩的多是翻唱
   if (platform === "QQ音乐" || platform === "网易云" || platform === "酷狗" || platform === "咪咕") bone += 12;
 
-  // 现场 / 巡演 / 合集
-  if (/演唱会|現場|现场|live\s*(版|in)|巡演|音樂節|音乐节|社慶|社庆|cover/i.test(t)) bone += 20;
+  // 现场 / 巡演 / 合集（统一交给 isLiveVersion，标题+专辑一起看，见函数下方）
+  if (/社慶|社庆|cover|翻唱/i.test(t)) bone += 20;
 
   /* 搜歌手名时，标题里全是「新闻/破亿/笑死/出征」这类资讯词的，
      是视频不是歌。此时没有「歌名」可对齐，只能靠这条把它压下去。 */
   if ((artistQuery || isArtistQuery(q, a)) && NEWS_TITLE_RE.test(t)) bone += 30;
 
+  // Live 版降权（原来只看标题，漏了大量「标题干净、专辑带演唱会」的情况）
+  if (isLiveVersion(raw, albumOf(raw))) bone += 20;
+
   return bone;
+}
+
+/* ============================================================
+ * Live / 现场版的判定
+ *
+ * ⚠️ 必须**标题和专辑一起看**。实测「晴天」的几种 Live 版：
+ *   标题「晴天 (Live)」        → 标题能看出来
+ *   标题「晴天」               → 看不出来，信息全在专辑
+ *      《周杰伦 2004 无与伦比 演唱会 Live》
+ *   标题「晴天 (Live)」        → 专辑也是演唱会
+ * 只查标题的话，第二种完全漏掉。
+ * ============================================================ */
+const LIVE_RE = /(?<![a-z])(live|concert)(?![a-z])|演唱[会會]|現場|现场|巡演|巡迴|巡回|音樂節|音乐节|音悦台|不插电|unplugged|acoustic\s*version|en\s*vivo/i;
+
+/** 从条目里尽量取到专辑名（不同平台字段名不一样） */
+function albumOf(item) {
+  if (!item) return "";
+  return String(
+    (item && item.album) ||
+    (item && item._raw && (item._raw.album || item._raw.ALBUM || item._raw.albumname || item._raw.album_name)) ||
+    ""
+  );
+}
+
+/** 标题或专辑任一命中 Live 特征即认为是现场版 */
+function isLiveVersion(title, album) {
+  const t = String(title || "");
+  const a = String(album || "");
+  if (!t && !a) return false;
+  return LIVE_RE.test(t) || LIVE_RE.test(a);
 }
 
 function relevanceExtra(title, query, artist, artistQuery) {
@@ -1297,9 +1330,13 @@ async function qqArtistProbe(q) {
   const res = { names: [], authoritative: false, exact: false };
   const qn0 = normTextZ(q);
   try {
+    /* ⚠️ 超时必须短。这个接口实测「稳定 5.0~5.2 秒、返回空 names」——
+       对中文查询基本是死的，但每次专辑/歌手搜索都在等它，
+       于是专辑页 1.9s → 6.4s，用户直接感觉「插件变慢了」。
+       1.2 秒拿不到就当没有，Apple 那边 300ms 就能给出结果。 */
     const qq = await axios_1.get("https://c.y.qq.com/soso/fcgi-bin/client_search_cp", {
       params: { w: q, t: 9, p: 1, n: 5, format: "json" },
-      timeout: 8000,
+      timeout: 1200,
       headers: { "User-Agent": UA, Referer: "https://y.qq.com/" },
       validateStatus: () => true,
     });
@@ -1629,8 +1666,17 @@ async function aliasCandidates(query) {
      而歌手页/专辑页是高频操作，用户会直接感觉到「插件变慢了」。 */
   const qqP = qqArtistProbe(q).catch(() => ({ names: [], authoritative: false, exact: false }));
   const appleP = appleArtistAliases(q).catch(() => []);
-  let qq = { names: [], authoritative: false, exact: false };
-  try { qq = await qqP; } catch (e) { /* 空 */ }
+  /* 整体预算 1.5 秒：到点就用手上已有的结果继续，不等 QQ。
+     Apple 通常 300ms 内返回，QQ 实测稳定 5s 且多半返回空 ——
+     专辑页/歌手页原本有 5 秒多都耗在等一个没有结果的请求上。 */
+  const EMPTY_QQ = { names: [], authoritative: false, exact: false };
+  let qq = EMPTY_QQ;
+  try {
+    qq = await Promise.race([
+      qqP,
+      new Promise((r) => setTimeout(() => r(EMPTY_QQ), 1500)),
+    ]);
+  } catch (e) { /* 空 */ }
   const appleNames = (await appleP.catch(() => [])) || [];
   /* QQ 说「查询词就是本名」→ 没有别名可找，直接用原查询。
      再问网易云只会白花 2 秒，还可能被它的推断带偏
@@ -1651,10 +1697,36 @@ async function aliasCandidates(query) {
     for (let i = 0; i < qq.names.length; i++) push(names, qq.names[i]);
     return { q: q, names: names.slice(0, 6), auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: true };
   }
-  // QQ / Apple 都没线索 → 才动用网易云那条慢路径（拿假名/罗马音/译名）
+  /* QQ / Apple 都没线索 → 才动用网易云那条慢路径（拿假名/罗马音/译名）。
+     这条要额外花 2 秒左右，而它只在「查询词本身是个外文歌手/乐队名」时才有价值。
+     实测「范特西」（专辑名）走这条路要白等 2 秒、拿到空结果。
+     所以这里不再无条件走：只有整串可能是人名时才问，否则直接收工。 */
+  if (!looksLikeArtistName(q)) {
+    return { q: q, names: names.slice(0, 6), auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: true };
+  }
   const al = await neteaseArtistAliases(q, qq).catch(() => []);
   for (let i = 0; i < (al || []).length; i++) push(names, al[i]);
   return { q: q, names: names.slice(0, 6), auth: ALIAS_AUTH[normTextZ(q)] || [], cheap: false };
+}
+
+/** 粗略判断「这串像不像歌手/乐队名」。
+ *  目的只是挡掉「拿专辑名去查歌手别名」这种必然落空的慢请求。
+ *
+ *  ⚠️ 第一版按「含 的/有/是 就当歌名」来判，直接误杀两个真乐队：
+ *      「草東沒有派對」「那我懂你意思了」—— 中文乐队名本来就爱用虚词。
+ *     所以这里**不再看虚词**，只看长度和字符构成：
+ *      中文 2~10 字、或外文 1~3 个词，就当可能是人名。
+ *     判宽一点没坏处：最坏是多花 2 秒，判窄了会漏掉真乐队的译名。 */
+function looksLikeArtistName(q) {
+  const s = String(q || "").trim();
+  if (!s || s.length > 20) return false;
+  // 太长的肯定是歌名/专辑名
+  if (/^[\u4e00-\u9fff]{2,10}$/.test(s)) return true;
+  // 外文：1~3 个词
+  if (/^[A-Za-z][A-Za-z0-9 '\-.&]*$/.test(s)) {
+    return s.split(/\s+/).filter(Boolean).length <= 3 && s.length <= 22;
+  }
+  return false;
 }
 
 /** 这条结果的歌手名，是不是「查询词或它的别名」之一。
@@ -8528,6 +8600,11 @@ function compareRank(a, b) {
   if (ra !== rb) return rb - ra;
   // extra 越小越好（多出来的字数少）
   if (a._extra !== b._extra) return (a._extra || 0) - (b._extra || 0);
+  /* 同档同匹配度时，录音室原版排在 Live 版前面。
+     Live 版现在不再被去重吞掉（key 里带了 LIVE 标记），会独立成一条，
+     所以需要在这里明确：原版先出来，现场版跟在后面，用户可以自己选。 */
+  const la = a._live ? 1 : 0, lb = b._live ? 1 : 0;
+  if (la !== lb) return la - lb;
   /* auth 排在 bone 前面。
      因为 bone 只是一些粗糙的启发式（内地平台 +12、Live +20），
      而 auth 是「Apple Music 里这首歌的正式发行版就是这张专辑、这个歌手」——
@@ -9192,11 +9269,23 @@ async function searchMusicAll(query, page) {
   }
 
   // ---- 去重 ----
+  /* ⚠️ 分组 key 必须区分「Live 版」和「录音室原版」。
+     之前 key 只有「标题|歌手」，而 normText 会把括号整个剥掉：
+         晴天            → 晴天
+         晴天 (Live)     → 晴天      ← 括号内容被抹掉
+         晴天（演唱会版）  → 晴天
+     于是「晴天」「晴天 (Live)」和各种演唱会版全被归一成同一个 key，
+     去重后只剩得分最高的那一条 —— Live 版就这么整条消失了。
+     实测「晴天」原本有 5 条不同版本，最后只剩 1 条。
+
+     现在把 isLive 打进 key：原版和现场版各留一条，谁都不吞谁。 */
   const groups = new Map();
   let order = 0;
   for (let i = 0; i < relevant.length; i++) {
     const it = relevant[i];
-    const key = normText(it.title) + "|" + normText(splitSingers(it.artist)[0] || "");
+    it._live = isLiveVersion(it.title, albumOf(it));
+    const key = normText(it.title) + "|" + normText(splitSingers(it.artist)[0] || "") +
+      (it._live ? "|LIVE" : "|STUDIO");
     it._tier = relevanceTier(it.title, query, it.artist, artistQuery);
     it._extra = relevanceExtra(it.title, query, it.artist, artistQuery);
     it._bone = officialBone(it.title, it.artist, it.platform, query, artistQuery);
@@ -9218,6 +9307,9 @@ async function searchMusicAll(query, page) {
       const ra = a._rel || 0, rb = b._rel || 0;
       if (ra !== rb) return rb - ra;
       if (a._extra !== b._extra) return a._extra - b._extra;
+      // 同组内若混进了不同版本（理论上 key 已分开，兜底再比一次）：原版优先
+      const la = a._live ? 1 : 0, lb = b._live ? 1 : 0;
+      if (la !== lb) return la - lb;
       /* Apple 歌手目录：证据最强的一层。
          它直接回答「这首是不是这个人唱片里的歌」——
          同名冒用歌手（artist 字段写着一模一样的名字）在这里被判 -60，
@@ -10201,7 +10293,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.0",
+  version: "4.10.1",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
