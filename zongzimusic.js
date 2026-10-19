@@ -5921,7 +5921,10 @@ function artistNameOk(name, nameSet, query) {
 
 /** 网易云歌手搜索。实测 130~250ms，是三家最快的。 */
 async function neteaseSearchArtist(query, page, size) {
-  try {
+  /* ⚠️ 这个接口偶发限流：返回 200 但 result.artists 是空数组。
+     实测同一个词连跑两次，一次 10 条、一次 0 条 —— 不重试的话
+     用户看到的就是「搜歌手什么都没有」。重试一次，代价 ~150ms。 */
+  const once = async () => {
     const r = await axios_1.get(NETEASE_SEARCH_WEB, {
       params: {
         s: query, type: 100,
@@ -5936,12 +5939,18 @@ async function neteaseSearchArtist(query, page, size) {
     return ar.map((a) => ({
       id: String(a.id || ""),
       name: String(a.name || ""),
-      // 网易云的 alias 是「周董」「Jay Chou」这类，过滤时要一起认
+      // 网易云的 alias 是「周董」「Jay Chou」这类，命中的别名也要能过闸门
       alias: Array.isArray(a.alias) ? a.alias : [],
       avatar: a.picUrl || a.img1v1Url || "",
       worksNum: Number(a.musicSize || 0),
       albumNum: Number(a.albumSize || 0),
     })).filter((x) => x.id && x.name);
+  };
+  try {
+    const first = await once();
+    if (first.length) return first;
+    await new Promise((r) => setTimeout(r, 120));
+    return await once();
   } catch (e) { return []; }
 }
 
@@ -6855,14 +6864,14 @@ const MIX_COVERS = {
   "兴奋": ["rock.jpg"],
   "现场音乐": ["rock.jpg"],
 
-  /* 深夜那张：台灯、星空、暖光，灯关一半的时候 */
-  "夜晚": ["night.jpg"],
-  "深夜": ["night.jpg"],
-  "安静": ["night.jpg"],
-  "孤独": ["night.jpg"],
-  "思念": ["night.jpg"],
-  "伤感": ["night.jpg"],
-  "午休": ["night.jpg"],
+  /* 深夜两张：灯关一半坐着（night）与钻被窝准备睡（night2），三天一换 */
+  "夜晚": ["night.jpg", "night2.jpg"],
+  "深夜": ["night.jpg", "night2.jpg"],
+  "安静": ["night.jpg", "night2.jpg"],
+  "孤独": ["night.jpg", "night2.jpg"],
+  "思念": ["night.jpg", "night2.jpg"],
+  "伤感": ["night.jpg", "night2.jpg"],
+  "午休": ["night.jpg", "night2.jpg"],
 
   /* 民谣那张：木箱鼓、木吉他、麦穗与落叶，乡野黄昏 */
   "民谣": ["folk.jpg"],
@@ -11588,7 +11597,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.7",
+  version: "4.10.8",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
