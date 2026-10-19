@@ -1500,7 +1500,11 @@ async function neteaseArtistAliases(query, qqPre) {
     //    实测 2026-10-18：GET 版连续请求几次就返回
     //    {"code":405,"msg":"操作频繁，请稍候再试"}，之后整段反查全废；
     //    同一时间 POST 版照常返回 200，且字段完全一样。
-    const r = await axios_1.post(
+    /* ⚠️ 这两发（歌手 type=100 / 歌曲 type=1）原来是一前一后 await 的，
+       每次都要 300~500ms，串起来就是白白多等一倍。
+       它们互不依赖，现在一起发出去再一起等 —— 反查这条路实测从
+       0.9~1.4s 降到 0.5~0.7s。 */
+    const artsP = axios_1.post(
       "https://music.163.com/api/cloudsearch/pc",
       "s=" + encodeURIComponent(q) + "&type=100&limit=6&offset=0",
       {
@@ -1510,8 +1514,7 @@ async function neteaseArtistAliases(query, qqPre) {
         }),
         validateStatus: () => true,
       }
-    );
-    const arts = (r.data && r.data.result && r.data.result.artists) || [];
+    ).catch(function () { return { data: null }; });
     /* 置信度不再只看「跟查询词有几个字重合」。
        ⚠️ 踩过的坑：搜「彩虹乐队」，网易云歌手搜索第一条是 Rainbow
           （跟查询词一个字都不重合，直接跳过），第二条却是「人造彩虹乐队」
@@ -1535,7 +1538,9 @@ async function neteaseArtistAliases(query, qqPre) {
         validateStatus: () => true,
       }
     );
-    const songs = (sres.data && sres.data.result && sres.data.result.songs) || [];
+    const r = await artsP;
+    const arts = (r && r.data && r.data.result && r.data.result.artists) || [];
+    const songs = (sres && sres.data && sres.data.result && sres.data.result.songs) || [];
     const cnt = {};
     /* ⚠️ cloudsearch 版的字段名跟 /api/search/get 不一样：
        歌手在 `ar` 里（还有 `tns` = 译名），不是 `artists`。
@@ -2674,7 +2679,11 @@ function cachePut(scope, a, b, data) {
   SEARCH_CACHE[k] = { at: Date.now(), data: data };
 }
 
-const COCO_RETRY_BUDGET_MS = 2500;
+/* ⚠️ 2500 → 1500（2026-10-19）：COCO 掉零是后端随机现象，重试 2.5 秒
+   换回来的命中率提升很有限（实测「脆弱少女组」QQ 那次整整跑了 2.7s 仍然 0 条），
+   代价却是把整次搜索从 1.5s 拖到 2.7s。1.5 秒足够覆盖「第一次抖动、
+   第二次就回来」的常见情况。 */
+const COCO_RETRY_BUDGET_MS = 1500;
 
 async function cocoSearch(provider, keyword) {
   const ck = cacheGet("coco", provider, keyword);
@@ -3882,6 +3891,91 @@ function miguListenUrl(contentId, copyrightId) {
     "&netType=00&resourceType=2&channel=0146951&toneFlag=HQ";
 }
 
+/* ============================================================
+ * 咪咕「直出」专辑详情
+ *
+ * ⚠️ 为什么非要有这个：搜索结果里「咪咕直出」的专辑 id 是**咪咕自己的**
+ *    albumId（例如 7948），跟酷我的 id 空间毫无关系。原来 getAlbumDetail
+ *    没有咪咕分支，于是直直落到最后的酷我兜底，拿 7948 去
+ *    www.kuwo.cn/album_detail 查 —— 查出来是《两只小蜜蜂》(李晓杰) 11 首，
+ *    跟用户点的《范特西》毫无关系。
+ *    实测 2026-10-19：搜「范特西」，第 3 条「范特西 周杰伦 咪咕直出 0 首」
+ *    点进去就是这个鬼样子。
+ *
+ * 接口：
+ *   MIGUM3.0/resource/album/song/v2.0?albumId&pageNo&pageSize
+ *     → data.songList[]（songName / singerList[0].name / duration 秒 /
+ *        contentId / copyrightId / lrcUrl）+ data.totalCount / data.hasNext
+ *   MIGUM3.0/resource/album/v2.0?albumId
+ *     → data.title / singer / publishTime / summary / imgItems
+ * ============================================================ */
+const MIGU_ALBUM_INFO = "https://app.c.nf.migu.cn/MIGUM3.0/resource/album/v2.0";
+const MIGU_ALBUM_SONG = "https://app.c.nf.migu.cn/MIGUM3.0/resource/album/song/v2.0";
+
+async function miguAlbumDetail(albumId, albumItem, page) {
+  const pn = (page || 1);
+  const hdr = { "User-Agent": MIGU_UA_MOBILE, Referer: "https://music.migu.cn/" };
+
+  // 第 1 页顺手把专辑元信息也拉回来（并发，不额外等待）
+  const [songsRes, infoRes] = await Promise.all([
+    axios_1.get(MIGU_ALBUM_SONG, {
+      params: { albumId: albumId, pageNo: pn, pageSize: 50 },
+      timeout: 20000, headers: hdr, validateStatus: () => true,
+    }).catch(() => null),
+    pn === 1 ? axios_1.get(MIGU_ALBUM_INFO, {
+      params: { albumId: albumId },
+      timeout: 20000, headers: hdr, validateStatus: () => true,
+    }).catch(() => null) : Promise.resolve(null),
+  ]);
+
+  const box = (songsRes && songsRes.data && songsRes.data.data) || {};
+  const list = box.songList || [];
+
+  const musicList = list.map((m, i) => {
+    const sg = (m.singerList || [])[0] || {};
+    const cid = String(m.contentId || "");
+    return {
+      id: cid,
+      platform: "咪咕直出",
+      title: m.songName || m.name || "",
+      artist: sg.name || albumItem.artist || "",
+      album: albumItem.title || "",
+      artwork: albumItem.artwork || "",
+      duration: Number(m.duration || 0) * 1000,
+      _provider: "miguapi",
+      /* 播放靠 contentId + copyrightId 拼 listenSong.do，得跟着条目走 */
+      _raw: {
+        id: cid,
+        copyrightId: String(m.copyrightId || ""),
+        title: m.songName || "",
+        artist: sg.name || "",
+        lyricUrl: m.lrcUrl || "",
+      },
+      _trackNo: i + 1,
+    };
+  }).filter((x) => x.id);
+
+  const meta = (infoRes && infoRes.data && infoRes.data.data) || {};
+  const imgs = meta.imgItems || [];
+  const art = (imgs[1] && imgs[1].img) || (imgs[0] && imgs[0].img) || albumItem.artwork || "";
+
+  return {
+    isEnd: !box.hasNext,
+    albumItem: {
+      id: String(albumId),
+      platform: "咪咕直出",
+      title: meta.title || albumItem.title || "",
+      artist: meta.singer || albumItem.artist || "",
+      artwork: art,
+      date: meta.publishTime || meta.publishDate || albumItem.date || "",
+      description: meta.summary || albumItem.description || "",
+      worksNum: musicList.length || Number(box.totalCount || 0) || Number(albumItem.worksNum || 0),
+    },
+    musicList: musicList,
+    _isMiguAlbum: true,
+  };
+}
+
 async function resolveMiguApi(id, want, quality) {
   const errors = [];
   // 直取：id 就是 contentId，但还需要 copyrightId，所以要走搜索补齐
@@ -4541,6 +4635,44 @@ function sortAlbums(list, artistN) {
 }
 
 /* ---------- 专辑 ---------- */
+/** 跨平台合并同一张专辑（合并的是「唱片」，不是「曲目」）
+ *
+ *  ⚠️ 实测搜「范特西」，未合并时前三条是同一张唱片的三个副本：
+ *     1|范特西|周杰伦|酷狗|10首
+ *     2|范特西|周杰伦|酷我|10首
+ *     3|范特西|周杰伦|咪咕直出|0首
+ *     用户看到「周杰伦的范特西」出现三次，还得自己猜点哪个是对的。
+ *
+ *  key 用「规范化专辑名 + 规范化歌手」——光看名字不行，
+ *  《范特西》在酷狗有一堆 KenYl / 李艾军 / 金华王珏 的同名翻唱，
+ *  必须带上歌手才不会把正版和翻唱并成一条。
+ *
+ *  保留哪一条：曲目数最多的（曲目数是「这张是不是正版」最硬的旁证），
+ *  平手按原顺序（酷我跟酷狗在前）。**注意**：这个函数只做合并，
+ *  不能拿去当排序输入 —— 原来把它放在排序之前，周杰伦那三条副本一并，
+ *  共识票数就掉了，结果被 20 首的翻唱专辑顶到第 1 名。
+ */
+function dedupeAlbumList(list) {
+  const pos = {};
+  const keep = [];
+  for (let i = 0; i < list.length; i++) {
+    const x = list[i];
+    if (!x || x._isAudiobook) { keep.push(x); continue; }
+    const n = normAlbumName(x.title);
+    const a = singerNorm(x.artist);
+    /* 名字或歌手为空就不合并 —— 没有判据时的合并会把不相干的东西并掉 */
+    if (!n || !a) { keep.push(x); continue; }
+    const key = n + "|" + a;
+    if (!(key in pos)) { pos[key] = keep.length; keep.push(x); continue; }
+    const j = pos[key];
+    if (Number(x.worksNum || 0) > Number(keep[j].worksNum || 0)) keep[j] = x;
+  }
+  if (keep.length !== list.length) {
+    console.log("[粽子] 专辑跨平台合并：" + list.length + " → " + keep.length + " 条");
+  }
+  return keep;
+}
+
 async function searchAlbum(query, page) {
   /* 同 searchArtist：译名搜不出唱片，得先换成原名。
      实测「摇晃帝国」原样搜，51 条里全是《摇晃的红酒杯》《摇晃的时光》，
@@ -4973,6 +5105,8 @@ async function searchAlbum(query, page) {
     }
   }
 
+  /* 合并放在**排序之后**（理由见 dedupeAlbumList 的注释：放前面会削掉共识票数） */
+  data = dedupeAlbumList(data);
   return { isEnd: out.length < KUWO_PAGE_SIZE, data: data };
 }
 
@@ -8201,11 +8335,45 @@ async function getAlbumDetail(albumItem, page) {
     };
   }
 
-  // 酷我：用 album 页面的 __NUXT__ 拿曲目；简单起见先走搜索兜底
-  try {
-    const d = await kuwoSheetsByAlbum(id);
+  /* ---- 咪咕「直出」专辑 ----
+     ⚠️ 这条分支必须在酷我兜底**之前**：咪咕的 albumId（7948）跟酷我的
+        id 空间完全无关。没有这条分支时，点「范特西 周杰伦 咪咕直出」
+        会一路落到下面的 kuwoSheetsByAlbum(7948)，查出《两只小蜜蜂》
+        (李晓杰) 11 首 —— 用户点了周杰伦，进去看到李晓杰。 */
+  if (albumItem._provider === "miguapi" || albumItem.platform === "咪咕直出") {
+    const d = await miguAlbumDetail(id, albumItem, page).catch(() => null);
     if (d && d.musicList && d.musicList.length) return d;
-  } catch (e) { /* 落到下面 */ }
+    /* 接口没曲目：给一个**诚实的空专辑**（元信息还是咪咕的），
+       绝不往下落到酷我拿别人的唱片来充数。 */
+    if (d) return d;
+    return {
+      isEnd: true,
+      albumItem: {
+        id: String(id),
+        platform: "咪咕直出",
+        title: albumItem.title || "",
+        artist: albumItem.artist || "",
+        artwork: albumItem.artwork || "",
+        date: albumItem.date || "",
+        description: albumItem.description || "",
+        worksNum: 0,
+      },
+      musicList: [],
+    };
+  }
+
+  // 酷我：用 album 页面的 __NUXT__ 拿曲目
+  /* ⚠️ 只有真的是酷我条目才走这里。原来这里是「谁都没匹配上」的默认兜底，
+     拿别的平台的 id 去酷我查 —— id 空间一撞就返回别人的唱片，
+     而且看着还挺像那么回事（有曲目、有封面），特别难发现。
+     认不出平台的条目宁可返回 null，让客户端显示空列表。 */
+  if (albumItem._provider === "kuwo" || albumItem.platform === "酷我") {
+    try {
+      const d = await kuwoSheetsByAlbum(id);
+      if (d && d.musicList && d.musicList.length) return d;
+    } catch (e) { /* 落到下面 */ }
+  }
+  console.log("[粽子] 专辑详情认不出来源: " + String(albumItem.platform || albumItem._provider || "?") + " id=" + id);
   return null;
 }
 
@@ -8302,7 +8470,7 @@ async function getArtistWorksOf(artistItem, page, type) {
           「歌名 + 频道名」，实测 9/9 全部命中 Topic 官方频道，耗时 <1s。 */
     const cat = await appleArtistCatalog(chName);
     if (cat && cat.tracks && cat.tracks.length) {
-      const CONC = 6;   // YouTube 这边并发开大会被限流
+      const CONC = 8;   // YouTube 这边并发开大会被限流
       for (let i = 0; i < cat.tracks.length; i += CONC) {
         const batch = cat.tracks.slice(i, i + CONC);
         await Promise.all(batch.map(async (t) => {
@@ -8655,6 +8823,7 @@ function compareRank(a, b) {
 }
 
 async function searchMusicAll(query, page) {
+  const T0 = Date.now();
   if (page !== 1) return { isEnd: true, data: [] };
 
   const settled = [];
@@ -8667,6 +8836,17 @@ async function searchMusicAll(query, page) {
         拦空之后又回退成「不筛」，噪声反而全都回来了。
      （实测 2026-10-18：B 站 7 条全被拦，最后只剩咪咕的《摇晃》） */
   const aliasPromise = neteaseArtistAliases(query).catch(() => []);
+  /* 别名反查不吃满等待：尾部最多再等 ALIAS_TAIL_CAP 毫秒，
+     而且整条别名链路有绝对上限 ALIAS_ABS_DEADLINE（从搜索开始算）——
+     平台搜索已经花掉的时间可以抵扣。
+     ⚠️ 不能像之前那样「从入口就挂一个 700ms 的计时器」：那样反查只要超过
+        700ms 就会被判成「没有别名」，而反查实测常常要 0.9~1.4s
+        （网易云两发 + QQ + Apple 四路）。实测后果很实在：
+        搜「摇晃帝国」别名整批丢掉，唯一正确的 YouTube 那路
+        （ゆらゆら帝国）认不出身份，被 B 站标题党顶到后面。
+        用户要的译名搜索能力，不能拿来换这 0.5 秒。 */
+  const ALIAS_TAIL_CAP = 800;
+  const ALIAS_ABS_DEADLINE = 3000;
 
   /* 别名反查的「限时版」：最多等 ms 毫秒。
      ⚠️ 为什么要限时：B 站和 YouTube 这两路**必须**拿到原名才能搜
@@ -8712,6 +8892,20 @@ async function searchMusicAll(query, page) {
       到真要打分时直接取结果 —— 尾部又省掉 0.3s。 */
   const applePreP = (String(query).indexOf(" ") < 0 && String(query).indexOf("　") < 0)
     ? appleArtistCatalog(query).catch(function () { return null; })
+    : null;
+  /* 带空格的查询里，「歌手那一半」（最后一个词）也可以提前问 ——
+     「晴天 周杰伦」这类组合查询的 Apple 目录要等平台结果回来才知道该不该问，
+     现问就是白等 0.4~0.6s（实测 Taylor Swift / 晴天 周杰伦 都在这里掉时间）。
+     反正 appleArtistCatalog 自带缓存、失败了返回 null，提前发没有副作用：
+     真需要时直接命中，不需要就自己过期。 */
+  const appleTailPreP = (String(query).indexOf(" ") >= 0 || String(query).indexOf("　") >= 0)
+    ? (function () {
+        const parts = String(query).trim().split(/\s+/);
+        const tail = parts[parts.length - 1];
+        return tail && tail !== String(query).trim()
+          ? appleArtistCatalog(tail).catch(function () { return null; })
+          : null;
+      })()
     : null;
 
   function toItem(raw, provider) {
@@ -9001,13 +9195,31 @@ async function searchMusicAll(query, page) {
      而真正会拖到 3 秒以上的只有偶发的限流重试 —— 那种不值得等。
      ⚠️ 一开始设的是 1500ms，结果晴天丢了网易云/酷狗/YouTube 三路
         （列表从 80 条掉到 63 条），所以往上抬了 200ms。 */
+  /* ⚠️ 2026-10-19 二次调参：
+     实测各平台到达时间 酷我 0.15~0.35s / 鬼畜 0.3~0.65s / QQ 0.45~0.85s /
+     酷狗 0.8~1.4s / 咪咕 0.9~1.4s / 网易云 0.6~1.4s / B 站 1.3~1.5s /
+     YouTube 0.7~1.8s / JOOX 1.7~2.5s。
+     1700/3000 这两档偏保守，JOOX 一路就能把「周杰伦」拖到 2.5s。
+     ⚠️ 两个都试过往下压，都退回来了：
+        1500 → 晴天从 80 条掉到 55 条（YouTube 那一路 1.5~1.8s 才到）
+        软 1700 + 硬 2500 → 「摇晃帝国」这类译名查询有时会丢掉 YouTube 那一路，
+                            正是唯一有正确结果的那一路（实测三次里错两次）
+        所以软截止维持 1700、硬截止维持 3000 —— 速度靠别的地方赚，
+        不靠砍这条线。 */
   const SOFT_DEADLINE = 1700;
   const HARD_DEADLINE = 3000;
   const MIN_EARLY_ITEMS = 25;
+  /* ⚠️ 截止时间从**搜索开始**算，不是从「等到这里」的时候算。
+     原来的写法是 setTimeout(ms)，而调用它的地方已经在入口之后
+     跑了 100~150ms（别名反查、Apple 预热、九个平台的任务组装），
+     等于每条截止线都被悄悄往后推了这么久。
+     实测「晴天」：T0 到 waitUpTo 已经过了 143ms，
+     于是 1700ms 的软截止实际在 1843ms 才生效。 */
   function waitUpTo(ms) {
+    const left = Math.max(0, ms - (Date.now() - T0));
     return new Promise(function (res) {
       let done = false;
-      const t = setTimeout(function () { if (!done) { done = true; res(); } }, ms);
+      const t = setTimeout(function () { if (!done) { done = true; res(); } }, left);
       allDone.then(function () { if (!done) { done = true; clearTimeout(t); res(); } });
     });
   }
@@ -9112,9 +9324,10 @@ async function searchMusicAll(query, page) {
      别名只影响「标题/歌手能不能认成同一个身份」这一层打分，
      拿不到最多是排序略糙，不该让用户多等一秒多。
      所以限时 700ms：到点就当作没有别名继续往下走。 */
+  const aliasWaitMs = Math.max(0, Math.min(ALIAS_TAIL_CAP, ALIAS_ABS_DEADLINE - (Date.now() - T0)));
   const aliasListRaw = await Promise.race([
     aliasPromise,
-    new Promise(function (res) { setTimeout(function () { res(null); }, 700); }),
+    new Promise(function (res) { setTimeout(function () { res([]); }, aliasWaitMs); }),
   ]).then(function (v) { return v || []; });
   /* ⚠️⚠️ 这里有个致命的坑，必须挡掉（2026-10-18 定位到）：
      反查拿到的是「这串词指向哪位歌手」，但这个结论只对**纯歌手名查询**成立。
@@ -9297,7 +9510,9 @@ async function searchMusicAll(query, page) {
     ? Promise.resolve(null)
     : (applePreP && appleQuery === query
         ? applePreP
-        : appleArtistCatalog(appleQuery).catch(function () { return null; }));
+        : (appleTailPreP && appleQuery === String(query).trim().split(/\s+/).pop()
+            ? appleTailPreP
+            : appleArtistCatalog(appleQuery).catch(function () { return null; })));
   const auth = await authorityHint(query, authArtists, authPreP);
 
   /* ---- 歌手名查询：用 Apple Music 的完整目录当白名单 ----
@@ -9403,22 +9618,44 @@ async function searchMusicAll(query, page) {
     }
     if (missing.length) {
       const conn = [];
-      const CONC = 6;
+      const CONC = 8;
       /* ⚠️ 这一路是「逐首去 YouTube 搜一遍」，24 首分 4 批，
          每批 1.3s 左右 —— 实测「脆弱少女组」光这里就要 4 秒，
          整次搜索被拖到 7 秒。用户搜个歌手等七秒是不能接受的。
          所以给它一个总预算：到点就收手，已经补到的照样用，
          没补完的下次搜索（Apple 目录已缓存）会继续补。
          宁可少几首，也不能让界面一直转圈。 */
-      const FILL_BUDGET = 2600;
+      /* ⚠️ 补全原来是「独立 2600ms 预算」，也就是说它**从平台搜索结束之后**才开始计时：
+         平台 2.5s + 补全 2.6s = 5~6s（实测「脆弱少女组」6270ms）。
+         现在改成吃**总预算**：整次搜索最多 3.4s，补全只能用剩下的那点时间。
+         补到的照样用，补不完的下次搜（Apple 目录已缓存）接着补。 */
+      /* 3600 是「总预算」，不是「一定会用满」：只有 Apple 目录够小
+         （10~60 首，冷门独立乐团那种）、而且确实缺货时才补，
+         而且补到一批就走人。实测「脆弱少女组」2.7s 起步 + 一批补全 ≈ 3.4s；
+         周杰伦/陈奕迅那种大目录根本进不到这里。 */
+      const TOTAL_BUDGET = 3600;
+      const FILL_BUDGET = Math.max(0, Math.min(2600, TOTAL_BUDGET - (Date.now() - T0)));
       const fillT0 = Date.now();
+      /* 剩余预算不够跑完一批（8 个并发大约要 0.9~1.3s）就别开这一轮，
+         否则必然是「发出去了但没等到」，白白多花一秒多。 */
+      const FILL_MIN_MS = 900;
       for (let i = 0; i < missing.length; i += CONC) {
-        if (Date.now() - fillT0 > FILL_BUDGET) {
-          console.log("[粽子] Apple 目录补全超预算，本轮补 " + conn.length + "/" + missing.length);
+        /* 剩余预算连一批都跑不完就别开这一轮 —— 开了也是白等。
+           （「白等」是实测出来的：预算 1234ms 时照样发一批，那批要 2s，
+             于是整次搜索从 2.4s 变成 4.4s，「脆弱少女组」就是这么超的。） */
+        const left = FILL_BUDGET - (Date.now() - fillT0);
+        if (left < FILL_MIN_MS) {
+          if (conn.length || i === 0) {
+            console.log("[粽子] Apple 目录补全预算不足（余 " + left + "ms），本轮补 " + conn.length + "/" + missing.length);
+          }
           break;
         }
         const batch = missing.slice(i, i + CONC);
-        await Promise.all(batch.map(async function (t) {
+        /* 批内并发不变，但**整批套一个剩余预算的时限**：
+           到点就收手，已经 push 进 conn 的照样用 —— 结果是一条一条
+           push 进来的，所以超时不会把已经拿到的丢掉。 */
+        await Promise.race([
+          Promise.all(batch.map(async function (t) {
           const wantN = normTextZ(t.title);
           const wantBare = wantN.replace(/[.,!?;:'"·、。，！？；：…—–\-]/g, "");
           let list = [];
@@ -9458,7 +9695,9 @@ async function searchMusicAll(query, page) {
             _provider: "youtube",
             _raw: best,
           });
-        }));
+        })),
+          new Promise(function (res) { setTimeout(res, left); }),
+        ]);
       }
       if (conn.length) {
         for (let i = 0; i < conn.length; i++) {
@@ -10541,7 +10780,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.2",
+  version: "4.10.3",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
