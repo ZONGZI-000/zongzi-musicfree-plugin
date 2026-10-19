@@ -2273,7 +2273,31 @@ function shouldUseAuthority() {
   } catch (e) { return true; }
 }
 
-async function authorityHint(query, topArtist) {
+/* ============================================================
+ * 权威目录的「预热」
+ *
+ * ⚠️ 为什么要单独拆一发：
+ *   authorityHint 里那发 iTunes 请求虽然只有 0.3~0.5s，
+ *   但它原来是在**平台搜索结果全部回来之后**才发的 ——
+ *   也就是说这 0.4s 是纯追加在总耗时尾部，用户全程在等。
+ *   而它其实只依赖 query，不依赖任何搜索结果（topArtist 只用于打分）。
+ *
+ *   所以现在：searchMusicAll 一进来就把这发请求发出去，
+ *   等真正要打分的时候再 await，那时它早就回来了 —— 尾部零耗时。
+ * ============================================================ */
+function authorityPrefetch(query) {
+  const q = String(query || "").trim();
+  if (!q || q.length > 40) return null;
+  if (!shouldUseAuthority()) return null;
+  /* 已经缓存过就别重复发 —— 直接给个同步返回的 promise */
+  const ck = normText(q).slice(0, 40);
+  const hit = AUTH_CACHE[ck];
+  if (hit && Date.now() - hit.at < AUTH_CACHE_TTL) return { cached: hit.v };
+  return itunesSearchAny("/search", { term: q, entity: "song", limit: 25, country: "cn" })
+    .catch(function () { return null; });
+}
+
+async function authorityHint(query, topArtist, pre) {
   if (!shouldUseAuthority()) return null;
   const q = String(query || "").trim();
   if (!q || q.length > 40) return null;
@@ -2287,10 +2311,15 @@ async function authorityHint(query, topArtist) {
        比「先找歌手再 lookup」稳得多 —— 后者要求查询词恰好是歌手名，
        搜「花海 周杰伦」时会被误认成歌手查询而错配。
        entity=song 一次就返回 歌名 / 歌手 / 专辑名 / 专辑曲目数，
-       全都是判定「正式发行版」要用的字段。 */
-    const songRes = await itunesSearchAny("/search", {
-      term: q, entity: "song", limit: 25, country: "cn",
-    });
+       全都是判定「正式发行版」要用的字段。
+
+       pre 是上面 authorityPrefetch 已经发出去的那一发：
+       有就直接用它的结果（通常早回来了），没有才现发。 */
+    const songRes = (pre && pre.cached !== undefined)
+      ? pre.cached
+      : (pre ? await pre : await itunesSearchAny("/search", {
+          term: q, entity: "song", limit: 25, country: "cn",
+        }));
     const tracks = ((songRes && songRes.results) || []).filter((x) => x.wrapperType === "track");
 
     // 查询词里可能带歌手名，拆出纯歌名再比
@@ -8639,6 +8668,52 @@ async function searchMusicAll(query, page) {
      （实测 2026-10-18：B 站 7 条全被拦，最后只剩咪咕的《摇晃》） */
   const aliasPromise = neteaseArtistAliases(query).catch(() => []);
 
+  /* 别名反查的「限时版」：最多等 ms 毫秒。
+     ⚠️ 为什么要限时：B 站和 YouTube 这两路**必须**拿到原名才能搜
+        （「摇晃帝国」在 B 站搜不到，「ゆらゆら帝国」才能搜到），
+        所以原来是 `aliasPromise.then(...)` —— 整条任务挂在反查上。
+        实测（2026-10-19）反查要 0.5~1.3s（网易云两发 + QQ + Apple 四路），
+        而它一慢，B 站和 YouTube 就跟着一起慢，整次搜索被拖到 3.8s。
+
+     现在给它一个很短的宽限：反查在 graceMs 内回来就用原名搜（绝大多数情况
+     0.5s 内就回来了）；超时也不干等，先用查询词本身开搜，
+     万一查询词召回为 0（真正的译名场景），再拿迟到的别名补一次。
+     两条路都还在，只是把「等」变成了「先干起来」。 */
+  function aliasGrace(graceMs) {
+    return new Promise(function (res) {
+      let done = false;
+      const t = setTimeout(function () {
+        if (!done) { done = true; res({ names: [], late: true }); }
+      }, graceMs);
+      aliasPromise.then(function (v) {
+        if (!done) { done = true; clearTimeout(t); res({ names: v || [], late: false }); }
+      });
+    });
+  }
+
+  /* B 站 / YouTube 的「第一发」查询词请求，**在等别名之前就发出去**。
+     ⚠️ 这两个平台单次请求本身就要 1.3~1.5s（实测 2026-10-19），
+        原来要等别名反查完（0.4~1.2s）才发第一发，两段叠加就是 2.5s+。
+        现在请求先上路，别名只在「查询词一无所获」时才用来补一发。
+        用闭包把 promise 传给下面的任务，拿到就直接复用，不重复发。 */
+  const ytFirstRawP = shouldUseYoutube()
+    ? ytSearchRaw(query).catch(function () { return []; })
+    : null;
+  const biliFirstRawP = shouldUseBilibili()
+    ? biliSearch(query, 1).catch(function () { return []; })
+    : null;
+
+  /* iTunes 权威目录也提前发出去（只依赖 query，见 authorityPrefetch 的说明） */
+  const authPreP = authorityPrefetch(query);
+
+  /* Apple 歌手目录：不含空格的查询，它必然就是用 query 去问
+     （含空格时「歌名 歌手」要取最后一段，那要等 artistQuery 判定出来，
+      没法提前）。所以这种最常见的情况先把它发出去，
+      到真要打分时直接取结果 —— 尾部又省掉 0.3s。 */
+  const applePreP = (String(query).indexOf(" ") < 0 && String(query).indexOf("　") < 0)
+    ? appleArtistCatalog(query).catch(function () { return null; })
+    : null;
+
   function toItem(raw, provider) {
     return {
       id: String(raw.id || raw.MUSICRID || ""),
@@ -8699,14 +8774,19 @@ async function searchMusicAll(query, page) {
     jobs.push(
       // YouTube 也走一次原名反查：搜「摇晃帝国」在 YouTube 上是空手，
       // 换成反查到的「Yura Yura Teikoku」就能搜到。
-      aliasPromise.then((aliases) => {
-        const anchors = [query].concat(aliases);
-        const kws = aliases.length ? aliases.concat([query]) : [query];
-        // 依次试，第一次拿到结果就停（避免多打请求拖慢整体）
-        return (async () => {
-          for (let k = 0; k < kws.length; k++) {
+      /* ⚠️ 顺序很关键：**先用查询词开搜，同时**在后台等别名。
+         原来是 `aliasGrace(...).then(...)` —— 查别名期间 YouTube 一个请求都不发，
+         而 YouTube 单次搜索本身就要 1.3s（实测 2026-10-19，
+         其中还有一次从网页抓 innertube API key），
+         450ms 的等待叠上去，这一路就稳稳变成最慢的那条。
+         现在两件事同时发生：查询词那一发立刻出手，别名回来了
+         再决定要不要补一发。总耗时 = max(搜索, 反查)，不叠加。 */
+      aliasGrace(450).then(async (ag) => {
+        const tryOne = async (kwList, anchList, preRaw) => {
+          for (let k = 0; k < kwList.length; k++) {
             let raw = [];
-            try { raw = await ytSearchRaw(kws[k]); } catch (e) { continue; }
+            if (k === 0 && preRaw) raw = preRaw;
+            else { try { raw = await ytSearchRaw(kwList[k]); } catch (e) { continue; } }
             const keep = (raw || []).filter((x) => {
               const d = ytDurSec(x.durationText);
               // 太短是切片、太长是合辑/直播回放/有声书
@@ -8714,13 +8794,27 @@ async function searchMusicAll(query, page) {
               if (/伴奏|教学|教程|测评|反应|reaction|钢琴谱|guitar\s*cover/i.test(x.title)) return false;
               if (shouldFilterCover() && !COVER_RE.test(query) && isCoverTitle(x.title)) return false;
               if (shouldFilterAudiobook() && isAudiobookTitle(x.title)) return false;
-              if (!titleMatchesAnchors(x.title, anchors, query)) return false;
+              if (!titleMatchesAnchors(x.title, anchList, query)) return false;
               return true;
             });
-            return { keep: keep, kw: kws[k] };
+            if (keep.length) return { keep: keep, kw: kwList[k] };
           }
           return { keep: [], kw: "" };
-        })();
+        };
+        /* 第一发永远用查询词本身（已经在路上/已回来）。
+           别名只在「查询词一无所获」时才补 —— 有货就没必要多打请求。 */
+        let r = await tryOne([query], [query], await ytFirstRawP);
+        if (!r.keep.length && ag.late) {
+          // 别名是迟到的：最多再等 1200ms（网易云那一路偶发限流会挂十几秒）
+          const late = await Promise.race([
+            aliasPromise,
+            new Promise(function (res) { setTimeout(function () { res(null); }, 1200); }),
+          ]);
+          if (late && late.length) r = await tryOne(late, [query].concat(late), null);
+        } else if (!r.keep.length && ag.names.length) {
+          r = await tryOne(ag.names, [query].concat(ag.names), null);
+        }
+        return r;
       }).then(async (res) => {
         const keep = (res.keep || [])
           .map((x) => ({
@@ -8765,13 +8859,13 @@ async function searchMusicAll(query, page) {
       // ⚠️ 先做一次原名反查（网易云歌手接口），把译名/别名一起拿来搜。
       //    B 站不认「摇晃帝国」这个中文译名，只认「ゆらゆら帝国」；
       //    反查拿到原名后，B 站和 YouTube 都能搜到正确结果。
-      aliasPromise.then(async (aliases) => {
-        const anchors = [query].concat(aliases);
-        // 有原名就先拿原名搜（原名召回远好于译名），译名留着当兜底
-        const kws = aliases.length ? aliases.concat([query]) : [query];
-        for (let k = 0; k < kws.length; k++) {
+      // 跟 YouTube 一样：查询词那一发立刻出手，别等别名
+      aliasGrace(450).then(async (ag) => {
+        const tryOne = async (kwList, anchList, preRaw) => {
+        for (let k = 0; k < kwList.length; k++) {
           let raw = [];
-          try { raw = await biliSearch(kws[k], 1); } catch (e) { continue; }
+          if (k === 0 && preRaw) raw = preRaw;
+          else { try { raw = await biliSearch(kwList[k], 1); } catch (e) { continue; } }
           const keep = (raw || [])
             .filter((x) => {
               const d = x.duration / 1000;
@@ -8781,7 +8875,7 @@ async function searchMusicAll(query, page) {
               // ⚠️ 标题必须真的命中查询词/原名。B 站是分词匹配，
               //    搜「摇晃帝国」会返回《时光的摇晃》《摇晃的汽水》，
               //    这些标题里根本没有「帝国」两个字，必须拦掉。
-              if (!titleMatchesAnchors(x.title, anchors, query)) return false;
+              if (!titleMatchesAnchors(x.title, anchList, query)) return false;
               return true;
             })
             .map((x) => ({
@@ -8792,11 +8886,23 @@ async function searchMusicAll(query, page) {
             }));
           // 这个关键词过滤后全灭就换下一个（比如原名在 B 站没收录）
           if (keep.length) {
-            console.log("[粽子] Bilibili " + keep.length + " 条（关键词: " + kws[k] + "）");
+            console.log("[粽子] Bilibili " + keep.length + " 条（关键词: " + kwList[k] + "）");
             return keep;
           }
         }
         return [];
+        };
+        let got = await tryOne([query], [query], await biliFirstRawP);
+        if (!got.length && ag.late) {
+          const late = await Promise.race([
+            aliasPromise,
+            new Promise(function (res) { setTimeout(function () { res(null); }, 1200); }),
+          ]);
+          if (late && late.length) got = await tryOne(late, [query].concat(late), null);
+        } else if (!got.length && ag.names.length) {
+          got = await tryOne(ag.names, [query].concat(ag.names), null);
+        }
+        return got;
       })
         .catch((e) => { console.log("[粽子] Bilibili 失败: " + e.message); return []; })
     );
@@ -8865,10 +8971,80 @@ async function searchMusicAll(query, page) {
     );
   }
 
-  // 一把并发，等最慢的那个（约 1.1s，瓶颈在 COCO 网易云）
-  const results = await Promise.all(jobs);
-  for (let i = 0; i < results.length; i++) {
-    if (results[i] && results[i].length) settled.push(results[i]);
+  /* ---- 软截止：不再死等最慢的那一路 ----
+     ⚠️ 原来这里是 `await Promise.all(jobs)`，等于整次搜索的耗时
+        由**最慢**的平台决定。实测（2026-10-19）：
+          晴天    总 3.8s，其中酷狗 2.4s / YouTube 2.8s 在拖后腿，
+                  其余五路 0.2~1.5s 早就回来了
+          年轮说  总 4.1s，YouTube 一路就占了 2.4s
+        Promise.all 的做法是：六路各花了 0.3s，白等那一路 2.5s。
+
+     现在改成「先等 1.5s，到点就用已经回来的那些」：
+       - 热歌/常规查询：五六个平台的条目在 1.5s 内基本齐了，
+         直接出结果，用户少等 1~2 秒
+       - 冷门歌：YouTube 那路往往是唯一有货的，如果 1.5s 时
+         收到的条目太少（< 25 条），再宽限到 3s，保证召回不退化
+
+     统一用一个「格子」数组收每路的结果：谁先回来谁先填，
+     提前返回不影响还没跑完的那几路，它们填完就丢（用户已经看到列表了）。 */
+  const SLOTS = new Array(jobs.length);
+  let slotsDone = 0;
+  const allDone = Promise.all(jobs.map(function (pr, i) {
+    return pr.then(
+      function (v) { SLOTS[i] = v || []; slotsDone++; return SLOTS[i]; },
+      function () { SLOTS[i] = []; slotsDone++; return SLOTS[i]; }
+    );
+  }));
+  /* 软截止 1700ms：实测（2026-10-19）各平台的到达时间是
+     酷我 0.15s / QQ 0.75s / 咪咕 0.8s / 酷狗 0.8s / 网易云 1.1s /
+     B 站 1.3s / YouTube 1.3s。1700ms 刚好把它们全部收齐，
+     而真正会拖到 3 秒以上的只有偶发的限流重试 —— 那种不值得等。
+     ⚠️ 一开始设的是 1500ms，结果晴天丢了网易云/酷狗/YouTube 三路
+        （列表从 80 条掉到 63 条），所以往上抬了 200ms。 */
+  const SOFT_DEADLINE = 1700;
+  const HARD_DEADLINE = 3000;
+  const MIN_EARLY_ITEMS = 25;
+  function waitUpTo(ms) {
+    return new Promise(function (res) {
+      let done = false;
+      const t = setTimeout(function () { if (!done) { done = true; res(); } }, ms);
+      allDone.then(function () { if (!done) { done = true; clearTimeout(t); res(); } });
+    });
+  }
+  function earlyCount() {
+    let n = 0;
+    for (let i = 0; i < SLOTS.length; i++) if (SLOTS[i]) n += SLOTS[i].length;
+    return n;
+  }
+  /* 判据不能只看「条数够多」。
+     ⚠️ 踩过：搜「IGU Band」时，1.5s 那一批里已经有网易云/QQ/咪咕的
+        20 多条**噪声**（Puta Bandida / Bandido Não Namora…），
+        条数早就过线了，于是提前返回 —— 而真结果全在 YouTube 那一路，
+        它还没回来。结果是「搜得飞快，但一个对的都没有」。
+     所以分两种情况：
+       A. 早到的结果里**已经有 ≥3 条标题正好等于查询词** → 这是搜歌名
+          （《晴天》《起风了》必然一堆标题就叫这个），不用等，直接出。
+       B. 没有这种命中 → 可能是搜歌手/译名，真货往往只在 B 站/YouTube，
+          老老实实等到 3 秒，别拿噪声凑数。 */
+  function earlyExactHits() {
+    const want = flatTitle(query);
+    if (!want || want.length < 2) return 0;
+    let n = 0;
+    for (let i = 0; i < SLOTS.length; i++) {
+      const arr = SLOTS[i];
+      if (!arr) continue;
+      for (let j = 0; j < arr.length; j++) {
+        const f = flatTitle(arr[j].title);
+        if (f && f === want) n++;
+      }
+    }
+    return n;
+  }
+  await waitUpTo(SOFT_DEADLINE);
+  if (earlyCount() < MIN_EARLY_ITEMS || earlyExactHits() < 3) await waitUpTo(HARD_DEADLINE);
+  // 到点还没回来的那几路直接放弃（它们的结果对这次返回已经没用了）
+  for (let i = 0; i < SLOTS.length; i++) {
+    if (SLOTS[i] && SLOTS[i].length) settled.push(SLOTS[i]);
   }
 
   // ---- 交错合并，避免一个平台刷屏 ----
@@ -8929,7 +9105,17 @@ async function searchMusicAll(query, page) {
      整批判成无关：搜「摇晃帝国」时 keep=0，于是回退成「一条都不筛」，
      咪咕那六条《摇晃》反而全冒出来了。
      query 先注册为真，别名兜在后面。 */
-  const aliasListRaw = await aliasPromise;
+  /* ⚠️ 这里原来是无条件 `await aliasPromise`，等于在尾部又插一段等待。
+     实测（2026-10-19）：
+       晴天     alias 早已回来，0ms
+       脆弱少女组 alias 卡到 1.5s，整次搜索从 3.5s 变成 5s
+     别名只影响「标题/歌手能不能认成同一个身份」这一层打分，
+     拿不到最多是排序略糙，不该让用户多等一秒多。
+     所以限时 700ms：到点就当作没有别名继续往下走。 */
+  const aliasListRaw = await Promise.race([
+    aliasPromise,
+    new Promise(function (res) { setTimeout(function () { res(null); }, 700); }),
+  ]).then(function (v) { return v || []; });
   /* ⚠️⚠️ 这里有个致命的坑，必须挡掉（2026-10-18 定位到）：
      反查拿到的是「这串词指向哪位歌手」，但这个结论只对**纯歌手名查询**成立。
      一旦查询是「歌名 + 歌手」（「晴天 周杰伦」），反查照样会返回歌手名
@@ -9090,7 +9276,29 @@ async function searchMusicAll(query, page) {
     seenAuthArtist[k] = 1;
     authArtists.push(nm);
   }
-  const auth = await authorityHint(query, authArtists);
+  const exactTitleHit = relevant.some(function (it) {
+    const f1 = flatTitle(it.title);
+    return f1 && f1 === flatTitle(query) && f1.length >= 2;
+  });
+  let appleQuery = query;
+  if (!artistQuery && queryHasSpace) {
+    const parts = String(query).trim().split(/\s+/);
+    if (parts.length >= 2) appleQuery = parts[parts.length - 1];
+  }
+  /* ⚠️ 权威目录（iTunes 歌曲搜索）和 Apple 歌手目录原来是**串行** await 的，
+     各要 0.2~0.8s，加起来就是白白多等一截 —— 实测「起风了」这两步共 0.8s，
+     占了总耗时的四分之一。两者互不依赖（都只依赖上面算出来的结果集），
+     所以先一起发出去，再一起等。
+     条件判断放在发请求之前：不满足条件就不发那一路，逻辑跟原来完全一致。 */
+  const _willAskApple = artistQuery || artistHits >= 2 || !exactTitleHit || (appleQuery !== query);
+  /* ⚠️ 只有当 appleQuery 正好等于 query 时才能复用预热的那一发；
+     组合查询（「晴天 周杰伦」）的问题不是同一个，得现问。 */
+  const _appleP = !_willAskApple
+    ? Promise.resolve(null)
+    : (applePreP && appleQuery === query
+        ? applePreP
+        : appleArtistCatalog(appleQuery).catch(function () { return null; }));
+  const auth = await authorityHint(query, authArtists, authPreP);
 
   /* ---- 歌手名查询：用 Apple Music 的完整目录当白名单 ----
      实测搜「那我懂你意思了」：酷狗歌手接口 data:null（这个乐团没被收录），
@@ -9106,10 +9314,6 @@ async function searchMusicAll(query, page) {
         搜歌名《起风了》《晴天》必然有一堆标题就叫这个，跳过提问（省 200ms）；
         搜人名则一条都不会正好等于，去问 Apple 才有意义。
      真伪最终由 Apple 自己把关：演出者名对得上 + 曲目 ≥10 首才算。 */
-  const exactTitleHit = relevant.some(function (it) {
-    const f1 = flatTitle(it.title);
-    return f1 && f1 === flatTitle(query) && f1.length >= 2;
-  });
   let appleCat = null;
   /* ⚠️ 组合查询（「晴天 周杰伦」）也要能用上 Apple 目录。
      直接拿整串去问当然不行 —— Apple 里没有叫「晴天周杰伦」的歌手。
@@ -9120,17 +9324,10 @@ async function searchMusicAll(query, page) {
      写死了 artistQuery，组合查询不会命中，不会误杀。
      这样《晴天》的原唱条目能拿到 trackHit=45，
      而「晴天(深情版)」这类反而因为不在目录里被压到 -60。 */
-  let appleQuery = query;
-  if (!artistQuery && queryHasSpace) {
-    const parts = String(query).trim().split(/\s+/);
-    if (parts.length >= 2) appleQuery = parts[parts.length - 1];
-  }
-  if (artistQuery || artistHits >= 2 || !exactTitleHit || (appleQuery !== query)) {
-    appleCat = await appleArtistCatalog(appleQuery);
-    if (appleCat) {
-      console.log("[粽子] Apple 目录「" + appleCat.name + "」"
-        + appleCat.albums.length + " 张专辑 / " + appleCat.tracks.length + " 首");
-    }
+  appleCat = await _appleP;
+  if (appleCat) {
+    console.log("[粽子] Apple 目录「" + appleCat.name + "」"
+      + appleCat.albums.length + " 张专辑 / " + appleCat.tracks.length + " 首");
   }
 
   /* ---- 有权威目录时，同名冒用的条目直接不收 ----
@@ -9207,7 +9404,19 @@ async function searchMusicAll(query, page) {
     if (missing.length) {
       const conn = [];
       const CONC = 6;
+      /* ⚠️ 这一路是「逐首去 YouTube 搜一遍」，24 首分 4 批，
+         每批 1.3s 左右 —— 实测「脆弱少女组」光这里就要 4 秒，
+         整次搜索被拖到 7 秒。用户搜个歌手等七秒是不能接受的。
+         所以给它一个总预算：到点就收手，已经补到的照样用，
+         没补完的下次搜索（Apple 目录已缓存）会继续补。
+         宁可少几首，也不能让界面一直转圈。 */
+      const FILL_BUDGET = 2600;
+      const fillT0 = Date.now();
       for (let i = 0; i < missing.length; i += CONC) {
+        if (Date.now() - fillT0 > FILL_BUDGET) {
+          console.log("[粽子] Apple 目录补全超预算，本轮补 " + conn.length + "/" + missing.length);
+          break;
+        }
         const batch = missing.slice(i, i + CONC);
         await Promise.all(batch.map(async function (t) {
           const wantN = normTextZ(t.title);
@@ -9334,17 +9543,56 @@ async function searchMusicAll(query, page) {
 
   out.sort(compareRank);
 
+  /* ============================================================
+   * Live 分组：录音室原版一块，现场/演唱会版另起一块
+   *
+   * 用户的要求（2026-10-19）：
+   *   「结果分两个？一个不是 live 一个是 live」
+   *   「如果有带 live 专辑的两个原唱就分开」
+   *
+   * 也就是：整份列表切成前后两段 ——
+   *   前段只有录音室版，后段才是 Live / 现场 / 巡演版。
+   * 用户搜歌时在头部就能看到干净的原版，想听现场再往下翻，
+   * 不用在一堆 Live 里挑。
+   *
+   * ⚠️ 这里只做**稳定分组**，段内顺序完全保持 compareRank 排出来的结果：
+   *    a) 原版内部原有的优劣顺序不动
+   *    b) Live 段内部也是好的在前
+   *    所以用两趟 push，不要用 sort —— sort 会打乱段内的既有排序。
+   *
+   * ⚠️ 判据用已经算好的 _live（isLiveVersion(title, album)），
+   *    专辑名里带 Live / 演唱会 的也算 —— 这正是用户说的
+   *    「带 live 专辑的」。两个原唱（原版 + Live 版）都会各自占一条，
+   *    因为去重 key 里已经带了 LIVE/STUDIO 标记，谁都不吞谁。
+   * ============================================================ */
+  const studioList = [];
+  const liveList = [];
+  for (let i = 0; i < out.length; i++) {
+    if (out[i]._live) liveList.push(out[i]);
+    else studioList.push(out[i]);
+  }
+  /* 极端情况兜底：
+     - 一条录音室版都没有（冷门现场曲目）→ 原样返回，别把列表清空
+     - 一条 Live 都没有 → 也不用拼，省一次数组拷贝 */
+  const grouped = studioList.length ? studioList.concat(liveList) : out;
+
   // ---- 后台预取前几首的播放地址 ----
   // 用户要求「先缓存好」，这样点第一首时不用等 1.5 秒。
   // 注意：这里**不 await**，让它自己跑完；搜索立刻返回。
   // Hermes 里 promise 链在函数返回后仍会继续执行（只是拿不到结果），
   // 所以能起到预热效果。
   if (shouldPrefetch()) {
-    prefetchTop(out, 3);
+    prefetchTop(grouped, 3);
+  }
+
+  /* 到底分没分开，日志里能看出来（调试 Live 混排时很省事）。
+     只有真存在两种版本时才打，免得每搜一次都刷一行。 */
+  if (liveList.length && studioList.length) {
+    console.log("[粽子] 已分组：原版 " + studioList.length + " 条 / Live " + liveList.length + " 条");
   }
 
   // _auth 带出去给 search() 用：降级补搜时要用同一份权威目录重新打分
-  return { isEnd: true, data: out, _auth: auth };
+  return { isEnd: true, data: grouped, _auth: auth };
 }
 
 /* ============================================================
@@ -10293,7 +10541,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.1",
+  version: "4.10.2",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
