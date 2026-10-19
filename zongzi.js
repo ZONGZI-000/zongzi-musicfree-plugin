@@ -6804,6 +6804,56 @@ const DZ_COVER_CACHE = {};
    一条 1080×1080 方图。走 jsDelivr，国内比 raw 快且能缓存。
    现在每个分类都有自绘图；万一表里漏了某个新分类，才回落到 Deezer。 */
 const COVER_CDN = "https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/covers/";
+
+/* ============================================================
+ * 歌曲级兜底封面
+ *
+ * 平台不保证每首歌都有封面：酷我老歌、咪咕、B 站翻唱、YouTube 冷门发行，
+ * artwork 常常是空串，卡片上就是一个灰块。
+ * 分类封面（MIX_COVERS）只管歌单，管不到单曲，所以这里补一套自己画的占位图。
+ *
+ * 三张轮换而不是一张：列表一屏二三十格，全用同一张会像加载失败。
+ * 按「歌名+歌手」哈希分配 —— 同一首歌每次看到的是同一张，换平台也不变。
+ * ============================================================ */
+/* fb-02 / fb-03 还没画，先把图名留在这儿占位：
+   文件没上传到仓库前不能挂进列表，否则 404 的卡片比灰块更难看。 */
+const FB_ART_COVERS = ["fb-01.jpg"];
+
+function fbHash(str) {
+  let h = 2166136261;                       /* FNV-1a，够散且不用 crypto */
+  const t = String(str || "");
+  for (let i = 0; i < t.length; i++) {
+    h ^= t.charCodeAt(i);
+    h = (h * 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/** 给一首没有封面的歌挑一张占位图 */
+function fbArt(item) {
+  const key = ((item && item.title) || "") + "|" + ((item && item.artist) || "");
+  const seed = key !== "|" ? key : String((item && item.id) || "");
+  return COVER_CDN + FB_ART_COVERS[fbHash(seed) % FB_ART_COVERS.length];
+}
+
+/** 递归补齐列表里缺封面的条目（只往下走已知的几个容器字段，不乱翻整棵树） */
+function deepFillArt(o, depth) {
+  if (!o || typeof o !== "object" || depth > 3) return o;
+  if (Array.isArray(o)) {
+    for (const x of o) deepFillArt(x, depth + 1);
+    return o;
+  }
+  /* 认「能当歌曲/专辑卡片用」的对象：有 id 和名字，且自己不是容器 */
+  const isCard =
+    (o.id || o.songmid || o.mid) &&
+    (o.title || o.name) &&
+    !o.musicList && !o.sheetItem && !o.data;
+  if (isCard && !String(o.artwork || "").trim()) o.artwork = fbArt(o);
+  const kids = ["data", "musicList", "tracks", "list", "sheetItem"];
+  for (const k of kids) if (o[k]) deepFillArt(o[k], depth + 1);
+  return o;
+}
+
 const MIX_COVERS = {
   /* 18 张自绘图，够铺满网易那 70 个分类加上 QQ 独有的那几个。
      一个分类一张，贴身就贴；剩下的不再现搜 Deezer。
@@ -11598,7 +11648,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.9",
+  version: "4.10.10",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -12161,4 +12211,22 @@ function md5Hex(str) {
   return hx(a) + hx(b) + hx(c) + hx(d);
 }
 
-
+/* ============================================================
+ * 兜底封面的统一挂载点
+ *
+ * 不逐处改 artwork 的赋值（那种地方有九十来处，漏一个就是一个灰块），
+ * 而是在导出层统一包一层：凡是对外返回曲目列表的方法，出参都过一遍
+ * deepFillArt()。以后新加平台也不用再记得手动补封面。
+ * ============================================================ */
+(function () {
+  ["search", "getAlbumInfo", "getMusicSheetInfo", "getArtistWorks", "getTopLists",
+   "getRecommendSheetsByTag", "getMusicComments"].forEach(function (name) {
+    const fn = module.exports[name];
+    if (typeof fn !== "function") return;
+    module.exports[name] = function () {
+      const r = fn.apply(this, arguments);
+      if (r && typeof r.then === "function") return r.then(function (v) { return deepFillArt(v, 0); });
+      return deepFillArt(r, 0);
+    };
+  });
+})();
