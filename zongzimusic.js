@@ -6452,6 +6452,669 @@ async function mixSheetDetail(recipe) {
 }
 
 /* ============================================================
+ * 口味画像（taste profile）
+ *
+ * MusicFree 插件沙箱是**无状态**的：没有文件、没有 AsyncStorage、
+ * 读不到 App 的播放历史和收藏（见 core/pluginManager/plugin.ts 里
+ * env 的定义，只有 getUserVariables 一个只读方法）。所以「自动
+ * 记录你听了什么」这条路根本走不通 —— 不是没写，是拿不到。
+ *
+ * 能拿到的只有 userVariables：用户自己填、存在 App 里、每次调用
+ * 都读得到的字符串。于是画像就建在这上面 ——
+ *
+ *   tasteSeeds  用户填的种子：歌手名（也可填歌名，会自动解析成歌手）
+ *   tasteSkip   不想再看到的歌手，同样逗号分隔
+ *
+ * 有了种子之后**不需要**预先存一份画像：每次请求现算即可，
+ * 计算全部是确定性函数，同样的种子永远给同样的结果。
+ *
+ * 扩张靠两条路，都不是「猜」：
+ *   ① 歌单共现 —— 用种子歌手搜歌单，统计同一张歌单里还出现了谁。
+ *      ⚠️ 这条比「相似歌手」准得多：榜单/推荐类歌单是运营拼的，
+ *      同档歌手会被拼在一起；而匿名可用的相似歌手接口基本都死了
+ *      （网易 simiSong 匿名返回空数组、QQ musicu 500003、
+ *      酷狗 Access Deny），Deezer 能替代但中文覆盖率差
+ *      （草东没有派对 直接查无此人），只能当补充。
+ *   ② 候选校验 —— 共现出来的名字必须能通过「歌手名匹配 + 曲库规模」
+ *      两道关，把 UGC 歌单里那些私人号的杂名滤掉。
+ *
+ * ⚠️ 性能：整条链路 26 个请求、实测 1.6 秒（本机直连）。
+ *    手机上慢一些，所以结果缓存 30 分钟，翻页不重复算。
+ * ============================================================ */
+
+/** 种子/排除名单解析：逗号、顿号、分号、竖线、换行都算分隔符 */
+function tasteList(v) {
+  return String(v || "")
+    .split(/[,，、;；|\n]/)
+    .map((x) => x.trim())
+    .filter((x) => x && x.length <= 40);
+}
+
+/* 翻奏 / 伴奏 / 纯音乐号的名字特征。这类号规模往往很大（Piano Echoes 3168 首），
+   单看曲库规模完全拦不住，只能从名字认。 */
+const TASTE_COVER_NAME = /(piano|cover|karaoke|instrumental|伴奏|翻奏|翻唱|纯音乐|钢琴版|吉他版|八音盒|music box|tribute|lullaby|ringtone|dj版|remix)/i;
+
+/* 曲目级的翻奏标记。只在括号或歌名尾部出现才算 —— 有些正经歌名本身
+   就带「Piano」这个词（比如《Piano Man》），照名字一刀切会误杀。
+   ⚠️ 实测混进来的还有更脏的一类：「晴天(抖音热搜版)」「XX (BGM版)」
+   —— 那是短视频翻唱号蹭原曲名，必须和钢琴版一起压掉。 */
+const TASTE_COVER_TRACK = /[（(【\[][^）)】\]]*(piano|cover|karaoke|instrumental|伴奏|翻奏|纯音乐|钢琴版|吉他版|八音盒|music box|remix|dj版|抖音|热搜|bgm|片段|铃声|女声|男声|童声|纯享|accelerated|sped up|nightcore)[^）)】\]]*[）)】\]]/i;
+
+/* 短视频翻唱号另有一招：直接把标记写在歌名尾巴上、不带括号，
+   比如「故事开头总是极致温柔 - 抖音版」。这类号名字也很杂，
+   用同一个词表扫全文。 */
+const TASTE_DOUYIN_TAIL = /(抖音|热搜|短视频|片段|女声|男声|童声)(版|$)/i;
+
+/** 歌手名与用户输入的匹配强度。3 = 完全同名，2 = 别名或前后缀只有拉丁字符，0 = 不算 */
+const TASTE_LATIN_EXTRA = /^[A-Za-z0-9 .,'&()\-·]+$/;
+function artistNameRelation(cand, q) {
+  const name = String((cand && cand.name) || "");
+  const aliases = [].concat((cand && cand.alias) || [], (cand && cand.alia) || [], (cand && cand.trans) || []);
+  const want = String(q || "").trim();
+  if (!name || !want) return 0;
+  if (name === want) return 3;
+  if (aliases.indexOf(want) >= 0) return 2;
+  /* 「G.E.M.邓紫棋」查「邓紫棋」、「Taylor Swift」查「Taylor」都该命中；
+     但「李志辉」查「李志」不能命中 —— 多出来的部分只要有中文字就不算。 */
+  if (name.indexOf(want) === 0 && TASTE_LATIN_EXTRA.test(name.slice(want.length))) return 2;
+  if (name.length > want.length &&
+      name.lastIndexOf(want) === name.length - want.length &&
+      TASTE_LATIN_EXTRA.test(name.slice(0, name.length - want.length))) return 2;
+  return 0;
+}
+
+/* 歌手搜索 → 择优。同名歌手在网易有一堆山寨号（「周杰伦.」「syE_21」
+   这种），只按名字匹配会挑错。实测「曲库规模」是最稳的判别式：
+   真身 581 首 vs 山寨 20 首，真身 1863 首 vs 粉丝号 3 首。
+   ⚠️ 但规模不能单独用 —— 「李志辉」有 290 首，比「李志」的 2 首多得多。
+      所以关系必须先过硬（名字对得上），规模只在**彼此关系同级**时排序。 */
+const TASTE_ARTIST_TTL = 24 * 60 * 60 * 1000;
+const TASTE_ARTIST_CACHE = {};
+
+async function tasteFindArtist(q) {
+  const key = normText(q);
+  const hit = TASTE_ARTIST_CACHE[key];
+  if (hit && Date.now() - hit.at < TASTE_ARTIST_TTL) return hit.v;
+  let best = null;
+  try {
+    const r = await httpGet("https://music.163.com/api/search/get",
+      { s: q, type: 100, limit: 10 }, NETEASE_HEADERS);
+    const list = (r && r.result && r.result.artists) || [];
+    const scored = [];
+    for (let i = 0; i < list.length; i++) {
+      const rel = artistNameRelation(list[i], q);
+      if (rel <= 0) continue;
+      scored.push({ rel: rel, size: Number(list[i].musicSize || 0), item: list[i] });
+    }
+    scored.sort((a, b) => (b.rel - a.rel) || (b.size - a.size));
+    if (scored.length) best = scored[0].item;
+  } catch (e) {
+    console.log("[粽子] 找歌手失败(" + q + "): " + e.message);
+  }
+  TASTE_ARTIST_CACHE[key] = { at: Date.now(), v: best };
+  return best;
+}
+
+/** 把用户输入的种子落成一位真歌手，失败返回空串。
+    ⚠️ 「填歌名自动解析成歌手」这条路**走不通**，2026-10-19 实测：
+       匿名搜「晴天」，前 30 条没有一条是周杰伦的原唱，全是
+       《晴天(深情版)》/Lucky小爱、《晴天 (原唱 周杰伦)》/RyaVocal
+       这类翻唱号。加 Cookie、换关键词组合都一样 —— 网易的匿名搜索
+       结果被翻唱内容淹了。拿第一条当原唱只会把种子带偏。
+    所以改成反过来的验证：**先当作歌手名去找**，找到后用它热门曲的
+    主唱占比自证身份。曲目全是我唱的 → 这是个真歌手，种子有效；
+    热门全是别人的歌 → 这是个蹭歌号或压根不是歌手，种子作废。
+    这样既不用猜歌名，也不会把假歌手当真。 */
+async function tasteResolveSeed(seed) {
+  const a = await tasteFindArtist(seed);
+  if (!a) return "";
+  const size = Number(a.musicSize || 0);
+  /* 曲库太小的同名号基本是私人上传（搜「晴天」会冒出一堆 0~16 首、
+     名字就叫「晴天」的假歌手）。但小众真乐队也可能只有 20 来首
+     （草东 24 首、万青 21 首），所以不能只看规模 ——
+     小曲库继续验证，大曲库直接放行省一次请求。 */
+  if (size < 5) return "";
+  if (size >= 20) return String(a.name);
+  /* 曲库小的时候再加一道专辑数门槛。
+     ⚠️ 只靠「主唱是不是自己」判不出来：实测有十几个叫「晴天」的私人号，
+        曲库 10~16 首、全是他自己唱的，占比 100%，但那不是歌手 ——
+        是个人上传。真乐队就算曲库小（草东 24 首、万青 21 首），
+        专辑数是 3 / 2 这种成规模的值；私人号普遍只有 1 张。 */
+  const alb = Number(a.albumSize || 0);
+  if (alb < 2) return "";
+  const songs = await tasteArtistSongs(a.id, 20);
+  if (!songs.length) return "";
+  const want = normText(a.name);
+  let own = 0;
+  for (let i = 0; i < songs.length; i++) {
+    const main = normText(splitSingers(songs[i].artist)[0] || songs[i].artist || "");
+    if (main && (main.indexOf(want) >= 0 || want.indexOf(main) >= 0)) own += 1;
+  }
+  /* 主唱占比过半才算歌手本人。蹭歌号（热门一半是别人的歌）直接作废 */
+  return own / songs.length >= 0.5 ? String(a.name) : "";
+}
+
+/** 拿某位歌手的代表曲（热门 50 首）。
+    ⚠️ 两个接口的字段名**不一样**，必须都兼容：
+        artist/top/song → ar / al / dt
+        artist/songs    → artists / album / duration
+        （没有 al 就直接没有专辑和封面）
+    踩过的坑：只读 ar 时，走 artist/songs 的分支拿到的 artist 全是空串，
+    后面「主歌手不符就丢」那条规则把整批歌全判成不符，一首不剩。 */
+async function tasteArtistSongs(artistId, limit) {
+  const cap = Number(limit) > 0 ? Number(limit) : 50;
+  const pick = (songs) => {
+    const out = [];
+    for (let i = 0; i < songs.length && out.length < cap; i++) {
+      const t = songs[i];
+      if (!t || !t.id || !t.name) continue;
+      const ars = t.ar || t.artists || [];
+      const al = t.al || t.album || null;
+      out.push({
+        id: String(t.id),
+        platform: "网易云",
+        title: t.name,
+        artist: ars.map((x) => x.name).filter(Boolean).join("/"),
+        album: (al && al.name) || "",
+        artwork: (al && al.picUrl) || "",
+        duration: Number(t.dt || t.duration || 0),
+        _provider: "netease",
+      });
+    }
+    return out;
+  };
+  try {
+    const r = await httpGet("https://music.163.com/api/v1/artist/songs",
+      { id: artistId, limit: cap, offset: 0, order: "hot" }, NETEASE_HEADERS);
+    const list = pick((r && r.songs) || []);
+    if (list.length) return list;
+  } catch (e) { /* 换旧接口再试 */ }
+  try {
+    const r2 = await httpGet("https://music.163.com/api/artist/top/song", { id: artistId }, NETEASE_HEADERS);
+    return pick((r2 && r2.songs) || []);
+  } catch (e) {
+    console.log("[粽子] 歌手曲目失败(" + artistId + "): " + e.message);
+    return [];
+  }
+}
+
+/* 歌单共现：搜种子歌手的歌单，统计同一张里还出现了谁。
+   ⚠️ 两个计数缺一不可：
+      · sheets = 在**几张不同的**歌单里出现过
+      · n      = 累计出现在多少首歌里
+      「sheets」才是判别噪声的关键。只在一张歌单里刷 57 次的私人号
+      （实测：「扎进心脏的智齿」）sheets 只有 1，而温岚、蔡依林这种
+      真合作歌手会横跨 3~4 张 —— 刷单刷不出跨歌单的分布。
+      所以排序第一权重是 sheets，n 只用来在同分布度里分先后。 */
+const TASTE_CO_MAX_SHEETS = 4;
+const TASTE_CO_MAX_TRACKS = 150;
+
+/* ⚠️ 歌单详情接口只回前 10 首完整曲目，剩下的都在 trackIds 里。
+   这是一个非常容易漏的坑：直接读 playlist.tracks 会以为「一张 143 首的
+   歌单只有 10 首」，共现统计只剩 35 个名字、相似歌手只有 2 个，
+   但整个流程一切正常、不报错。（本文件另一处的歌单详情早就踩过，
+   那里是补曲目，这里是补统计用的人。）
+   所以必须按 trackIds 批量取详情，100 个一批。 */
+async function tasteSheetTracks(pl, maxTracks) {
+  const cap = Number(maxTracks) > 0 ? Number(maxTracks) : 1000;
+  const out = [];
+  const have = {};
+  const push = (t) => {
+    if (!t || !t.id) return;
+    if (have[t.id]) return;
+    have[t.id] = 1;
+    out.push(t);
+  };
+  (pl.tracks || []).forEach(push);
+  const ids = (pl.trackIds || []).map((x) => x && x.id).filter(Boolean);
+  const missing = [];
+  for (let i = 0; i < ids.length && missing.length < cap; i++) {
+    if (!have[ids[i]]) missing.push(ids[i]);
+  }
+  for (let i = 0; i < missing.length; i += 100) {
+    const chunk = missing.slice(i, i + 100);
+    try {
+      const d = await axios_1.get(NETEASE_SONG_DETAIL, {
+        params: {
+          ids: JSON.stringify(chunk),
+          c: JSON.stringify(chunk.map(() => ({ id: 0 }))),
+        },
+        timeout: 20000,
+        headers: NETEASE_HEADERS,
+        validateStatus: () => true,
+      });
+      const songs = (d.data && d.data.songs) || [];
+      songs.forEach(push);
+    } catch (e) { /* 单批失败不影响已拿到的 */ }
+    if (out.length >= cap) break;
+  }
+  return out.slice(0, cap);
+}
+
+async function tasteCoArtists(seedName) {
+  const co = {};
+  try {
+    const r = await httpGet("https://music.163.com/api/search/get",
+      { s: seedName, type: 1000, limit: 8 }, NETEASE_HEADERS);
+    const sheets = (r && r.result && r.result.playlists) || [];
+    const pick = sheets.filter((p) => p && p.id).slice(0, TASTE_CO_MAX_SHEETS);
+    const details = await Promise.all(pick.map((p) =>
+      httpGet(NETEASE_PLAYLIST_DETAIL, { id: p.id, n: TASTE_CO_MAX_TRACKS }, NETEASE_HEADERS)
+        .catch(() => null)
+    ));
+    for (let i = 0; i < details.length; i++) {
+      const pl = details[i] && details[i].playlist;
+      if (!pl) continue;
+      const tracks = await tasteSheetTracks(pl, TASTE_CO_MAX_TRACKS);
+      /* 同一张歌单里同一个人只记一次 sheets，歌数照常累加 */
+      const inThisSheet = {};
+      for (let j = 0; j < tracks.length; j++) {
+        const ars = (tracks[j] && (tracks[j].ar || tracks[j].artists)) || [];
+        for (let k = 0; k < ars.length; k++) {
+          const name = (ars[k] && ars[k].name) || "";
+          const key = normText(name);
+          if (!key || key.length < 2) continue;
+          co[key] = co[key] || { name: name, n: 0, sheets: 0 };
+          co[key].n += 1;
+          if (!inThisSheet[key]) { inThisSheet[key] = 1; co[key].sheets += 1; }
+        }
+      }
+    }
+  } catch (e) {
+    console.log("[粽子] 共现失败(" + seedName + "): " + e.message);
+  }
+  return Object.keys(co).map((k) => co[k]).sort((a, b) => (b.sheets - a.sheets) || (b.n - a.n));
+}
+
+/* 画像缓存。种子里任何一个字变了整份就作废 —— 缓存键直接拼种子串。 */
+const TASTE_TTL = 30 * 60 * 1000;
+const TASTE_CACHE = {};
+/* 一次请求能带的歌手数。每个歌手要 1~2 个请求，太多就超时了 */
+const TASTE_MAX_SEEDS = 8;
+
+async function buildTasteProfile(seedsRaw, skipRaw) {
+  const seeds = tasteList(seedsRaw).slice(0, TASTE_MAX_SEEDS);
+  const skip = tasteList(skipRaw).map(normText);
+  const cacheKey = seeds.join("|") + "##" + skip.join("|");
+  const hit = TASTE_CACHE[cacheKey];
+  if (hit && Date.now() - hit.at < TASTE_TTL) return hit.v;
+
+  /* ① 种子落成真歌手。解析不出来的直接跳过（不拿原词硬凑）。
+     ⚠️ 必须并发：一个种子两次请求，8 个种子串行就是十几趟往返，
+        手机上要等十秒以上（表现为「为你推荐」一直转圈）。
+        并发后本机冷启动 4.6s → 2s 出头。 */
+  const settled = await Promise.all(seeds.map((s) =>
+    tasteResolveSeed(s).then((name) => name).catch(() => "")
+  ));
+  const resolved = [];
+  const seen = {};
+  for (let i = 0; i < settled.length; i++) {
+    const name = settled[i];
+    if (!name) {
+      console.log("[粽子] 种子无效，跳过: " + seeds[i]);
+      continue;
+    }
+    const key = normText(name);
+    if (!key || seen[key]) continue;
+    if (skip.indexOf(key) >= 0) continue;
+    seen[key] = 1;
+    resolved.push(name);
+  }
+  if (!resolved.length) return { seeds: [], artists: [], songs: [], empty: true };
+
+  /* ② 每位歌手：歌单共现（找同档的人）+ 自己的热门曲。
+     同样并发 —— tasteFindArtist 命中 24h 缓存时不发请求，
+     首次则是一次搜索，并发能省掉大半等待。 */
+  const infos = await Promise.all(resolved.map((n) => tasteFindArtist(n).catch(() => null)));
+  const seedArtists = [];
+  for (let i = 0; i < infos.length; i++) {
+    const info = infos[i];
+    if (!info || Number(info.musicSize || 0) < 3) continue;
+    seedArtists.push({
+      id: String(info.id), name: info.name,
+      size: Number(info.musicSize || 0), albumSize: Number(info.albumSize || 0),
+    });
+  }
+  /* 种子里有一半解析不出真歌手（比如全被「不想听到」排掉了），或者
+     全都查不到曲库 → 直接判空，别拿空列表往下算。
+     踩过的坑：这里不断开时，后面的步骤全都拿空数组继续跑，
+     最后返回一个 songs 为空的画像，调用方拿到 0 首的歌单再取详情就崩。 */
+  if (!seedArtists.length) return { seeds: [], artists: [], songs: [], empty: true };
+  const coLists = await Promise.all(seedArtists.map((a) => tasteCoArtists(a.name)));
+
+  /* ③ 共现结果合并。可信度 = 横跨了几张歌单 × 被几位种子带出来。
+     ⚠️ 「被几位种子带出来」是防止某一位种子的私单把榜单带偏；
+        「横跨几张歌单」是防止刷单号。两个都是分布指标，不是热度指标 ——
+        热度（累计歌数）在这里几乎没用，刷单号能把它的数字堆得很高。 */
+  /* ⚠️ 种子之间必须互相排除。踩过的坑：三位种子会同时出现在同一批歌单里
+     （「林俊杰＋周杰伦＋陈奕迅＋薛之谦」这种），于是它们互相把对方的
+     权重顶到满分，占掉前 24 个候选名额，把真正的相似歌手（蔡依林、
+     G.E.M. 这些）挤出去 —— 表现为「相似歌手只有 2 个」。
+     排除之后权重才反映「有多少个**非种子**环境里出现」。 */
+  const merged = {};
+  for (let i = 0; i < coLists.length; i++) {
+    const list = coLists[i];
+    for (let j = 0; j < list.length; j++) {
+      const key = normText(list[j].name);
+      if (!key || key.length < 2) continue;
+      if (skip.indexOf(key) >= 0) continue;
+      if (seen[key]) continue;                 // 种子自己不算相似
+      merged[key] = merged[key] || { name: list[j].name, n: 0, sheets: 0, seeds: 0 };
+      merged[key].n += list[j].n;
+      merged[key].sheets = Math.max(merged[key].sheets, list[j].sheets || 0);
+      merged[key].seeds += 1;
+    }
+  }
+  const cands = Object.keys(merged)
+    .map((k) => merged[k])
+    /* 至少要在 2 张歌单里出现过才算候选：只在单张里出现的基本是私单噪声 */
+    .filter((x) => x.sheets >= 2)
+    .sort((a, b) => ((b.seeds * 10 + b.sheets) - (a.seeds * 10 + a.sheets)) || (b.n - a.n))
+    .slice(0, 30);
+
+  /* ④ 校验：名字得对得上、曲库得有规模。这一步专治共现里的杂名
+     （实测未过滤时榜首是「扎进心脏的智齿」这种私人号，
+      过滤后剩下的才是林俊杰 / 薛之谦 / 蔡依林）。 */
+  /* 校验同样并发跑：cands 最多 30 个，串行就是 30 趟往返。
+     并发后仍按原顺序过滤，结果和串行完全一致（tasteFindArtist 有缓存，
+     同一名字不会重复请求）。 */
+  const candInfos = await Promise.all(cands.map((c) =>
+    tasteFindArtist(c.name).catch(() => null)
+  ));
+  const checked = [];
+  for (let i = 0; i < cands.length; i++) {
+    const info = candInfos[i];
+    if (!info) continue;
+    const size = Number(info.musicSize || 0);
+    if (size < 8) continue;
+    /* 翻奏 / 伴奏 / 纯音乐号整位排除。
+       ⚠️ 实测：「Piano Echoes」靠曲子里的原唱关系被共现带进周杰伦的圈，
+          它自己有 3168 首、专辑 237 张，规模判据完全拦不住；但它出的
+          全是《青花瓷 (Piano Ver.)》这种翻奏，用户点进「因为你在听
+          周杰伦」看到一排钢琴版，会以为推荐坏了。
+          判据看名字，因为这类号一定会把「翻奏」写进名字（不然没人搜得到）。 */
+    if (TASTE_COVER_NAME.test(String(info.name || ""))) continue;
+    checked.push({
+      id: String(info.id), name: info.name, size: size,
+      albumSize: Number(info.albumSize || 0),
+      weight: cands[i].seeds * 10 + cands[i].sheets,
+    });
+    if (checked.length >= 12) break;
+  }
+
+  /* ⑤ 取曲：种子歌手全带，相似的按权重补位，避免整单都是同一个人 */
+  const artists = seedArtists.concat(checked);
+  const jobs = artists.map((a) => tasteArtistSongs(a.id, 20).then((s) => ({ a: a, s: s })));
+  const got = await Promise.all(jobs);
+
+  /* ⑤b 原创占比闸门：整批热门里「主唱就是本人」的比例太低，说明这是个
+     蹭歌号（热门全靠在别人歌里挂名），整位踢掉。
+     ⚠️ 实测「姜辰辰」50 首热门里有一半主唱不是自己，靠曲名过滤只能
+        压掉一部分（《网抑热播伤感合集》《如果忧郁是天赋》这类名字
+        干干净净、完全没有翻唱标记）。曲名这条路走不通，只能看结构。
+     阈值 0.5 的依据：正常人 44/50≈0.88，草东 24/24，而这类号不到一半。 */
+  for (let i = seedArtists.length; i < got.length; i++) {
+    const g = got[i];
+    if (!g.s.length) continue;
+    const want = normText(g.a.name);
+    let own = 0;
+    let short = 0;
+    for (let j = 0; j < g.s.length; j++) {
+      const main = normText(splitSingers(g.s[j].artist)[0] || g.s[j].artist || "");
+      if (main && (main.indexOf(want) >= 0 || want.indexOf(main) >= 0)) own += 1;
+      /* 90 秒以下的算「碎片」。短视频号会把一整首歌剪成几十个片段发，
+         正经歌手的热门里几乎不会有。 */
+      if (g.s[j].duration && g.s[j].duration < 90000) short += 1;
+    }
+    /* 判据（满足任一就踢）：
+       ① 原创占比 < 50% —— 蹭歌号（热门一半是别人的歌）
+       ② 碎片率 > 15% —— 短视频搬运号
+         实测：姜辰辰 20 首热门里 4 首短于 90 秒（20%），
+         周深 0/50、华晨宇 0/50、草东 0/24。
+     ⚠️ 不设「专辑数多就豁免」：姜辰辰有 127 张「专辑」，
+        但那些是单曲发行堆出来的（每首歌发一张），数量上比
+        周杰伦（42 张）还多，用它做豁免等于给搬运号开后门。
+       ⚠️ 也不设「原创占比豁免」：初音ミク这类合成音声的主唱字段
+        常挂制作人名字，占比只有 1/20 —— 但它名下有几千首、
+        在多个歌手的歌单里稳定共现，碎片率是 0，靠 ② 这条判据放行。 */
+    const bad = (own / g.s.length < 0.5) || (short / g.s.length > 0.15);
+    if (bad) {
+      console.log("[粽子] 画像剔除搬运号: " + g.a.name +
+        "（原创 " + own + "/" + g.s.length + "，碎片 " + short + "/" + g.s.length + "）");
+      g.s = [];
+    }
+  }
+
+  /* ⚠️ 取曲顺序必须先种子、后相似。按「每位歌手轮流取 1 首」时，
+     相似的歌手有十几个，12 轮就被他们填满了，种子歌手拿不到几首 ——
+     实测「因为你在听 周杰伦」里周杰伦只占 3/40。
+     改成两段：种子区间铺满，相似歌手只在后面补位。 */
+
+  /** 某位歌手的曲目过滤出可用列表（去翻奏、去挂名合唱） */
+  function usableSongs(artistName, list, seenId, seenTk) {
+    const want = normText(artistName);
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+      const song = list[i];
+      if (!song || !song.id || seenId[song.id]) continue;
+      /* 翻奏版（《青花瓷 (Piano Ver.)》）和短视频蹭名版（《晴天(抖音热搜版)》）
+         一起压掉 —— 用户要原曲 */
+      const ttl = String(song.title || "");
+      if (TASTE_COVER_TRACK.test(ttl)) continue;
+      if (TASTE_DOUYIN_TAIL.test(ttl)) continue;
+      /* 时长过短的也丢：实测「晴天(抖音热搜版)」只有 36 秒，
+         正经歌不会这么短，这基本就是剪辑片段。 */
+      if (song.duration && song.duration < 70000) continue;
+      /* ⚠️ 挂名合唱要丢掉。实测周杰伦 50 首热门里 39 首的主歌手是
+         蔡依林 / 李玟 / 李荣浩 —— 那是《布拉格广场》这类别人主场、
+         他参与合唱的歌。它们属于对方，硬算成他的歌会让推介失真。 */
+      const mainArtist = normText(splitSingers(song.artist)[0] || song.artist || "");
+      if (mainArtist && want && mainArtist.indexOf(want) < 0 && want.indexOf(mainArtist) < 0) continue;
+      const tkey = normText(song.title) + "|" + mainArtist;
+      if (seenTk[tkey]) continue;
+      seenTk[tkey] = 1;
+      seenId[song.id] = 1;
+      out.push(song);
+    }
+    return out;
+  }
+
+  const seenSong = {};
+  const seenTitle = {};
+  const songs = [];
+  const seedCount = seedArtists.length;
+
+  /* 第一段：种子歌手，每位最多 8 首，按轮次交替取，避免一个人占满 */
+  const seedPools = got.slice(0, seedCount).map((g) => usableSongs(g.a.name, g.s, seenSong, seenTitle));
+  for (let round = 0; round < 8; round++) {
+    for (let i = 0; i < seedPools.length; i++) {
+      if (round < seedPools[i].length) songs.push(seedPools[i][round]);
+    }
+  }
+
+  /* 第二段：相似歌手补位。每人 2 首即可 —— 相似歌手有十几位，
+     每人 4 首会把 40 首的位子占掉大半，种子歌手反而又变稀。
+     目标配比：种子占 60% 左右，其余平摊给相似的歌手。 */
+  const simPools = got.slice(seedCount).map((g) => usableSongs(g.a.name, g.s, seenSong, seenTitle));
+  for (let round = 0; round < 2; round++) {
+    for (let i = 0; i < simPools.length; i++) {
+      if (round < simPools[i].length) songs.push(simPools[i][round]);
+    }
+  }
+
+  const out = {
+    seeds: seedArtists.map((a) => a.name),
+    artists: artists.map((a) => a.name),
+    similar: checked.map((a) => a.name),
+    songs: songs,
+    empty: false,
+  };
+  /* 一首都取不到（种子全是蹭歌号、或者被过滤规则压光了）→ 判空，
+     不缓存空结果之外的东西，也不让调用方拿到一张 0 首的歌单。 */
+  if (!songs.length) {
+    console.log("[粽子] 画像为空：种子都没能取到可用曲目");
+    return { seeds: [], artists: [], songs: [], empty: true };
+  }
+  TASTE_CACHE[cacheKey] = { at: Date.now(), v: out };
+  return out;
+}
+
+/** 用户填的种子（插件设置页里那两项）。
+    ⚠️ 两种取法都得支持：真机沙箱里 env.userVariables 是 getter，
+       而本地 Node 测试只能塞 getUserVariables 函数。 */
+function tasteVars() {
+  try {
+    if (typeof env === "undefined" || !env) return { seeds: "", skip: "" };
+    let vars = null;
+    if (typeof env.getUserVariables === "function") {
+      try { vars = env.getUserVariables(); } catch (e) { vars = null; }
+    }
+    if (!vars || typeof vars !== "object") vars = env.userVariables;
+    if (!vars || typeof vars !== "object") return { seeds: "", skip: "" };
+    return { seeds: vars.tasteSeeds || "", skip: vars.tasteSkip || "" };
+  } catch (e) { return { seeds: "", skip: "" }; }
+}
+
+/* 「为你推荐」在标签栏里的 id。用不可能和平台分类撞车的前缀，
+   与 mix: / applaylist: 那套自造 id 的策略一致。 */
+const TAG_TASTE = "taste:for-you";
+const TASTE_PREFIX = "taste:";
+const TASTE_SHEET_TRACKS = 40;
+
+/* 画像单的 id 里带着「种子指纹」和「第几张」——
+   id 是客户端回传的唯一线索，配方得能自解释，不能在内存里找。
+   指纹只取哈希，不把歌手名写进 id（避免长中文串和特殊字符）。 */
+function tasteFingerprint(seedsRaw, skipRaw) {
+  return recHash("taste|" + tasteList(seedsRaw).join(",") + "|" + tasteList(skipRaw).join(",")).toString(36);
+}
+
+const isTasteId = (id) => String(id || "").indexOf(TASTE_PREFIX) === 0;
+function parseTasteId(id) {
+  const p = String(id || "").slice(TASTE_PREFIX.length).split(":");
+  /* taste:<指纹>:<第几张> */
+  return { fp: p[0] || "", seq: Number(p[1] || 1) };
+}
+
+/* 把画像曲目按「歌手不过密」排一下。逐首挑：优先选和上一首不同歌手的，
+   挑不到就退而求其次 —— 不能让排序把整张单拖成同一人循环。 */
+function tasteArrange(songs, seed) {
+  const out = [];
+  if (!songs || !songs.length) return out;
+  const left = recShuffle(songs, seed);
+  let last = "";
+  while (left.length) {
+    let idx = 0;
+    for (let i = 0; i < left.length; i++) {
+      const k = normText(splitSingers(left[i].artist)[0] || left[i].artist || "");
+      if (k !== last) { idx = i; break; }
+    }
+    const pick = left.splice(idx, 1)[0];
+    last = normText(splitSingers(pick.artist)[0] || pick.artist || "");
+    out.push(pick);
+  }
+  return out;
+}
+
+/** 画像拆成几张单：主单 + 按种子歌手分的分支单，让「为你推荐」不止一张卡 */
+async function tasteSheets() {
+  const tv = tasteVars();
+  const prof = await buildTasteProfile(tv.seeds, tv.skip);
+  if (prof.empty || !prof.songs.length) return [];
+
+  const fp = tasteFingerprint(tv.seeds, tv.skip);
+  const day = recDayKey();
+  const seedNames = prof.seeds.slice(0, 4);
+
+  const out = [];
+  /* ① 主单：全部曲目混排，40 首 */
+  out.push({
+    id: TASTE_PREFIX + fp + ":1",
+    platform: "粽子",
+    title: "为你推荐 · 每日精选",
+    artist: "粽子",
+    artwork: (prof.songs[0] && prof.songs[0].artwork) || "",
+    worksNum: Math.min(prof.songs.length, TASTE_SHEET_TRACKS),
+    playCount: 0,
+    description: tasteBlurb(prof, seedNames),
+    _provider: "taste",
+  });
+
+  /* ② 分支单：每位种子歌手一张，内容是该歌手 + 相似歌手同框，
+     方便想听某一路的时候直接点进去。最多 3 张，再多就没意义了。 */
+  for (let i = 0; i < Math.min(seedNames.length, 3); i++) {
+    const name = seedNames[i];
+    const key = normText(name);
+    const mine = prof.songs.filter((s) => normText(s.artist).indexOf(key) >= 0);
+    const rest = prof.songs.filter((s) => normText(s.artist).indexOf(key) < 0);
+    const list = mine.concat(rest).slice(0, TASTE_SHEET_TRACKS);
+    if (list.length < 5) continue;
+    out.push({
+      id: TASTE_PREFIX + fp + ":" + (i + 2),
+      platform: "粽子",
+      title: "因为你在听 " + name,
+      artist: "粽子",
+      artwork: (mine[0] && mine[0].artwork) || (list[0] && list[0].artwork) || "",
+      worksNum: list.length,
+      playCount: 0,
+      description: name + " 和同档歌手的曲目，共 " + list.length + " 首。每天重排一次。",
+      _provider: "taste",
+    });
+  }
+  return out;
+}
+
+function tasteBlurb(prof, seedNames) {
+  const who = seedNames.join("、");
+  const sim = (prof.similar || []).slice(0, 4).join("、");
+  return "根据你填的种子（" + who + "）推的。" +
+    (sim ? "\n顺着歌单里的同框关系，又找到了 " + sim + " 这些歌手。" : "") +
+    "\n这不是平台算法 —— 插件读不到你的播放历史，只能靠你手填的种子往外扩。" +
+    "想换口味就去插件设置改「口味种子」。";
+}
+
+/** 画像单详情：按 id 里的指纹找回同一种子组合，现算现给 */
+async function tasteSheetDetail(recipe) {
+  const tv = tasteVars();
+  const fp = tasteFingerprint(tv.seeds, tv.skip);
+  const prof = await buildTasteProfile(tv.seeds, tv.skip);
+  if (prof.empty || !prof.songs.length) return null;
+  const day = recDayKey();
+  const seed = ((day * 2654435761) ^ recHash("taste|" + recipe.seq)) >>> 0;
+
+  let list;
+  if (recipe.seq <= 1) {
+    list = prof.songs;
+  } else {
+    const name = (prof.seeds || [])[recipe.seq - 2];
+    if (!name) return null;
+    const key = normText(name);
+    list = prof.songs.filter((s) => normText(s.artist).indexOf(key) >= 0)
+      .concat(prof.songs.filter((s) => normText(s.artist).indexOf(key) < 0));
+  }
+  const musicList = tasteArrange(list, seed).slice(0, TASTE_SHEET_TRACKS);
+  if (!musicList.length) return null;
+
+  const seedNames = (prof.seeds || []).slice(0, 4);
+  const title = recipe.seq <= 1
+    ? "为你推荐 · 每日精选"
+    : "因为你在听 " + (seedNames[recipe.seq - 2] || "");
+  return {
+    isEnd: true,
+    sheetItem: {
+      id: TASTE_PREFIX + fp + ":" + recipe.seq,
+      platform: "粽子",
+      title: title,
+      artist: "粽子",
+      artwork: (musicList[0] && musicList[0].artwork) || "",
+      worksNum: musicList.length,
+      playCount: 0,
+      description: tasteBlurb(prof, seedNames),
+    },
+    musicList: musicList,
+  };
+}
+
+/* ============================================================
  * 评论（getMusicComments）
  *
  * MusicFree 客户端里有「查看评论」入口（歌曲菜单里），
@@ -9538,7 +10201,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.9.34",
+  version: "4.10.0",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -9558,6 +10221,16 @@ module.exports = {
      https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/zongzi.js */
   srcUrl: "https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/zongzimusic.js",
   userVariables: [
+    {
+      key: "tasteSeeds",
+      name: "口味种子（推荐歌单用）",
+      hint: "填你常听的**歌手名**，逗号或顿号分隔，比如：周杰伦，草东没有派对，陈奕迅。最多 8 个。填了之后推荐页顶部会出现「为你推荐」。\n\n⚠️ 要填歌手，不要填歌名。插件拿不到听歌历史（沙箱既没有存储也读不到收藏），只能靠你手填；而按歌名反查原唱这条路在网易上不可靠（搜「晴天」前 30 条全是翻唱版），所以填歌名基本解析不出来，那一项会被跳过。\n\n填得越准，推荐越像你。",
+    },
+    {
+      key: "tasteSkip",
+      name: "不想听到的歌手（可选）",
+      hint: "逗号分隔。这些歌手不会出现在「为你推荐」里，也不会作为相似歌手被扩进来。",
+    },
     {
       key: "feishuWebhook",
       name: "飞书 Webhook（可选）",
@@ -9673,6 +10346,30 @@ module.exports = {
   getMusicComments: musicComments,
   getMusicSheetInfo: async function (sheetItem, page) {
     if (!sheetItem) return null;
+    /* 口味画像单（taste:<指纹>:<第几张>）：按种子现算。
+       沙箱存不下任何东西，所以「画像」不是记忆，而是每次重算的确定性结果。 */
+    if (isTasteId(sheetItem.id)) {
+      try {
+        const d = await tasteSheetDetail(parseTasteId(sheetItem.id));
+        if (d) return d;
+      } catch (e) {
+        console.log("[粽子] 画像单详情失败: " + e.message);
+      }
+      return {
+        isEnd: true,
+        sheetItem: {
+          id: String(sheetItem.id),
+          platform: "粽子",
+          title: sheetItem.title || "为你推荐",
+          artist: "粽子",
+          artwork: sheetItem.artwork || "",
+          worksNum: 0,
+          playCount: 0,
+          description: "种子歌手解析不出来。去插件设置里把「口味种子」填成具体的歌手名试试。",
+        },
+        musicList: [],
+      };
+    }
     /* 自己拼的歌单（mix:<分类>:<天>:<序号>）：id 里有完整配方，
        当场抓歌、按规则重排，不依赖任何平台歌单。 */
     if (isMixId(sheetItem.id)) {
@@ -9842,13 +10539,29 @@ module.exports = {
     return neteaseSheetDetail(id, 1).catch(() => null);
   },
   /* 「推荐歌单」页入口。tag 就是网易歌单广场的分类，
-     按语种/风格/场景/情感/主题分好组，和 App 原生观感一致。 */
+     按语种/风格/场景/情感/主题分好组，和 App 原生观感一致。
+     填了种子歌手的话，顶上加一个「为你推荐」的固定位。 */
   getRecommendSheetTags: function () {
-    return neteaseRecommendTags().catch((e) => {
+    const tv = tasteVars();
+    const seeds = tasteList(tv.seeds);
+    const skip = tasteList(tv.skip).map(normText);
+    /* 「有你」= 至少有一个种子没被排除名单吃掉。
+       ⚠️ 这个判断故意不做成「种子能解析成真歌手」——那要联网验一遍，
+          会让整个标签栏等好几秒。宁可先放上去：真解析不出来时
+          点进去是空列表（不崩、不报错），比标签栏每次打开卡三秒好。
+          唯一的例外是「种子全被自己排掉」这种一眼就定的情况。 */
+    const hasTaste = seeds.some((s) => skip.indexOf(normText(s)) < 0);
+    return neteaseRecommendTags().then((tags) => {
+      if (!hasTaste) return tags;
+      const pinned = (tags && tags.pinned) || [];
+      return Object.assign({}, tags, {
+        pinned: [{ id: TAG_TASTE, title: "为你推荐" }].concat(pinned),
+      });
+    }).catch((e) => {
       console.log("[粽子] 推荐 tag 失败: " + e.message);
       /* 兜底：至少给几个能点的分类，别让页面空着 */
       return {
-        pinned: [{ id: "全部", title: "热门" }],
+        pinned: (hasTaste ? [{ id: TAG_TASTE, title: "为你推荐" }] : []).concat([{ id: "全部", title: "热门" }]),
         data: [{ title: "分类", data: NE_SHEET_CATS.map((c) => ({ id: c, title: c })) }],
       };
     });
@@ -9858,6 +10571,18 @@ module.exports = {
   getRecommendSheetsByTag: async function (tag, page) {
     const p = Number(page) > 0 ? Number(page) : 1;
     const name = (tag && (tag.id || tag.title)) || "";
+    /* 「为你推荐」不是平台标签，而是按用户填的种子现算的画像单。
+       放在最前，翻页时给空（画像单就那几张，翻不出新的）。 */
+    if (name === TAG_TASTE) {
+      if (p > 1) return { isEnd: true, data: [] };
+      try {
+        const sheets = await tasteSheets();
+        return { isEnd: true, data: sheets };
+      } catch (e) {
+        console.log("[粽子] 画像歌单失败: " + e.message);
+        return { isEnd: true, data: [] };
+      }
+    }
     try {
       const pool = await recSheetPool(name);
       const start = (p - 1) * REC_SHEET_PAGE_SIZE;
