@@ -6817,7 +6817,7 @@ const COVER_CDN = "https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugi
  * ============================================================ */
 /* fb-02 / fb-03 还没画，先把图名留在这儿占位：
    文件没上传到仓库前不能挂进列表，否则 404 的卡片比灰块更难看。 */
-const FB_ART_COVERS = ["fb-01.jpg"];
+const FB_ART_COVERS = ["fb-02.jpg"];
 
 function fbHash(str) {
   let h = 2166136261;                       /* FNV-1a，够散且不用 crypto */
@@ -11648,7 +11648,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.11",
+  version: "4.10.12",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
