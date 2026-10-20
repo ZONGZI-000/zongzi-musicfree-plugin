@@ -1419,8 +1419,21 @@ async function qqArtistProbe(q) {
       }
       if (!main) continue;
       if (normTextZ(main) === qn0) { res.exact = true; continue; }
-      /* 没有括号译名时，主名要跟查询词有 2 字连续重合才收
-         （防止搜「晴天」时把 QQ 里同名的野鸡歌手当成译名）。 */
+      /* 别名只能是「跨文字体系的另一种写法」，不能是「名字里多一个字」。
+
+         ⚠️ 踩过两次：搜「赵薇」，QQ 的歌手接口按分词返回
+            「赵薇风」(75 首) /「赵薇琳」(0 首) /「赵雪薇」/「赵紫薇」。
+            旧判据「LCS ≥ 2 字」把它们全收进别名表，
+            紧接着 pickEffectiveName 拿「赵薇风」去酷狗一验 —— 真有这位，
+            于是整个查询被改写成「赵薇风」，歌手页只剩她和 0 首的赵薇琳。
+            用户看到的就是「搜赵薇出来两个陌生人」。
+
+            真别名长什么样：L'Arc〜en〜Ciel ↔ 彩虹乐队（拉丁↔中文）、
+            IGU Band ↔ 那我懂你意思了。都是**换了一套文字**，
+            不是「原名再添一个字」。中文名多一个字就是另一个人。 */
+      const mainIsCJK = /^[\u4e00-\u9fff]+$/.test(main);
+      const queryIsCJK = /^[\u4e00-\u9fff]+$/.test(q);
+      if (mainIsCJK && queryIsCJK) continue;   // 纯中文之间只认全等（上面已处理）
       if (lcsLen(q, main) >= 2 && res.names.indexOf(main) < 0) res.names.push(main);
     }
   } catch (e) { /* 拿不到就交出空结果 */ }
@@ -11699,7 +11712,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.13",
+  version: "4.10.14",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
