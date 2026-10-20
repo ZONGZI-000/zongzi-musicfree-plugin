@@ -1243,8 +1243,18 @@ function relevanceExtra(title, query, artist, artistQuery) {
     }
     if (best < 0 || score < best) best = score;
   }
-  return best < 0 ? 0 : best;
+  /* ⚠️ 一个都没命中时不能返回 0（2026-10-21）。
+     extra 的语义是「比查询词多出来几个字」，越小越靠前；而 0 是**最靠前**
+     的值。于是「标题里根本没有查询词」的条目反而排到了
+     「起风了(伴奏)」(多 3 个字) 前面 —— 实测搜「起风了」，
+     《飞机云(电影《起风了》插曲)》排在《起风了(伴奏)》上面；
+     搜「后来」，《未来へ》排在《后来 (翻唱)》上面。
+     没命中的给个大值沉到本档末尾（比资讯的 999 小），
+     这样同档里「沾边的、字数少的」先出来，顺序就不再是随机的。 */
+  return best < 0 ? NO_MATCH_EXTRA : best;
 }
+/** relevanceExtra 里「标题跟查询词完全没关系」的罚分（小于资讯的 999） */
+const NO_MATCH_EXTRA = 700;
 
 
 /* ============================================================
@@ -1903,33 +1913,64 @@ function nameMatchesAny(name, names) {
   return false;
 }
 
-/** 歌手条目排序：在原来 rankByName 的基础上，多认两个信号 ——
- *   ① 权威原名（QQ 的「原名 (译名)」写法）压在译名同名条目之前
- *   ② 作品多的更可能是正经歌手（128 首的山寨号 vs 613 首的本尊）
- *  没有别名时不会走到这里（见 searchArtist 里的 names.length > 1 判断），
- *  所以老行为一个字都不变。 */
-function rankArtistCandidates(list, query, names, authNames) {
+/** 歌手条目排序（**统一入口**，有别名和没别名都走这里）。
+ *
+ *  用户的要求（2026-10-21）：
+ *    「按顺序排，两个字在前三个字在后都是可以理解的，参考 LX Music，
+ *      他就是短的在前长的在后。」
+ *
+ *  所以档位分明之后，**同一档里名字短的排前面**，长名 / 带前后缀的往后站。
+ *  原来那版是加减分制（完全匹配 +100、多一个字 -2、酷我再 +5），
+ *  分差太小 —— 实测搜「彩虹乐队」，YouTube 的「L'Arc-en-Ciel」(13 字)
+ *  排在「彩虹乐队」(4 字) 前面；搜「GEM」，5 字的「宝石Gem」排在
+ *  4 字的「Gem浩」前面。加减分怎么调都会在别处翻车，
+ *  干脆把「长度」提成独立的比较键。
+ *
+ *  档位（越大越前）：
+ *    4  权威原名 —— QQ 括号译名声明过的本名（彩虹乐队 → L'Arc-en-Ciel）
+ *    3  名字跟查询词完全一样
+ *    2  名字跟某个别名完全一样
+ *    1  名字里**包含**查询词/别名（「mc邓丽君」「165.邓丽君」这类）
+ *    0  只在作品数 / 频道名上沾边（YouTube 的「Teresa Teng 老歌精選」）
+ */
+function sortArtistResults(list, query, names, authNames) {
   const qz = normTextZ(query);
+  const alias = (names || []).map(normTextZ).filter(Boolean);
   const auth = (authNames || []).map(normTextZ).filter(Boolean);
-  return list.map((x) => {
-    const nz = normTextZ(x.name);
-    let sc = 0;
-    if (nz === qz) sc += 100;
-    else if (nz.indexOf(qz) >= 0) sc += 55;
-    else sc += 20;                       // 只是命中了别名
+  if (qz && alias.indexOf(qz) < 0) alias.push(qz);
+
+  const nameOf = (x) => normTextZ(x.name);
+  const cls = (x) => {
+    const nz = nameOf(x);
+    if (!nz) return 0;
+    /* 权威原名只在「换了一套写法」时才算最高档：
+       彩虹乐队 → L'Arc-en-Ciel（跟查询词毫无重叠，不顶上来用户认不出）
+       ⚠️ 但「邓紫棋 → G.E.M.邓紫棋」这种只是**在原名前加了拉丁前缀**，
+          它跟查询词是包含关系 —— 当成「包含」档处理，让长度说话，
+          否则用户会看到长的排前面，跟「短的在前」正好相反。 */
     for (let i = 0; i < auth.length; i++) {
-      if (nz === auth[i]) { sc += 120; break; }
-      if (nz.indexOf(auth[i]) >= 0) { sc += 60; break; }
+      if (nz === auth[i] && !(qz && (nz.indexOf(qz) >= 0 || qz.indexOf(nz) >= 0))) return 4;
     }
-    sc -= Math.max(0, nz.length - qz.length) * 2;
-    if (x.platform === "酷我") sc += 5;
-    if (x._official) sc += 40;
-    if (x.platform === "咪咕直出" && nz !== qz) sc -= 15;
-    // 作品数只当小权重（最多 10 分），不能盖过名字匹配
-    const w = Number(x.worksNum || 0);
-    if (w > 0) sc += Math.min(10, (Math.log(w) / Math.LN10) * 6);
-    return { x: x, sc: sc };
-  }).sort((a, b) => b.sc - a.sc).map((y) => y.x);
+    if (nz === qz) return 3;
+    for (let i = 0; i < alias.length; i++) if (nz === alias[i] && !qz) return 2;
+    for (let i = 0; i < alias.length; i++) {
+      if (alias[i] && nz.indexOf(alias[i]) >= 0) return 1;
+    }
+    return 0;
+  };
+  /* 长度用归一化后的名字：括号里的补充说明不算长度
+     （「冯沁苑(买辣椒也用券)」按 3 个字算，跟「冯沁苑」一样长）。 */
+  return list.map((x) => ({ x: x, c: cls(x), L: nameOf(x).length }))
+    .sort((a, b) => {
+      if (a.c !== b.c) return b.c - a.c;      // ① 匹配档位
+      if (a.L !== b.L) return a.L - b.L;      // ② 同档里短的在前（用户要的）
+      // ③ 并列时的细排：官方号 > 酷我（字段最全）> 作品多的
+      const oa = a.x._official ? 1 : 0, ob = b.x._official ? 1 : 0;
+      if (oa !== ob) return ob - oa;
+      const pa = a.x.platform === "酷我" ? 1 : 0, pb = b.x.platform === "酷我" ? 1 : 0;
+      if (pa !== pb) return pb - pa;
+      return Number(b.x.worksNum || 0) - Number(a.x.worksNum || 0);
+    }).map((y) => y.x);
 }
 
 /** 决定「真正要拿去搜的名字」。
@@ -5798,13 +5839,13 @@ async function searchArtist(query, page) {
     } catch (e) { /* 拿不到就维持空结果 */ }
   }
 
-  /* 排序：
-     没换名、也没别名 → 走原来的 rankByName，老行为一个字不变。
-     有别名时改用 rankArtistCandidates —— 它会把「QQ 声明的原名」
-     （彩虹乐队 → L'Arc〜en〜Ciel）顶到山寨同名号前面。 */
-  const ranked = (pick.names.length > 1 || (pick.auth && pick.auth.length))
-    ? rankArtistCandidates(out, query, pick.names, pick.auth)
-    : rankByName(out, query, "name");
+  /* 排序：统一走 sortArtistResults（2026-10-21）。
+     原来分两条路 —— 没别名用 rankByName、有别名用 rankArtistCandidates，
+     两条各自加减分，结果「同档里名字短的排前面」这条规则两边都没有，
+     于是搜「彩虹乐队」时 13 字的 L'Arc-en-Ciel 压着 4 字的彩虹乐队。
+     现在档位（权威原名 > 全等 > 别名全等 > 包含 > 沾边）之后直接比长度，
+     短的在前，跟 LX Music 一样。 */
+  const ranked = sortArtistResults(out, query, pick.names, pick.auth);
   const deduped = dedupeArtists(ranked);
 
   /* 咪咕的歌手数据只有 id/name/highlightStr 三个字段（没有作品数、没有头像），
@@ -9725,6 +9766,14 @@ function compareRank(a, b) {
   // bone 越小越好（官方发行版）
   const ba = a._bone || 0, bb = b._bone || 0;
   if (ba !== bb) return ba - bb;
+  /* 同档同匹配度、同官方性时，标题短的排前面（2026-10-21）。
+     用户的要求：「参考 LX Music，他就是短的在前长的在后」。
+     放在 bone 之后是有意的：先把「这首到底是不是正式发行」排明白，
+     再在同等可信的条目里按长度收尾 —— 否则一段 Live 演出的长标题
+     会靠字数优势压到真正的短标题原曲前面。
+     实测收益：搜「晴天」时「Nocturne No.13…」这类长标题不再混进前排。 */
+  const tla = normTextZ(a.title).length, tlb = normTextZ(b.title).length;
+  if (tla !== tlb) return tla - tlb;
   // 播放量微调
   const ha = a._hot || 0, hb = b._hot || 0;
   if (ha !== hb) return hb - ha;
@@ -11780,7 +11829,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.15",
+  version: "4.10.16",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
