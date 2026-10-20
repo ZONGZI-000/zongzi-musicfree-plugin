@@ -855,12 +855,42 @@ function artistConsistent(others, artistNorm) {
   return false;
 }
 
+/** 标题里写了歌手名，算不算「歌手对得上」。
+ *
+ *  ⚠️ 为什么需要这条（实测 2026-10-21 搜「赵薇 左耳」）：
+ *     赵薇那首《左耳》在内地四平台**没有版权**，返回的 60 多条全是别人的翻唱
+ *     （井上苑子 / 蔡易欢 / 张小花…）。真正有她声音的只有 YouTube 和 B 站
+ *     那几条搬运：标题写着「《左耳》-赵薇」「赵薇 - 左耳」，
+ *     而 artist 字段是频道名（VOLVO劲浪乌托邦声浪舱 / BELLA PING MUSIC CHANNEL 2）。
+ *
+ *     原来的判据只看 artist 字段 → 这些条目跟「井上苑子」那批**判成同一档、
+ *     同样罚 40 分**，然后靠数组顺序随机排列，用户翻半天找不到原唱。
+ *
+ *  ⚠️ 但必须防两类误伤：
+ *     ① 版本词当歌手：搜「起风了 live」，others 里是 live，
+ *        任何标题带 Live 的都会被判成「歌手对得上」→ 挡住变体词。
+ *     ② 翻唱照抄原唱名：已经在 isCoverTitle 那一层判成 1 档，
+ *        轮不到这里（「左耳（cover 赵薇）」不会因为标题有赵薇就升档）。
+ */
+function titleMentionsArtist(others, titleRaw) {
+  if (!others || !others.length) return false;
+  const t = singerNorm(titleRaw);
+  if (!t) return false;
+  for (let i = 0; i < others.length; i++) {
+    const tok = String(others[i] || "");
+    if (!tok || tok.length < 2) continue;
+    if (VARIANT_RE.test(tok) || isCoverTitle(tok)) continue;   // ①
+    if (t.indexOf(singerNorm(tok)) >= 0) return true;
+  }
+  return false;
+}
+
 /** 歌手没对上的罚分，只在 2 档内部生效：歌名一样但换了人的排后面 */
 const ARTIST_MISS_PENALTY = 40;
 
 /** 标题里的「这是资讯/视频，不是歌」字样。
  *  搜歌手名时全靠它把八卦新闻从歌曲堆里挑出来压下去。 */
-const NEWS_TITLE_RE = /破防|亮立场|立场|出征|集体|网友|网友笑|笑死|翻车|卖台|表态|回應|回应|新聞|新闻|大白話|大白话|譴責|谴责|統一|统一|門票|门票|演唱會門票|票價|票价|專訪|专访|爆料|怒斥|崩潰|崩溃|打臉|打脸|專輯發|专辑发|新歌|首發|首发|破億|破亿|霸榜|熱搜|热搜|網亮|网亮|主播|直播回放|太惨|太慘|卖不出去|賣不出去|降价|降價|綠媒|绿媒|中天|三立|民視|民视|TVBS|東森|央視|央视|新華社|新华社|網紅|网红|洗版|吵翻|吵翻天|炸鍋|炸锅|政治|選情|选情|罷免|罢免|立委|議員|议员|部長|部长|總統|总统|中共|解放軍|解放军|軍演|军演|外交|國防|国防|關稅|关税/i;
+const NEWS_TITLE_RE = /苹果日报|蘋果日報|联合报|聯合報|自由时报|自由時報|中国时报|中國時報|星岛|星島|明报|明報|东森新闻|東森新聞|三立新闻|三立新聞|娱乐新闻|娛樂新聞|新浪娱乐|新浪娛樂|网易娱乐|網易娛樂|腾讯娱乐|騰訊娛樂|日报|日報|晚报|晚報|周刊|週刊|专访|專訪|破防|亮立场|立场|出征|集体|网友|网友笑|笑死|翻车|卖台|表态|回應|回应|新聞|新闻|大白話|大白话|譴責|谴责|統一|统一|門票|门票|演唱會門票|票價|票价|爆料|怒斥|崩潰|崩溃|打臉|打脸|專輯發|专辑发|新歌|首發|首发|破億|破亿|霸榜|熱搜|热搜|網亮|网亮|主播|直播回放|太惨|太慘|卖不出去|賣不出去|降价|降價|綠媒|绿媒|中天|三立|民視|民视|TVBS|東森|央視|央视|新華社|新华社|網紅|网红|洗版|吵翻|吵翻天|炸鍋|炸锅|政治|選情|选情|罷免|罢免|立委|議員|议员|部長|部长|總統|总统|中共|解放軍|解放军|軍演|军演|外交|國防|国防|關稅|关税/i;
 
 /* ============================================================
  * 「这条根本不是歌」的识别（不分搜歌名还是搜歌手）
@@ -883,7 +913,17 @@ const NON_MUSIC_VIDEO_RE = /水晶球|占卜|塔罗|塔羅|星座|冥想|催眠|
  * 所以 NON_MUSIC_VIDEO_RE 那条「artist 里没有歌手名」的前提挡不住它。
  * 这一条**不看 artist**，只看标题，要求去掉查询词后还剩 ≥6 字：
  * 《幕后玩家》《首播》这种歌名本身带这些字时不会被误杀。 */
-const MEDIA_VIDEO_RE = /幕后|幕後|花絮|混剪|首播|预告|預告|抢先看|搶先看|彩蛋|彩排|探班|采访|採訪|专访|專訪|片段|剪辑|剪輯|未公开|未公開|reaction|instrumental|纯音乐|純音樂/i;
+const MEDIA_VIDEO_RE = /幕后|幕後|花絮|混剪|首播|预告|預告|抢先看|搶先看|彩蛋|彩排|探班|采访|採訪|专访|專訪|片段|剪辑|剪輯|未公开|未公開|reaction|instrumental|纯音乐|純音樂|发布会|發布會|记者会|記者會|首映|见面会|見面會/i;
+
+/* 新闻媒体署名。
+ * 实测搜「赵薇 左耳」，第 9 条是
+ *   蘇有朋處女導《左耳》操瘦6公斤　不敢與趙薇比較 -- 蘋果日報 20141119
+ * 它标题里既有歌名又有歌手名，上面所有针对性规则都放它过去，
+ * 于是稳稳排进「能听的原唱」那一段。但它是一条娱乐新闻。
+ *
+ * 只在**视频平台**上、且去掉歌名歌手后还剩 ≥6 字时才判 ——
+ * 《新闻》这种真歌名（长度短、没有媒体署名）不会被误杀。 */
+const NEWS_SOURCE_RE = /蘋果日報|苹果日报|聯合報|联合报|自由時報|自由时报|中國時報|中国时报|星島|星岛|明報|明报|東森新聞|东森新闻|三立新聞|三立新闻|蘋果新聞|苹果新闻|新浪娱乐|新浪娛樂|網易娛樂|网易娱乐|騰訊娛樂|腾讯娱乐|娱乐新闻|娛樂新聞|新聞網|新闻网|新聞台|新闻台|电视台|電視台|[日週周]报|晚报|晚報|周刊|週刊/i;
 
 /** 查询词整串是否就是这位歌手的名字（搜「周杰伦」而不是搜某首歌）。
  *  ⚠️ 只认整串、且长度 ≥2，避免「起风了 买辣椒也用券」这种组合串误判。 */
@@ -1036,15 +1076,30 @@ function relevanceTier(title, query, artist, artistQuery, titleQuery) {
   for (let i = 0; i < cands.length; i++) {
     const c = cands[i];
     if (!c.text) continue;
-    // 这一截是歌名，剩下那截得在歌手名里对得上，才算完全匹配
-    const artistOk = artistConsistent(c.others, at);
+    /* 这一截是歌名，剩下那截得在歌手名里对得上，才算完全匹配。
+       ⚠️ 除了 artist 字段，标题里写着歌手名的也算 ——
+         版权缺失只有搬运版时（赵薇《左耳》），artist 是频道名，
+         只认 artist 会把唯一能听的原唱跟一堆翻唱判成同一档。 */
+    const artistInTitle = titleMentionsArtist(c.others, raw);
+    const artistOk = artistConsistent(c.others, at) || artistInTitle;
     if (flat === c.text) {
       // 「起风了」对「起风了」；「起风了（2019版）」多出六个字，不算
       const t = artistOk ? 3 : 2;
       if (t > best) best = t;
       if (best === 3) return 3;
     } else if (c.text.length >= 2 && core.indexOf(c.text) >= 0) {
-      if (best < 2) best = 2;
+      /* 歌名对上了、歌手名也写在标题里 → 这条就是「这首歌 + 这个人」，
+         跟标题正好等于歌名的条目同级。
+         ⚠️ 为什么不再压成 2 档（实测「赵薇 左耳」）：
+            内地四平台没版权，能听的原唱全在 YouTube/B站搬运，
+            标题必然是「《左耳》-赵薇」这种「歌名 + 歌手」写法，
+            永远对不上「标题正好等于歌名」。压成 2 档后，
+            它们跟「左耳 / 井上苑子」那批翻唱同档，只能靠罚分分出高下，
+            用户翻了十几条才看到第一条能听的。
+         歌手只在标题里（artist 是频道名）才算 —— 上面 artistInTitle
+         已经挡掉了版本词和「cover 赵薇」这类翻唱标记。 */
+      if (artistInTitle) { if (best < 3) best = 3; }
+      else if (best < 2) best = 2;
     }
   }
   return best;
@@ -1174,7 +1229,10 @@ function relevanceExtra(title, query, artist, artistQuery) {
   for (let i = 0; i < cands.length; i++) {
     const c = cands[i];
     if (!c.text || c.text.length < 2) continue;
-    const artistOk = artistConsistent(c.others, at);
+    /* 同上：标题里写着歌手名也算对得上。
+       否则「《左耳》-赵薇」（频道名当 artist）跟「左耳/井上苑子」
+       同样罚 40 分，只能靠数组顺序排 —— 用户就在一堆翻唱里翻不到原唱。 */
+    const artistOk = artistConsistent(c.others, at) || titleMentionsArtist(c.others, raw);
     let score;
     if (flat === c.text) {
       score = artistOk ? 0 : ARTIST_MISS_PENALTY;
@@ -10264,6 +10322,16 @@ async function searchMusicAll(query, page) {
       const residual2 = coreTitle(it.title).replace(qcore, "").length;
       if (residual2 >= 6) { droppedNews++; continue; }
     }
+    /* 新闻媒体署名的视频 —— 同上，是娱乐新闻不是歌。
+       实测搜「赵薇 左耳」，苹果日报那条《蘇有朋處女導《左耳》操瘦6公斤
+       　不敢與趙薇比較》标题里歌名歌手全齐，前面几条规则一个都拦不住，
+       结果它稳稳挤进「能听的原唱」那一段。
+       ⚠️ 判据要「去掉歌名歌手后还剩 6 字以上」——《新闻》这种真歌名不算。 */
+    if (!it._guichu && (it.platform === "YouTube" || it.platform === "Bilibili") &&
+        NEWS_SOURCE_RE.test(it.title)) {
+      const residual3 = coreTitle(it.title).replace(qcore, "").length;
+      if (residual3 >= 6) { droppedNews++; continue; }
+    }
     const tcore = coreTitle(it.title);
     const tflat = flatTitle(it.title);
     // 判断「这条结果跟查询有没有关系」。
@@ -11712,7 +11780,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.14",
+  version: "4.10.15",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
