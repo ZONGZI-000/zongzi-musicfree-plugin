@@ -1504,9 +1504,30 @@ async function appleArtistAliases(query) {
     const artId = arts[0] && arts[0].artistId ? String(arts[0].artistId) : "";
     const artName = (arts[0] && arts[0].artistName) || "";
 
-    /* ③ 两条证据至少中一条才认这个 id */
+    /* ③ 证据分档，强到弱。**完全同名永远排第一**。
+
+       ⚠️ 踩过的大坑（搜「赵薇」）：
+         专辑结果 10 条里 8 条属于「趙薇薇」—— 一位抖音翻唱歌手，
+         名字只比「赵薇」多一个字，459 首作品；赵薇本人只有 1 张
+         《天使旅行箱》。旧逻辑第一条判据是「专辑数量压倒性 + 名字含查询词」，
+         「趙薇薇」两条全中（含「赵薇」），于是把它当成赵薇的正式身份，
+         反查结果被改写成「赵薇薇」—— 歌手页只剩那个翻唱号，
+         专辑页全是《断送青春爱错人》《别让爱凋落》这种。
+         可艺人实体搜索的第一条恰好就是「趙薇」，一字不差。
+         名字完全一致这个证据，比「谁专辑多」硬得多 —— 名字多一个字
+         就是另一个人，不是同一个人。 */
+    let exactArt = null;
+    for (let i = 0; i < arts.length; i++) {
+      if (arts[i].artistId && normTextZ(arts[i].artistName) === qn) {
+        exactArt = arts[i];
+        break;
+      }
+    }
+
     let pickId = "";
-    if (domId && domN >= 2 && share >= 0.25 && (domId === artId || normTextZ(byId[domId].name).indexOf(qn) >= 0)) {
+    if (exactArt) {
+      pickId = String(exactArt.artistId);   // 艺人实体跟查询词完全同名 → 本尊
+    } else if (domId && domN >= 2 && share >= 0.25 && (domId === artId || normTextZ(byId[domId].name).indexOf(qn) >= 0)) {
       pickId = domId;                       // 专辑压倒性 + 艺人实体对得上
     } else if (artId && artName && normTextZ(artName).indexOf(qn) >= 0) {
       pickId = artId;                       // 艺人实体自己就含查询词
@@ -5056,7 +5077,17 @@ async function searchAlbum(query, page) {
        搜「后来」，Apple 把它认成歌手「後來者」（15 张专辑 45 首 → 全过），
        然后专辑页只剩《何时了却这牵挂》《未了的缘》——刘若英的《后来》
        一张都看不到。 */
-    if (cat && !cat.truncated && cat.albums.length >= 2 && cat.tracks.length >= 10) {
+    /* ⚠️ 专辑数门槛不能再死卡 2 张（搜「赵薇」）：
+       赵薇在 Apple 里只有一张《天使旅行箱》10 首 —— 是货真价实的完整专辑，
+       只是她作品本来就少。卡 2 张就把整个骨架丢掉，专辑页退回
+       酷我/酷狗那堆同名翻唱：《断送青春爱错人》《花开又花谢花满天》
+       《愿你》《秋风经过》，全是「赵薇薇」「赵雪薇」「赵紫薇」的。
+       取而代之的判据：**艺人实体跟查询词完全同名 + 曲目够多（≥10）**。
+       晴天那种同名野鸡歌手只有 3 张 5 首，曲目数过不了；
+       只发过一两张正经专辑的真歌手能过。 */
+    const exactNameIdentity = normTextZ(cat && cat.name) === normTextZ(eq);
+    if (cat && !cat.truncated && cat.tracks.length >= 10
+        && (cat.albums.length >= 2 || exactNameIdentity)) {
       if (await looksLikeSongQuery(eq)) {
         console.log("[粽子]「" + cat.name + "」目录 " + cat.albums.length + " 张，"
           + "但「" + String(query).trim() + "」是歌名 → 不走 Apple 目录");
@@ -5081,7 +5112,17 @@ async function searchAlbum(query, page) {
       if (!parts.length) return false;
       for (let i = 0; i < Math.min(2, parts.length); i++) {
         const a = parts[i];
-        if (a === artistN || a.indexOf(artistN) >= 0 || artistN.indexOf(a) >= 0) return true;
+        /* ⚠️ 这里的包含判断只在「一边是拉丁/纯英文写法」时成立。
+           中文名多一个字就是另一个人：「赵薇薇」包含「赵薇」，
+           于是搜赵薇时专辑页塞满《断送青春爱错人》《花开又花谢花满天》
+           这些抖音翻唱 —— 而赵薇本人只有一张《天使旅行箱》。
+           「陈奕迅 / Eason Chan」这种中英对照写法仍然要留，
+           所以放宽条件设成「其中一边不含 CJK」。 */
+        if (a === artistN) return true;
+        const aHasCJK = /[\u4e00-\u9fff]/.test(a);
+        const nHasCJK = /[\u4e00-\u9fff]/.test(artistN);
+        if (aHasCJK && nHasCJK) continue;          // 两边都是中文 → 只认全等
+        if (a.indexOf(artistN) >= 0 || artistN.indexOf(a) >= 0) return true;
       }
       return false;
     };
@@ -5472,8 +5513,14 @@ async function searchArtist(query, page) {
     if (!id || seen[id]) continue;
     const nm = String(a.ARTIST || a.artist || "").replace(/&nbsp;/g, " ").trim();
     if (!nm) continue;
-    // 只留「名字里真的含查询词/原名」的（允许繁简/大小写差异）
-    if (!nameMatchesAny(nm, nameSet)) continue;
+    /* 只留名字对得上的（允许繁简/大小写差异）。
+       ⚠️ 这里必须用 artistNameOk 而不是 nameMatchesAny：
+          nameMatchesAny 是「包含即通过」，会把「赵薇薇」当成「赵薇」
+          （酷我搜「赵薇」第一条歌手结果就是「赵薇薇」，459 首），
+          于是搜赵薇先跳出一个名字多一个字的别人。
+          artistNameOk 要求完全相等，或者「拉丁前缀 + 中文名」那种
+          写法（g.e.m. 邓紫棋），中文多字一律不算。 */
+    if (!artistNameOk(nm, nameSet, query)) continue;
     seen[id] = 1;
     let pic = a.PICPATH || a.hts_PICPATH || "";
     if (pic && pic.indexOf("http") !== 0) pic = (basePic || "http://img1.kuwo.cn/star/starheads/") + pic;
@@ -5500,6 +5547,10 @@ async function searchArtist(query, page) {
      * 所以必须要求**名字里真的含查询词**（繁简归一后比），才留下。 */
     const nm = String(a.name || "");
     if (!nameMatchesAny(nm, nameSet)) continue;
+    /* ⚠️ 长度松紧度不能替代名字校验：搜「王菲」，咪咕会回「王菲菲」「王菲儿」，
+       长度只多一个字，旧的「≤ 查询词+1」卡不住。这两个是另外的歌手。
+       名字本身必须对得上（全等，或「拉丁前缀 + 中文名」那种写法）。 */
+    if (!artistNameOk(nm, nameSet, query)) continue;
     // 换名搜索时不能再按「查询词长度」卡，否则「ゆらゆら帝国」会被算太长
     if (pick.via && nm.length > eq.length + 1) continue;
     if (!pick.via && nm.length > String(query).length + 1) continue;
@@ -11648,7 +11699,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.12",
+  version: "4.10.13",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
