@@ -932,17 +932,68 @@ const NEWS_SOURCE_RE = /蘋果日報|苹果日报|聯合報|联合报|自由時�
  * 结果里 artist 写着「那我懂你意思了」，光靠字符串包含永远判不出来。 */
 const ARTIST_ALIAS = {};
 
+/** 整串是不是纯中文（汉字）。用来判断「这是换了文字体系的译名」还是「另一个人」。 */
+function isPureCJK(s) {
+  const t = String(s || "").replace(/\s+/g, "");
+  if (!t) return false;
+  return /^[\u4e00-\u9fff]+$/.test(t);
+}
+
+/** ⚠️ 单个名字跟查询词是不是同一个人（不含多人分隔符那一步）。
+ *
+ *  这里曾经是 `an.indexOf(qn) >= 0` —— 包含即通过。后果（实测 2026-10-21
+ *  搜「李志」）：李志辉(264 首) / 李志强 / 李志成 / 李志洲 / 大勇（李志勇）
+ *  / 李志轩 / 李志斌 全部被认成「李志」，一起拿了 3 档，把李志本人的歌
+ *  整片挤出前排 —— 用户看到的第一屏是「天涯 - 李志辉」这种别人的歌。
+ *  同一类问题搜「赵薇」时已经踩过一次（赵薇薇 / 赵薇风），当时只在
+ *  歌手库里加了闸门，**排序这一层漏掉了**。
+ *
+ *  真能算同一个人的写法只有三种：
+ *    A. 完全相等                   周杰伦 / 李志
+ *    B. 拉丁前缀 + 中文名           G.E.M.邓紫棋 / 李志 Li Zhi
+ *       （前缀里不能有中文：「东北周杰伦」「李志轩」是另一个人）
+ *    C. 中文名 + 拉丁后缀           蘇打綠 sodagreen
+ *  中文名多一个字一律不是同一个人。
+ */
+function oneNameEq(name, qn) {
+  let nn = singerNorm(toSimplified(name));
+  // YouTube 自动生成的官方频道叫「李志 - Topic」
+  nn = nn.replace(/\s*[-–—]\s*topic$/, "").replace(/\s+/g, "");
+  if (!nn || !qn) return false;
+  if (nn === qn) return true;
+  if (nn.length > qn.length) {
+    if (nn.slice(-qn.length) === qn) {
+      const prefix = nn.slice(0, nn.length - qn.length);
+      // 前缀必须是拉丁字母/数字/标点，「李志轩」这种中文前缀不算
+      if (prefix && !/[\u4e00-\u9fff]/.test(prefix)) return true;
+    }
+    if (nn.slice(0, qn.length) === qn) {
+      const suffix = nn.slice(qn.length);
+      // 后缀同理：「李志辉」「李志强」全是另一个人
+      if (suffix && !/[\u4e00-\u9fff]/.test(suffix)) return true;
+    }
+  }
+  return false;
+}
+
 function isArtistQuery(query, artist) {
   const qn = normTextZ(query);
   if (!qn || qn.length < 2) return false;
   const an = singerNorm(toSimplified(artist));
   if (!an) return false;
-  if (an.indexOf(qn) >= 0) return true;
+  /* 多人合作署名先拆开逐个认：「周杰伦&杨瑞代」「李志、江砚深」
+     「G.E.M.邓紫棋&陈奕迅」都得让其中一位对上就算。
+     拆完仍要整串再比一次 —— AC/DC 这种名字里自带斜杠的会被拆坏。 */
+  const parts = an.split(/[\/&、,，]/);
+  for (let i = 0; i < parts.length; i++) {
+    if (oneNameEq(parts[i], qn)) return true;
+  }
+  if (oneNameEq(an, qn)) return true;
   const als = ARTIST_ALIAS[qn];
   if (als && als.length) {
     for (let i = 0; i < als.length; i++) {
       const k = normTextZ(als[i]);
-      if (k && an.indexOf(k) >= 0) return true;
+      if (k && oneNameEq(an, k)) return true;
     }
   }
   return false;
@@ -1605,13 +1656,23 @@ async function appleArtistAliases(query) {
       }
     }
 
+    /* ⚠️ 下面两处判据原来是 `name.indexOf(qn) >= 0`（包含即通过）。
+       跟 isArtistQuery 同一个毛病：搜「李志」时 Apple 那边专辑最多的
+       是「李志辉」（佛教音乐，264 首），名字含「李志」→ 被当成李志的
+       正式身份，反查出来的名字全指向他。改成跟排序层同一套判据 ——
+       要么是同一写法的变体（oneNameEq），要么是换了文字体系的译名。 */
+    const samePerson = (nm) => {
+      if (!nm) return false;
+      if (oneNameEq(nm, qn)) return true;
+      return isPureCJK(nm) !== isPureCJK(q);
+    };
     let pickId = "";
     if (exactArt) {
       pickId = String(exactArt.artistId);   // 艺人实体跟查询词完全同名 → 本尊
-    } else if (domId && domN >= 2 && share >= 0.25 && (domId === artId || normTextZ(byId[domId].name).indexOf(qn) >= 0)) {
+    } else if (domId && domN >= 2 && share >= 0.25 && (domId === artId || samePerson(byId[domId].name))) {
       pickId = domId;                       // 专辑压倒性 + 艺人实体对得上
-    } else if (artId && artName && normTextZ(artName).indexOf(qn) >= 0) {
-      pickId = artId;                       // 艺人实体自己就含查询词
+    } else if (artId && artName && samePerson(artName)) {
+      pickId = artId;                       // 艺人实体自己就跟查询词是同一个人
     } else if (domId && domN >= 2 && share >= 0.8) {
       pickId = domId;                       // 专辑几乎全归一个人
     }
@@ -1740,8 +1801,31 @@ async function neteaseArtistAliases(query, qqPre) {
       if (normTextZ(String(songs[i].name || "")).indexOf(qn) >= 0) titleHit++;
     }
     const looksLikeSong = songs.length > 0 && titleHit * 2 >= songs.length;
-    // 至少 3 条、且占结果的 40% 以上，才认「这串词就是这位歌手」
-    if (!looksLikeSong && topName && topCnt >= 3 && topCnt * 10 >= songs.length * 4) {
+    /* ⚠️ 再加一道身份闸（实测 2026-10-21 搜「李志」）：
+       「谁占多数」这条推断会把**别人的名字**带进来。搜李志时
+       网易云曲库里有 14/20 条挂在「李志辉」名下（那是另一位佛教音乐
+       制作人，264 首），而他本人的歌在内地被下架得只剩 1 条。
+       于是 topName = 李志辉，被当成「李志的另一个名字」注册进 ARTIST_ALIAS
+       —— 之后 isArtistQuery 认李志辉就是李志，李志辉的歌全拿 3 档，
+       第一屏是「水墨兰亭 - 李志辉」「平遥古韵 - 李志辉」，
+       李志自己的《天涯》《苏州河》反而挤不过他们。
+       同一个坑搜「赵薇」也踩过（赵薇薇 459 首），当时的修法只加在
+       歌手库里，这条**别名推断**路径漏掉了。
+
+       判据跟 isArtistQuery 一致：要么本来就是同一个写法（oneNameEq 认的
+       拉丁前缀/后缀那种），要么是**换了一套文字**（中文 ↔ 拉丁/假名）——
+       真别名全是后者：彩虹乐队 ↔ L'Arc〜en〜Ciel、摇晃帝国 ↔ ゆらゆら帝国。
+       中文名之间只认全等，「李志辉」「李志强」是另一个人。 */
+    const sameIdentity = (() => {
+      if (!topName) return false;
+      const tn2 = normTextZ(topName);
+      if (!tn2) return false;
+      if (oneNameEq(topName, normTextZ(q))) return true;
+      // 一边是纯中文、另一边不是 → 换文字体系的译名，认
+      return isPureCJK(topName) !== isPureCJK(q);
+    })();
+    // 至少 3 条、且占结果的 40% 以上、且身份对得上，才认「这串词就是这位歌手」
+    if (!looksLikeSong && topName && topCnt >= 3 && topCnt * 10 >= songs.length * 4 && sameIdentity) {
       const tn = normTextZ(topName);
       for (let i = 0; i < arts.length; i++) {
         const a = arts[i];
@@ -2202,7 +2286,11 @@ async function appleArtistCatalog(name) {
             落日飞车 →「Sunset Rollercoaster」（这条走不通，前缀纯拉丁但整串不同）
             IGU Band →「那我懂你意思了」（反向：iTunes 给的名字是中文）
          所以 B 也允许反过来：iTunes 名字被查询词包含，或查询词被它包含。 */
-      if (an === qn || an.indexOf(qn) >= 0 || qn.indexOf(an) >= 0) { picked = artists[i]; break; }
+      /* ⚠️ 这里也是「包含即通过」，同一类误伤：搜「李志」时 iTunes 能搜到
+         「李志辉」，名字含「李志」就被当成他，整份 Apple 目录全指向别人。
+         跟排序层统一用 oneNameEq（全等 / 拉丁前缀 / 拉丁后缀），
+         剩下的「一个字都不重合的中英文对照」由下面的按歌搜兜底。 */
+      if (oneNameEq(an, qn)) { picked = artists[i]; break; }
     }
     /* 兜底：搜歌手没匹配上，就**按歌搜**再反查。
        实测「IGU Band」——iTunes 的歌手搜索能给出「那我懂你意思了」
@@ -5006,6 +5094,89 @@ function dedupeAlbumList(list) {
   return keep;
 }
 
+/** Apple 目录能不能当「唱片骨架」用。
+ *
+ *  三条门槛缺一不可：
+ *   ① 目录没被 lookup 的 200 条上限截断（截断说明还有唱片没拿到）；
+ *   ② 曲目 ≥10 首 —— iTunes 里有大量跟歌手同名的野鸡小号
+ *      （搜「晴天」给一个只有 3 张 5 首的「晴天」），挡掉它们；
+ *   ③ 名字完全一致（赵薇只有 1 张专辑但确实是她的）或者 ≥2 张专辑；
+ *   ④ 这个词不能是歌名 —— 搜「后来」Apple 会认成歌手「後來者」
+ *      （15 张 45 首，前三条全过），专辑页就只剩别人的唱片了。
+ */
+async function appleSkeletonOk(cat, eq, query) {
+  if (!cat) return false;
+  if (cat.truncated || cat.tracks.length < 10) return false;
+  const exactNameIdentity = normTextZ(cat.name) === normTextZ(eq);
+  if (!(cat.albums.length >= 2 || exactNameIdentity)) return false;
+  if (await looksLikeSongQuery(eq)) {
+    console.log("[粽子]「" + cat.name + "」目录 " + cat.albums.length + " 张，"
+      + "但「" + String(query).trim() + "」是歌名 → 不走 Apple 目录");
+    return false;
+  }
+  return true;
+}
+
+/** 用 Apple 的唱片清单校正平台专辑列表。
+ *
+ *  skeleton=true  —— 以 Apple 为准：只保留能对上 Apple 唱片的平台条目，
+ *                   Apple 有、平台没有的补一条占位（点进去走 Apple 播放）。
+ *                   平台整个不可信时用（酷狗压根没这个歌手）。
+ *  skeleton=false —— 平台条目一条不动，只把「Apple 有、平台没有」的唱片
+ *                   追加到后面。平台目录残缺时用（赵薇只剩几张抖音翻唱，
+ *                   而 Apple 还有整张《天使旅行箱》）。
+ */
+function mergeAppleAlbums(cat, pool, skeleton) {
+  const used = {};
+  const extra = [];
+  const list = skeleton ? [] : pool.slice();
+  for (let i = 0; i < cat.albums.length; i++) {
+    const a = cat.albums[i];
+    const an = normAlbumName(a.title);
+    let best = -1, bestSc = -1;
+    for (let j = 0; j < pool.length; j++) {
+      if (used[j]) continue;
+      const xn = normAlbumName(pool[j].title);
+      if (!xn) continue;
+      let sc = 0;
+      if (an && xn === an) sc = 100;
+      else if (an && an.length >= 3 && (xn.indexOf(an) >= 0 || an.indexOf(xn) >= 0)) sc = 60;
+      else continue;
+      // 曲目数对得上更可信（正规专辑 8~13 首，单曲 1~2 首）
+      if (a.worksNum >= 5 && Number(pool[j].worksNum || 0) >= 5) sc += 20;
+      if (sc > bestSc) { bestSc = sc; best = j; }
+    }
+    if (best >= 0) {
+      used[best] = 1;
+      /* ⚠️ 平台条目的 date / worksNum 经常是缺的 ——
+         咪咕那条《没有人在乎你在乎的事》worksNum=0、date=""，
+         排序时会掉进「单曲」那档被甩到最后，明明它是 2014 年的正规专辑。
+         用 Apple 的权威值补上（平台自己有值就不覆盖）。 */
+      const x = pool[best];
+      if (!Number(x.worksNum)) x.worksNum = a.worksNum;
+      if (!String(x.date || "").trim()) x.date = a.date;
+      if (!x.artwork) x.artwork = a.artwork;
+      if (skeleton) list.push(x);
+      continue;
+    }
+    const ph = {
+      id: "apple:" + cat.id + ":" + i,
+      platform: "Apple Music",
+      title: a.title,
+      artist: a.artist,
+      artwork: a.artwork,
+      date: a.date,
+      description: "Apple Music 目录（该平台暂无音源）",
+      worksNum: a.worksNum,
+      _provider: "apple",
+      _kind: "album",
+    };
+    if (skeleton) list.push(ph);
+    else extra.push(ph);
+  }
+  return list.concat(extra);
+}
+
 async function searchAlbum(query, page) {
   /* 同 searchArtist：译名搜不出唱片，得先换成原名。
      实测「摇晃帝国」原样搜，51 条里全是《摇晃的红酒杯》《摇晃的时光》，
@@ -5197,17 +5368,10 @@ async function searchAlbum(query, page) {
        取而代之的判据：**艺人实体跟查询词完全同名 + 曲目够多（≥10）**。
        晴天那种同名野鸡歌手只有 3 张 5 首，曲目数过不了；
        只发过一两张正经专辑的真歌手能过。 */
-    const exactNameIdentity = normTextZ(cat && cat.name) === normTextZ(eq);
-    if (cat && !cat.truncated && cat.tracks.length >= 10
-        && (cat.albums.length >= 2 || exactNameIdentity)) {
-      if (await looksLikeSongQuery(eq)) {
-        console.log("[粽子]「" + cat.name + "」目录 " + cat.albums.length + " 张，"
-          + "但「" + String(query).trim() + "」是歌名 → 不走 Apple 目录");
-      } else {
-        appleAlbums = cat;
-        console.log("[粽子] 酷狗无此歌手，改用 Apple 目录「" + cat.name + "」"
-          + cat.albums.length + " 张");
-      }
+    if (await appleSkeletonOk(cat, eq, query)) {
+      appleAlbums = cat;
+      console.log("[粽子] 酷狗无此歌手，改用 Apple 目录「" + cat.name + "」"
+        + cat.albums.length + " 张");
     }
   }
 
@@ -5270,6 +5434,27 @@ async function searchAlbum(query, page) {
       }
     }
 
+    /* ---- 平台目录太薄时，拿 Apple 的唱片补齐 ----
+       酷狗认得出这位歌手，不等于它的唱片是齐的：
+       实测搜「赵薇」，酷狗歌手页只挂着她几张单曲，
+       真正的《天使旅行箱》整张十首只在 Apple 里有；
+       搜「脆弱少女組」也是同样情况（4 张 EP 全在 Apple，酷狗只有同名杂牌）。
+       所以「平台唱片少于 4 张」时补一次 Apple —— 平台条目一条不删（不硬删，
+       真歌可能在别的平台），只把 Apple 有、平台没有的整张追加在后面。 */
+    if (page === 1 && kept.length < 4) {
+      try {
+        const cat = await appleArtistCatalog(singerHit.name);
+        if (await appleSkeletonOk(cat, singerHit.name, query)) {
+          const before = kept.length;
+          const merged2 = mergeAppleAlbums(cat, kept, false);
+          kept.length = 0;
+          for (let i = 0; i < merged2.length; i++) kept.push(merged2[i]);
+          console.log("[粽子] 平台唱片只有 " + before + " 张 → 用 Apple 目录「"
+            + cat.name + "」补到 " + kept.length + " 张");
+        }
+      } catch (e) { /* Apple 挂了就维持平台结果 */ }
+    }
+
     // 听书聚合条目照旧带出来（它本来就不是专辑）
     const books = page === 1 ? out.filter((x) => x._isAudiobook) : [];
 
@@ -5288,22 +5473,9 @@ async function searchAlbum(query, page) {
      后面八条《凤囚凰》《那年夏天》… 是冒名歌手的 1 首单曲。
      用户搜一个乐团，只想看到这个乐团真出过的唱片。 */
   if (appleAlbums) {
-    const appleSet = appleAlbums.albumSet;
-    const normSet = Object.keys(appleSet);
-
     /* Apple 的专辑名对到各平台结果上。
        用户搜歌手时看不到歌名列表，光有专辑名没有播放地址也没用，
        所以必须从平台结果里**配对**——名字对得上、歌手也对得上才算。 */
-    const hitAppleAlbum = (x) => {
-      const n = normAlbumName(x.title);
-      if (!n) return false;
-      if (appleSet[n]) return true;
-      for (let i = 0; i < normSet.length; i++) {
-        const a = normSet[i];
-        if (a.length >= 3 && (a.indexOf(n) >= 0 || n.indexOf(a) >= 0)) return true;
-      }
-      return false;
-    };
     const hitByName = (x) => {
       const a = singerNorm(x.artist || "");
       const names = [singerNorm(appleAlbums.name), singerNorm(eq), singerNorm(query)];
@@ -5325,51 +5497,7 @@ async function searchAlbum(query, page) {
       if (!hitByName(x)) continue;
       pool.push(x);
     }
-    const used = {};
-    const kept2 = [];
-    for (let i = 0; i < appleAlbums.albums.length; i++) {
-      const a = appleAlbums.albums[i];
-      const an = normAlbumName(a.title);
-      let best = null, bestSc = -1;
-      for (let j = 0; j < pool.length; j++) {
-        const x = pool[j];
-        if (used[j]) continue;
-        const xn = normAlbumName(x.title);
-        if (!xn) continue;
-        let sc = 0;
-        if (xn === an) sc = 100;
-        else if (an.length >= 3 && (xn.indexOf(an) >= 0 || an.indexOf(xn) >= 0)) sc = 60;
-        else continue;
-        // 曲目数对得上更可信（正规专辑 8~13 首，单曲 1~2 首）
-        if (a.worksNum >= 5 && Number(x.worksNum || 0) >= 5) sc += 20;
-        if (sc > bestSc) { bestSc = sc; best = j; }
-      }
-      if (best !== null) {
-        used[best] = 1;
-        /* ⚠️ 平台条目的 date / worksNum 经常是缺的 ——
-           咪咕那条《没有人在乎你在乎的事》worksNum=0、date=""，
-           排序时会掉进「单曲」那档被甩到最后，明明它是 2014 年的正规专辑。
-           用 Apple 的权威值补上（平台自己有值就不覆盖）。 */
-        const x = pool[best];
-        if (!Number(x.worksNum)) x.worksNum = a.worksNum;
-        if (!String(x.date || "").trim()) x.date = a.date;
-        if (!x.artwork) x.artwork = a.artwork;
-        kept2.push(x);
-      } else {
-        kept2.push({
-          id: "apple:" + appleAlbums.id + ":" + i,
-          platform: "Apple Music",
-          title: a.title,
-          artist: a.artist,
-          artwork: a.artwork,
-          date: a.date,
-          description: "Apple Music 目录（该平台暂无音源）",
-          worksNum: a.worksNum,
-          _provider: "apple",
-          _kind: "album",
-        });
-      }
-    }
+    const kept2 = mergeAppleAlbums(appleAlbums, pool, true);
     console.log("[粽子] Apple 目录「" + appleAlbums.name + "」" + appleAlbums.albums.length
       + " 张，其中 " + kept2.filter((x) => x._provider !== "apple").length + " 张配到平台音源");
 
@@ -11829,7 +11957,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.16",
+  version: "4.10.17",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
