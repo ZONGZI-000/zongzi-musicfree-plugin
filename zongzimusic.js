@@ -12382,10 +12382,17 @@ async function getArtistWorksUncached(artistItem, page, type) {
            但 **MB 那份继续在后台拉**，拉完写进缓存 —— 用户再进来（或切回歌曲页）
            就是全量 77 首，而不是像以前那样「每次进来都重新空等 6 秒」。
            ⚠️ 必须 catch，否则后台那个 rejection 会变成 unhandled。
-           ⚠️ 窗口只给 1.5 秒（不是 6 秒）：MB 要么已有缓存（0ms），要么就是
-              4~9 秒起（撞上 1.1s 限流重试更久）。等 6 秒等于把「MB 慢」这件事
-              直接变成用户的白屏时间，而这段时间里 Apple 那部分其实早就能给了。 */
-        const MB_CAT_FAST_MS = 1500;
+           ⚠️ 窗口分类型（不是一刀切）：
+              「歌曲」页等 3.2 秒 —— Apple 那部分本身有歌可点，但实测 MB 首次
+                约 2.4~3 秒（赵薇 2.97s / 彩虹 3.9s），窗口太短会退化成「只有
+                Apple 那 10 首」，用户会以为唱片库是残的（这正是他报的毛病）。
+                3.2 秒能覆盖典型情况，真慢就交给后台补，不让它拖到 9 秒；
+              「专辑」页要等 9 秒 —— 这一页的内容**整个都来自 MB**
+                （赵薇在 Apple 只有 1 张，MB 有 9 张），1.5 秒就撒手
+                等于把「9 张专辑」降级成「1 张」。
+                实测 MB 撞限流重试时会到 9 秒，9 秒窗口刚好兜住；
+                真超过就由外层 12 秒总闸统一收口。 */
+        const MB_CAT_FAST_MS = isAlbum ? 9000 : 3200;
         let mcat = null;
         let stillRunning = true;
         const mbP = mbArtistCatalog(artistItem.name || "").catch(function () { return null; });
@@ -15506,7 +15513,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.42",
+  version: "4.10.43",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
