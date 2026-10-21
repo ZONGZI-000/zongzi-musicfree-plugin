@@ -6775,12 +6775,32 @@ async function searchArtist(query, page) {
       if (cat && cat.id && (cat.albums.length || cat.tracks.length)) {
         console.log("[粽子] 平台全无此歌手，Apple 目录「" + cat.name + "」"
           + cat.albums.length + " 张 / " + cat.tracks.length + " 首");
+        /* ⚠️ 列表里的「N 首」也得是真的。
+           实测「赵薇」：Apple 香港区只有《天使旅行箱》10 首，
+           于是歌手条目写着「10 首」，用户以为她只发过一张唱片 ——
+           实际上 MusicBrainz 有 77 首。点进去已经补全了，但列表这一行
+           是用户第一眼看到的东西，不能留着错的。
+           ⚠️ 4s 预算 + 只在 Apple 明显薄（<20 首）时才问，别拖累正常歌手。 */
+        let worksNum = cat.tracks.length || cat.albums.length;
+        if (cat.tracks.length < 20) {
+          try {
+            const mcat = await Promise.race([
+              mbArtistCatalog(cat.name || eq).catch(function () { return null; }),
+              new Promise(function (res) { setTimeout(function () { res(null); }, 4000); }),
+            ]);
+            if (mcat && mcat.tracks.length > worksNum) {
+              worksNum = mcat.tracks.length;
+              console.log("[粽子] 「" + cat.name + "」Apple 只有 "
+                + cat.tracks.length + " 首 → 按 MusicBrainz 记 " + worksNum + " 首");
+            }
+          } catch (e) { /* 拿不到就按 Apple 的算 */ }
+        }
         out.push({
           id: "apart:" + cat.id,
           platform: "Apple Music",
           name: cat.name || eq,
           avatar: (cat.albums[0] && cat.albums[0].artwork) || "",
-          worksNum: cat.tracks.length || cat.albums.length,
+          worksNum: worksNum,
           fans: 0,
           description: "",
           _provider: "apple",
@@ -10493,7 +10513,68 @@ async function getArtistWorksOf(artistItem, page, type) {
   if (String(id).indexOf("apart:") === 0) {
     const artistId = String(id).slice(6);
     if (!artistId) return { isEnd: true, data: [] };
-    const r = await appleArtistWorks(artistId, page, type === "album" ? "album" : "music", rn);
+    const isAlbum = type === "album";
+    const r = await appleArtistWorks(artistId, page, isAlbum ? "album" : "music", rn);
+
+    /* ---- Apple 目录太薄时，用 MusicBrainz 补齐 ----
+       实测（2026-10-21）「赵薇」：Apple 香港区只有《天使旅行箱》10 首，
+       而 MB 有 9 张 77 首 —— 《飘》《双》《我们都是大导演》《小燕子赵薇》
+       全在，用户点进歌手页只看得到 10 首，等于把人当成只发过一张唱片。
+       ⚠️ 只在第 1 页、且 Apple 一页都没填满时补（<20 条 = 目录确实薄）；
+          Apple 那边正常的歌手（陈奕迅 100+ 首）永远进不来这条。
+       ⚠️ 补进来的曲目**没有 audio id**，播放时走跨平台兜底（跟 Apple
+          占位条目同一套），所以 platform 标 MusicBrainz 而不是 Apple。 */
+    const thin = r && (r.data || []).length < 20;
+    if (page === 1 && thin) {
+      try {
+        const mcat = await Promise.race([
+          mbArtistCatalog(artistItem.name || "").catch(function () { return null; }),
+          new Promise(function (res) { setTimeout(function () { res(null); }, 6000); }),
+        ]);
+        if (mcat) {
+          const head = (r && r.data) || [];
+          if (isAlbum) {
+            if (mcat.albums.length > head.length) {
+              const before = head.length;
+              mergeMbAlbums(mcat, head);
+              console.log("[粽子] Apple 只有 " + before + " 张专辑 → MusicBrainz「"
+                + mcat.name + "」补到 " + head.length + " 张");
+            }
+          } else if (mcat.tracks.length > head.length) {
+            const have = {};
+            for (let i = 0; i < head.length; i++) {
+              const k = normTextZ(head[i].title || "");
+              if (k) have[k] = 1;
+            }
+            let added = 0;
+            /* 上限 90 首：一页塞两百条会卡，用户也翻不动。
+               补齐的意义是「别让他看起来只发过一张唱片」，不是把全部作品一次倒完。 */
+            for (let i = 0; i < mcat.tracks.length && head.length < 90; i++) {
+              const t = mcat.tracks[i];
+              const k = normTextZ(t.title || "");
+              if (!k || have[k]) continue;
+              have[k] = 1;
+              head.push({
+                id: "",           // 没有音源 id，播放走跨平台兜底
+                platform: "MusicBrainz",
+                title: t.title,
+                artist: mcat.name,
+                album: t.album || "",
+                artwork: "",
+                duration: Number(t.duration || 0),
+                _provider: "mb",
+              });
+              added++;
+            }
+            if (added) {
+              console.log("[粽子] Apple 只有 " + (head.length - added) + " 首 → MusicBrainz「"
+                + mcat.name + "」补 " + added + " 首");
+            }
+          }
+          return { isEnd: true, data: head };
+        }
+      } catch (e) { /* MB 挂了就用 Apple 那份 */ }
+    }
     return r;
   }
 
@@ -13168,7 +13249,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.21",
+  version: "4.10.22",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
