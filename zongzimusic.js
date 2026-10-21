@@ -580,7 +580,9 @@ async function probeAudio(url, extraHeaders) {
   const out = { ok: false, total: 0 };
   try {
     const r = await axios_1.get(url, {
-      timeout: 12000,
+      /* 只取 2KB 验魔数，6 秒足够；原来是 12 秒 ——
+         慢网下这一个探测就能白占 12 秒，用户看到的就是转圈。 */
+      timeout: 6000,
       responseType: "arraybuffer",
       headers: Object.assign({ "User-Agent": UA, Range: "bytes=0-2047" }, extraHeaders || {}),
       validateStatus: () => true,
@@ -4636,6 +4638,18 @@ function ytPickAudio(list, quality) {
  * ============================================================ */
 const YT_INLINE_MAX_BYTES = 6 * 1024 * 1024;   // 超过 6MB 不内联（无损/长音频）
 
+/* ⚠️ 内联必须有**总超时**（2026-10-21 事故：「一直转」）。
+   原来只有每块的 20 秒超时，整首是 4 路并发分块下载，
+   手机端实测 5G 限速 151KB/s：一首 1.4MB 要 9 秒，2.2MB 要 15 秒，
+   整首 6MB 直接 40 秒 —— 这期间界面没有任何反馈，就是「一直转」。
+   而且只要有一块慢，最坏要等 20 秒 × 剩余块数。
+
+   现在给整首一个硬 deadline：6 秒内下不完就直接放弃内联、回退流式 URL。
+   流式的代价是开头偶尔重新缓冲（每 2 秒卡一次，1 分多钟后攒够缓冲就稳），
+   但那比「转 20 秒然后失败」好得多 —— 点下去最好 1~2 秒就能出声。
+   内联真正划算的是快网（实测本机 1~3 秒下完），慢网就让它走流式。 */
+const INLINE_TOTAL_DEADLINE = 6000;
+
 const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /** Uint8Array → base64（纯 JS，Hermes 里没有 Buffer，btoa 也不一定有） */
@@ -4677,10 +4691,13 @@ const INLINE_CHUNK = 256 * 1024;
 const INLINE_CONCURRENCY = 4;
 
 /** 下载单个 Range 块。返回 Uint8Array，失败返回 null。 */
-async function fetchRange(url, start, end, extraHeaders) {
+async function fetchRange(url, start, end, extraHeaders, timeoutMs) {
   try {
     const r = await axios_1.get(url, {
-      timeout: 20000,
+      /* ⚠️ 单块超时从 20s 收到 6s。256KB 一块实测本地 150~950ms，
+         6s 是 6~40 倍余量；真超过 6s 说明这条连接已经废了，
+         与其干等 20s 不如让它快点失败、整体转流式。 */
+      timeout: Number(timeoutMs) || 6000,
       responseType: "arraybuffer",
       validateStatus: () => true,
       headers: Object.assign({ "User-Agent": UA, Range: "bytes=" + start + "-" + end }, extraHeaders || {}),
@@ -4704,9 +4721,40 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes) {
   const cap = Number(maxBytes) || YT_INLINE_MAX_BYTES;
   if (!size || size > cap) return null;
 
+  /* 整首的硬 deadline（见 INLINE_TOTAL_DEADLINE 的说明）。
+     到点就整体放弃内联、让调用方把流式地址直给播放器 ——
+     用户点下去要的是「一秒内出声」，不是「等十秒然后一首完美的内存音频」。 */
+  const t0 = Date.now();
+  const remain = () => INLINE_TOTAL_DEADLINE - (Date.now() - t0);
+
   // 先拉第一块确认能下、并验魔数（省得白下整首才发现是错误页）
-  const first = await fetchRange(url, 0, Math.min(INLINE_CHUNK, size) - 1, extraHeaders);
+  const tFirst = Date.now();
+  const first = await fetchRange(url, 0, Math.min(INLINE_CHUNK, size) - 1, extraHeaders,
+    Math.min(6000, Math.max(1500, remain())));
   if (!first || first.length < 4096) return null;
+  if (remain() <= 0) return null;
+
+  /* 用第一块实测出网速，明显下不完就**立刻**放弃，别死等 deadline。
+     ⚠️ 这是「一直转」的最后一环：慢网下如果只会「等满 8 秒再回退」，
+        用户就是先白等 8 秒、然后才开始流式缓冲，加起来还是十几秒。
+        实测手机端 5G 限速 151KB/s —— 一首 3.7MB 的曲子要 24 秒，
+        这种一眼就知道没戏的，第一块（256KB）到手的耗时就能算出来：
+        256KB / 151KB/s ≈ 1.7 秒，按「第一块耗时 × 剩余批数」就能估总耗时。
+        预估远超 deadline 的直接放弃内联。 */
+  const firstMs = Date.now() - tFirst;
+  const chunkCount = Math.ceil(size / INLINE_CHUNK);
+  /* 折算：第一块是单连接，剩下的是 4 路并发，所以总耗时大约是
+     「第一块的耗时 × 需要几批」，而不是「第一块 × 块数」。
+     不除以并发数会把慢网估成 4 倍，白白把本来 2 秒能下完的歌推去流式。 */
+  const rounds = Math.ceil(chunkCount / INLINE_CONCURRENCY);
+  const estTotalMs = firstMs * rounds;
+  /* ⚠️ 门槛要放得很宽（2.5 倍 deadline）。
+     第一块里含 DNS + TLS 握手，实测本机 2.3MB 的歌第一块就要 2~3 秒，
+     按真实吞吐算 3 批 ≈ 6~9 秒，会正好压在 deadline 上 ——
+     门槛定太紧就会把「内联 8 秒能下完」误判成没戏，全都推去流式，
+     结果就是能一次播干净的歌反而开始每 2 秒卡。
+     这里只拦真正没救的（预估 20 秒以上），其余交给下面的硬 deadline。 */
+  if (firstMs > 800 && estTotalMs > INLINE_TOTAL_DEADLINE * 2.5) return null;
   {
     const x = (i) => first[i] || 0;
     const okHead =
@@ -4731,9 +4779,13 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes) {
   let failed = false;
   async function worker() {
     while (!failed && cursor < ranges.length) {
+      /* 每块之前都看一眼总 deadline：超了就直接收工，
+         不要「再下一块就好」—— 慢网下每一块都可能是最后一块。 */
+      if (remain() <= 0) { failed = true; return; }
       const idx = cursor++;
       const [s, e] = ranges[idx];
-      const part = await fetchRange(url, s, e, extraHeaders);
+      const part = await fetchRange(url, s, e, extraHeaders,
+        Math.min(6000, Math.max(1200, remain())));
       if (!part) { failed = true; return; }
       u8.set(part, s);
       filled += part.length;
@@ -4783,16 +4835,27 @@ async function ytFetchUrl(videoId, quality) {
   const pick = ytPickAudio(res.audios, quality);
   if (!pick) throw new Error("yt: 没有可用的音频流");
 
-  if (!(await verifyPlayable(pick.url))) throw new Error("yt: 地址不可播");
+  /* ⚠️ 验活可以省掉一次往返。
+     整首内联那条路本来就要先拉第一块、在里面验魔数（见 inlineAudio），
+     再单独探一次 2KB 纯属多花一个 RTT —— 慢网下这就是 1~2 秒的转圈。
+     所以：要内联就先不验活，把验活的责任交给 inlineAudio 的第一块；
+     内联失败回退流式时，再补上验活。 */
+  const willInline = shouldInlineYoutube() && Number(pick.size || 0) > 0 &&
+    Number(pick.size) <= YT_INLINE_MAX_BYTES;
+
+  if (!willInline && !(await verifyPlayable(pick.url))) throw new Error("yt: 地址不可播");
 
   /* VISIONOS 签发的 URL 没有 1MB 配额（实测首/中/尾全 200），不用探测。
      ⚠️ 但**不能**在这里提前 return —— 那会跳过下面的整首内联，
      导致 YouTube 又退回流式播放（开头 1 分多钟每 2 秒卡一次）。 */
   let ok = pick;
 
-  if (!usedVisionos && shouldProbeYtQuota()) {
+  if (!usedVisionos && shouldProbeYtQuota() && !willInline) {
     // 探测点落在每个候选文件的尾部（见 ytQuotaOk），能取到尾部就说明整首可下。
     // 只试 2 个档：同一视频各档的配额表现基本一致，多试只是白花时间。
+    /* ⚠️ willInline 时不探测：内联本身就会逐块拉整首，
+       任何一块拿不到（配额截断）就会失败并回退，等价于更高强度的配额检查。
+       单独再探尾部只是多花一个 RTT。 */
     const candidates = [pick].concat(res.audios.filter((a) => a !== pick)).slice(0, 2);
     const tried = candidates.map((c) => c.itag);
     const results = await Promise.all(candidates.map((c) => c.url ? ytQuotaOk(c.url, c.size) : Promise.resolve(false)));
@@ -4815,6 +4878,11 @@ async function ytFetchUrl(videoId, quality) {
       const dataUri = await inlineAudio(ok.url, ok.size, ok.mime);
       if (dataUri) return dataUri;
     } catch (e) { /* 失败就回退流式 */ }
+    /* 内联没成（超时 / 分块失败 / 太大）→ 现在这条流式地址还没验过
+       （willInline 时我们跳过了验活），补验一次再交出去。 */
+    if (willInline && !(await verifyPlayable(ok.url))) {
+      throw new Error("yt: 内联超时且流式地址不可播");
+    }
   }
 
   return ok.url;
@@ -10264,7 +10332,11 @@ async function musicComments(musicItem, page) {
  *    否则「榜单」页每次打开都要等好几秒，体验还不如不做。
  *    拉到的结果缓存 30 分钟，反复进出不重复打苹果。
  * ============================================================ */
-const APPLE_CHART_BASE = "https://rss.applemarketingtools.com/api/v2";
+/* ⚠️ 域名 2026-10-21 换过：rss.applemarketingtools.com 现在只回 301，
+   跳到 rss.marketingtools.apple.com。走旧域名等于每次多一个来回，
+   而且实测旧域名在部分网络下 301 之后就没下文了（拖到 20s 超时）。
+   直接写新域名。 */
+const APPLE_CHART_BASE = "https://rss.marketingtools.apple.com/api/v2";
 
 /** 参与的地区。只挑华语用户真的会看的，全上会让榜单页太长 */
 const APPLE_CHART_REGIONS = [
@@ -10277,6 +10349,10 @@ const APPLE_CHART_ALBUM_REGIONS = [["cn", "中国"], ["us", "美国"], ["jp", "�
 
 const APPLE_CHART_CACHE = {};
 const APPLE_CHART_TTL = 30 * 60 * 1000;
+
+/* 榜单页愿意为 Apple 专辑/歌单榜等多久。超过就先把现有的吐出去，
+   那两个 feed 留在后台继续拉。1.2 秒是「页面还不觉得卡」的上限。 */
+const APPLE_CHART_SOFT_WAIT = 1200;
 
 function shouldUseAppleChart() {
   try {
@@ -10458,12 +10534,27 @@ async function appleChartEntries() {
   /* 专辑 / 歌单只展开中国区：再多个区，榜单页会长到要滚好几屏，
      而且这几个 chart 是打开页面就得等的，多了会明显变慢。 */
   const cc = "cn";
-  const feeds = await Promise.all([
+
+  /* ⚠️ 这两个 feed 是整页卡死的元凶，**不能无脑 await**。
+     2026-10-21 实测：苹果这边 cn/albums 正常 1~2 秒，但 playlists
+     经常 24~30 秒才回来、或者直接挂到超时；而 getTopLists 是
+     「打开榜单页」这一个动作的唯一出参 —— 等它就等于整页白屏。
+     所以改成：只等 1.2 秒，回来多少算多少；没回来的继续在后台拉，
+     拉完进缓存，下次进榜单页自然就有了。
+     歌单组本身是静态条目（8 个地区），不受影响，始终立刻显示。 */
+  const pending = [
     appleChartRaw(cc, "albums", 50).catch(() => null),
     appleChartRaw(cc, "playlists", 50).catch(() => null),
+  ];
+  const raced = await Promise.race([
+    Promise.all(pending),
+    new Promise((res) => setTimeout(() => res([null, null]), APPLE_CHART_SOFT_WAIT)),
   ]);
-  const albumsFeed = feeds[0];
-  const plsFeed = feeds[1];
+  const albumsFeed = raced[0];
+  const plsFeed = raced[1];
+  if (!albumsFeed || !plsFeed) {
+    console.log("[粽子] Apple 专辑/歌单榜 1.2s 内未回，后台继续拉（下次进页面就有）");
+  }
 
   const albums = ((albumsFeed && albumsFeed.results) || []).filter((x) => x && x.name).slice(0, 12);
   if (albums.length) {
@@ -13449,6 +13540,24 @@ function httpsCacheIsOk(url) {
   return true;
 }
 
+/* ============================================================
+ * 同一首歌的「取流作业」去重（single-flight）
+ *
+ * ⚠️ 2026-10-21 事故：手机上「一直转」。
+ * 根因是 MusicFree 播放一首歌时会**连着**要好几个音质：
+ *   low → standard → high → super
+ * 插件这边缓存 key 故意不带 quality（见 mediaCacheKey 的说明），
+ * 但那只对「已经取完」的情况有效 —— 四个请求几乎同时打进来时，
+ * 缓存还都是空的，于是四路**各自**把整首音频下载了一遍：
+ * 一首 1.4MB 的歌变成 5.6MB，high 档再拿 3.7MB 档就变成十几 MB。
+ * 用户在 5G 限速 151KB/s 下等到的就是几十秒的转圈。
+ *
+ * 现在按 mediaCacheKey 把并发的取流合成一个作业：后来的直接等同一个
+ * promise，谁先回来就都拿它。音质差异对我们无意义（YouTube 各档
+ * 本来就是同一条流，B站/直链也就是码率不同），多下几遍纯属浪费。
+ * ============================================================ */
+const RESOLVE_INFLIGHT = {};
+
 async function getMediaSource(musicItem, quality) {
   const providerForPlay = musicItem._provider || LABEL_TO_PROVIDER[musicItem.platform] || "";
 
@@ -13466,6 +13575,23 @@ async function getMediaSource(musicItem, quality) {
     return decorateSource({ url: cached }, providerForPlay);
   }
 
+  // 3) 同一首歌已经有作业在跑 → 等它，别再下第二遍
+  const flightKey = mediaCacheKey(musicItem);
+  const running = RESOLVE_INFLIGHT[flightKey];
+  if (running) return running;
+
+  const job = (async function () {
+    try {
+      return await getMediaSourceUncached(musicItem, quality, providerForPlay);
+    } finally {
+      delete RESOLVE_INFLIGHT[flightKey];
+    }
+  })();
+  RESOLVE_INFLIGHT[flightKey] = job;
+  return job;
+}
+
+async function getMediaSourceUncached(musicItem, quality, providerForPlay) {
   const result = await resolveMediaSource(musicItem, quality);
 
   /* 把「播放该带的头」和「http→https」补上。
@@ -14144,7 +14270,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.31",
+  version: "4.10.32",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
