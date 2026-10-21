@@ -8198,7 +8198,7 @@ const COVER_CDN = "https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugi
  * ============================================================ */
 /* 三张都已入库：黑胶、唱机+波形、麦克风各一张，
    都在 1:1 1080 墨绿底同风格，轮换才不会看出是同一个模板。 */
-const FB_ART_COVERS = ["fb-01.jpg", "fb-02.jpg", "fb-03.jpg"];
+const FB_ART_COVERS = ["fb-01.jpg", "fb-02.jpg", "fb-03.jpg", "fb-04.jpg"];
 
 function fbHash(str) {
   let h = 2166136261;                       /* FNV-1a，够散且不用 crypto */
@@ -13477,7 +13477,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.24",
+  version: "4.10.25",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
