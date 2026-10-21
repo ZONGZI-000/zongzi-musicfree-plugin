@@ -3390,6 +3390,307 @@ function ytDurSec(s) {
   return 0;
 }
 
+/* ============================================================
+ * YouTube Music 目录（music.youtube.com 的 WEB_REMIX innertube）
+ *
+ * 为什么需要它：国内五家平台上「歌手」条目质量差异极大 ——
+ *   搜「李志」，网易云给的是一个只有 2 首的野鸡同名号（musicSize=2），
+ *   QQ 的歌手接口 500003 已死，酷狗只回「李志辉 / 李志强 / 李志国…」，
+ *   酷我/咪咕的歌手库压根没有这个条目。
+ * 但李志在 YouTube Music 上有 **13 张官方专辑 110 首**（ATV 音频，
+ * 不是搬运视频），是唯一完整可信的目录。
+ *
+ * ⚠️ 这里的 browse 走 music.youtube.com 的 WEB_REMIX 客户端，
+ *    和取流用的 ANDROID/VISIONOS 是两套东西，互不影响：
+ *    取流仍然走 ytPlayer（ANDROID/VISIONOS 才拿得到 streamingData）。
+ * ============================================================ */
+const YTM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+let ytmKey = "", ytmVisitor = "", ytmVer = "", ytmName = "67", ytmAt = 0;
+
+async function ytmBootstrap() {
+  if (ytmKey && ytmVer && Date.now() - ytmAt < 30 * 60 * 1000) return;
+  const r = await axios_1.get("https://music.youtube.com/", {
+    timeout: 20000, responseType: "text", transformResponse: [(x) => x],
+    headers: { "User-Agent": YTM_UA }, validateStatus: () => true,
+  });
+  const d = String(r.data || "");
+  const g = (re) => (d.match(re) || [])[1] || "";
+  ytmKey = g(/"INNERTUBE_API_KEY":"([^"]+)"/);
+  ytmVisitor = g(/"VISITOR_DATA":"([^"]+)"/);
+  ytmVer = g(/"INNERTUBE_CLIENT_VERSION":"([^"]+)"/);
+  ytmName = g(/"INNERTUBE_CONTEXT_CLIENT_NAME":(\d+)/) || "67";
+  ytmAt = Date.now();
+  if (!ytmKey || !ytmVer) throw new Error("ytm bootstrap failed");
+}
+
+function ytmCtx() {
+  return {
+    client: {
+      clientName: "WEB_REMIX", clientVersion: ytmVer,
+      hl: "zh-TW", gl: "US",
+      visitorData: ytmVisitor,
+    },
+    user: { lockedSafetyMode: false },
+    request: { useSsl: true },
+  };
+}
+
+async function ytmCall(path, body) {
+  await ytmBootstrap();
+  /* ⚠️ 调用方写的是 ytmCall("search", { context: ytmCtx(), ... })，
+     而 ytmCtx() 在**传参前**就求值了 —— 首次运行时 bootstrap 还没跑，
+     于是 clientVersion / visitorData 全是空串，服务端直接 404
+     "Requested entity was not found"。这里统一用 bootstrap 后的真值覆盖。 */
+  if (body && body.context && body.context.client) {
+    body.context.client.clientVersion = ytmVer;
+    body.context.client.visitorData = ytmVisitor;
+  }
+  const send = () => axios_1.post(
+    "https://music.youtube.com/youtubei/v1/" + path + "?prettyPrint=false&key=" + ytmKey,
+    JSON.stringify(body),
+    {
+      timeout: 20000, validateStatus: () => true,
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": YTM_UA,
+        "X-YouTube-Client-Name": ytmName,
+        "X-YouTube-Client-Version": ytmVer,
+        "X-Goog-Visitor-Id": ytmVisitor,
+        Origin: "https://music.youtube.com",
+        Referer: "https://music.youtube.com/",
+      },
+    }
+  );
+  let r = await send();
+  /* ⚠️ 冷启动陷阱：刚抓到的 visitorData 第一次请求**稳定**返回
+     404 "Requested entity was not found"（实测连打三次都是这个规律：
+     第一次 404、第二次 200）。这不是参数错，是这个 visitor 还没被激活。
+     所以 404 时原样重发一次，不要重建 bootstrap（重建会换新 visitor，又 404）。 */
+  if (r && r.status === 404) {
+    await new Promise((res) => setTimeout(res, 150));
+    r = await send();
+  }
+  return r.data;
+}
+
+/** 递归捞指定 key 的 renderer（不依赖层级，YouTube 结构改版也不会挂） */
+function ytmCollect(root, keyName) {
+  const out = [];
+  (function walk(o, d) {
+    if (!o || typeof o !== "object" || d > 30) return;
+    if (Array.isArray(o)) { for (let i = 0; i < o.length; i++) walk(o[i], d + 1); return; }
+    const ks = Object.keys(o);
+    for (let i = 0; i < ks.length; i++) {
+      const k = ks[i];
+      if (k === keyName && o[k]) out.push(o[k]);
+      walk(o[k], d + 1);
+    }
+  })(root, 0);
+  return out;
+}
+
+/** runs 数组 → 纯文本 */
+function ytmRuns(node) {
+  if (!node) return "";
+  if (node.simpleText) return String(node.simpleText);
+  return ((node.runs || []).map((r) => r.text || "")).join("");
+}
+
+/** 从 musicResponsiveListItemRenderer 取一条曲目 */
+function ytmRowToTrack(v, artistFallback, albumFallback) {
+  const flex = v.flexColumns || [];
+  const col = (i) => (flex[i] && flex[i].musicResponsiveListItemFlexColumnRenderer &&
+    ytmRuns(flex[i].musicResponsiveListItemFlexColumnRenderer.text)) || "";
+  const title = col(0);
+  if (!title) return null;
+  // 第 2 列常常是空的（ATV 音轨没有「歌手」列），第 3 列是播放量
+  const mid = col(1);
+  const plays = col(2);
+  let artist = mid && !/plays|播放|次/i.test(mid) ? mid : "";
+  if (!artist) artist = artistFallback || "";
+  let duration = 0;
+  const fixed = v.fixedColumns || [];
+  for (let i = 0; i < fixed.length; i++) {
+    const f = fixed[i] && fixed[i].musicResponsiveListItemFixedColumnRenderer;
+    if (f) { duration = ytDurSec(ytmRuns(f.text)) * 1000; if (duration) break; }
+  }
+  const s = JSON.stringify(v);
+  let vid = v.playlistItemData && v.playlistItemData.videoId;
+  if (!vid) {
+    const m = s.match(/"videoId":"([A-Za-z0-9_-]{11})"/);
+    vid = m && m[1];
+  }
+  if (!vid) return null;
+  // ATV = 唱片公司官方音轨；MUSIC_VIDEO_TYPE_OMV 才是 MV/官方视频
+  const atv = /MUSIC_VIDEO_TYPE_ATV/.test(s);
+  const art = (s.match(/"thumbnails":\[\{"url":"([^"]+)"/) || [])[1] || "";
+  return {
+    id: vid,
+    platform: "YouTube",
+    title: title,
+    artist: artist,
+    album: albumFallback || "",
+    artwork: art || "",
+    duration: duration,
+    _provider: "youtube",
+    _atv: atv,
+    _plays: plays,
+  };
+}
+
+/** 搜歌手 → 拿艺人 channelId（只认 MUSIC_PAGE_TYPE_ARTIST 的那条） */
+async function ytmFindArtist(name) {
+  const q = String(name || "").trim();
+  if (!q) return null;
+  /* ⚠️ params 是「只看艺人」的过滤位，实测 EgWKAQIgAWoKEAkQBRAKEAMQBA%3D%3D
+     能稳定只回艺人。不过过滤失效时下面还会再按 pageType 兜一遍。 */
+  const d = await ytmCall("search", {
+    context: ytmCtx(), query: q, params: "EgWKAQIgAWoKEAkQBRAKEAMQBA%3D%3D",
+  });
+  const rows = ytmCollect(d, "musicResponsiveListItemRenderer");
+  const want = singerNorm(q);
+  const cands = [];
+  for (let i = 0; i < rows.length; i++) {
+    const v = rows[i];
+    const be = v.navigationEndpoint && v.navigationEndpoint.browseEndpoint;
+    const cfg = be && be.browseEndpointContextSupportedConfigs &&
+      be.browseEndpointContextSupportedConfigs.browseEndpointContextMusicConfig;
+    const pg = cfg && cfg.pageType;
+    if (pg !== "MUSIC_PAGE_TYPE_ARTIST") continue;
+    const id = be.browseId;
+    if (!id || String(id).indexOf("UC") !== 0) continue;
+    const nm = ytmRuns((v.flexColumns || [])[0] &&
+      v.flexColumns[0].musicResponsiveListItemFlexColumnRenderer &&
+      v.flexColumns[0].musicResponsiveListItemFlexColumnRenderer.text) ||
+      (v.title && ytmRuns(v.title)) || "";
+    /* ⚠️ 名字必须真正相等 —— 搜「李志」YouTube 也会回「李志多」，
+       那是另一个人（1 个订阅者）。跟别处同一道闸。 */
+    if (singerNorm(nm) !== want) continue;
+    const s = JSON.stringify(v);
+    const subs = (s.match(/\"text\":\"([\d.,]+[KMB]? subscribers?)\"/) || [])[1] || "";
+    cands.push({ id: id, name: nm, subs: subs });
+  }
+  if (!cands.length) return null;
+  /* 同名多个频道时取订阅数最大的 —— 真身 39.4K，山寨 1 个。 */
+  const num = (t) => {
+    const m = String(t || "").match(/([\d.]+)\s*([KMB])?/i);
+    if (!m) return 0;
+    const n = Number(m[1]) || 0;
+    const u = (m[2] || "").toUpperCase();
+    return u === "K" ? n * 1e3 : u === "M" ? n * 1e6 : u === "B" ? n * 1e9 : n;
+  };
+  cands.sort((a, b) => num(b.subs) - num(a.subs));
+  return cands[0];
+}
+
+/** 艺人页 → 专辑列表（MPREb...） */
+async function ytmArtistAlbums(channelId) {
+  const d = await ytmCall("browse", { context: ytmCtx(), browseId: channelId });
+  const items = ytmCollect(d, "musicTwoRowItemRenderer");
+  const out = [];
+  const seen = {};
+  let artistName = "";
+  for (let i = 0; i < items.length; i++) {
+    const v = items[i];
+    const title = ytmRuns(v.title);
+    if (!title) continue;
+    const bb = v.title && v.title.runs && v.title.runs[0] &&
+      v.title.runs[0].navigationEndpoint && v.title.runs[0].navigationEndpoint.browseEndpoint;
+    const id = bb && bb.browseId;
+    if (!id || String(id).indexOf("MPRE") !== 0) continue;
+    if (seen[id]) continue;
+    seen[id] = 1;
+    const sub = (v.subtitle && v.subtitle.runs || []).map((r) => r.text || "").join(" ");
+    /* ⚠️ 艺人页里的专辑 subtitle 只有「2018年」这种年份，没有
+       「Album • 歌手 • 年份」三段（那是搜索页的格式）。
+       所以年份直接用 /(\d{4})/ 捞，歌手名一律用频道名（art.name），
+       别去 subtitle 里猜 —— 猜出来的是「2014年」这种假歌手名。 */
+    const ym = sub.match(/(\d{4})/);
+    const year = ym ? ym[1] : "";
+    const alArtist = "";
+    const s = JSON.stringify(v);
+    const art = (s.match(/"thumbnails":\[\{"url":"([^"]+)"/) || [])[1] || "";
+    out.push({ id: id, title: title, artist: alArtist, date: year, artwork: art });
+  }
+  return { albums: out, artistName: artistName };
+}
+
+/** 专辑页 → 曲目 */
+async function ytmAlbumTracks(albumId, artistFallback, albumFallback) {
+  const d = await ytmCall("browse", { context: ytmCtx(), browseId: albumId });
+  const rows = ytmCollect(d, "musicResponsiveListItemRenderer");
+  const out = [];
+  const seen = {};
+  for (let i = 0; i < rows.length; i++) {
+    const t = ytmRowToTrack(rows[i], artistFallback, albumFallback);
+    if (!t || seen[t.id]) continue;
+    seen[t.id] = 1;
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * 歌手名 → 完整作品表（专辑 + 曲目）。
+ * 这是「平台歌手条目不可信」时的目录兜底。
+ * 带 1 小时缓存，因为 getArtistWorks 会按专辑反复取。
+ */
+const YTM_CAT_CACHE = {};
+const YTM_CAT_TTL = 60 * 60 * 1000;
+
+async function ytmArtistCatalog(name) {
+  const q = String(name || "").trim();
+  if (!q) return null;
+  const ck = "ytm:" + singerNorm(q);
+  const hit = YTM_CAT_CACHE[ck];
+  if (hit && Date.now() - hit.at < YTM_CAT_TTL) return hit.v;
+  try {
+    const art = await ytmFindArtist(q);
+    if (!art) return null;
+    const al = await ytmArtistAlbums(art.id);
+    if (!al.albums.length) return null;
+    /* 逐张拉曲目。李志 13 张，并发 4 路约 4~6 秒 —— 只在兜底路径上跑，
+       正常歌手（酷狗/酷我有条目）根本不会走到这里。 */
+    const albums = [];
+    const tracks = [];
+    const seenT = {};
+    const CONC = 4;
+    for (let i = 0; i < al.albums.length; i += CONC) {
+      const batch = al.albums.slice(i, i + CONC);
+      const parts = await Promise.all(batch.map(async (a) => {
+        const tr = await ytmAlbumTracks(a.id, a.artist || art.name, a.title).catch(() => []);
+        return { a: a, tr: tr };
+      }));
+      for (let j = 0; j < parts.length; j++) {
+        const p = parts[j];
+        albums.push({
+          id: "ytmal:" + p.a.id,
+          platform: "YouTube",
+          title: p.a.title,
+          artist: p.a.artist || art.name,
+          artwork: p.a.artwork || "",
+          date: p.a.date || "",
+          description: "",
+          worksNum: p.tr.length,
+          _provider: "youtube",
+          _kind: "album",
+        });
+        for (let k = 0; k < p.tr.length; k++) {
+          const t = p.tr[k];
+          if (seenT[t.id]) continue;
+          seenT[t.id] = 1;
+          tracks.push(t);
+        }
+      }
+    }
+    const v = { id: art.id, name: art.name, albums: albums, tracks: tracks };
+    YTM_CAT_CACHE[ck] = { at: Date.now(), v: v };
+    return v;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function ytSearchRaw(query) {
   const c = YT_ANDROID;
   const r = await axios_1.post(
@@ -5965,6 +6266,32 @@ async function searchArtist(query, page) {
         });
       }
     } catch (e) { /* 拿不到就维持空结果 */ }
+
+    /* Apple 也没有（或 iTunes 那几个区都没铺这个人）→ 问 YouTube Music。
+       实测「脆弱少女组」Apple 目录取不到（null），YTM 有 3 张 16 首。
+       两家都是「平台全无」时的兜底，先 Apple 后 YTM，谁有就用谁。 */
+    if (!out.length) {
+      try {
+        let cat = await ytmArtistCatalog(eq);
+        if (!cat && eq !== query) cat = await ytmArtistCatalog(query);
+        if (cat && (cat.albums.length || cat.tracks.length)) {
+          console.log("[粽子] 平台与 Apple 全无此歌手，YouTube Music 目录「" + cat.name + "」"
+            + cat.albums.length + " 张 / " + cat.tracks.length + " 首");
+          out.push({
+            id: "ytmcat:" + cat.id,
+            platform: "YouTube",
+            name: cat.name || eq,
+            avatar: (cat.albums[0] && cat.albums[0].artwork) || "",
+            worksNum: cat.tracks.length || cat.albums.length,
+            albumNum: cat.albums.length,
+            fans: 0,
+            description: "",
+            _provider: "youtube",
+            _ytmCh: cat.id,
+          });
+        }
+      } catch (e) { /* 还拿不到就维持空结果 */ }
+    }
   }
 
   /* 排序：统一走 sortArtistResults（2026-10-21）。
@@ -5989,10 +6316,37 @@ async function searchArtist(query, page) {
     }));
   }
 
+  /* ---- YouTube Music 目录兜底（2026-10-21）----
+     有些歌手在国内平台上根本没有正经条目，只有一个同名野鸡号：
+       搜「李志」网易云给的是 musicSize=2 的空壳（《Tbzjfdasg》《Ozjdgwaasd》
+       这种乱码歌名），QQ 歌手接口 500003 已死，酷狗只回「李志辉 / 李志强」，
+       酷我/咪咕压根没有。但李志在 YouTube Music 上有 13 张官方专辑 110 首 ATV。
+     判据：条目作品数少得离谱（<10）→ 问 YTM。YTM 明显更全才接管，
+     否则不动（周杰伦 1708 首永远走国内源，不会去问 YTM）。 */
+  const ytmTargets = deduped.filter((x) => Number(x.worksNum) < 10).slice(0, 2);
+  if (ytmTargets.length) {
+    await Promise.all(ytmTargets.map(async (x) => {
+      try {
+        const cat = await ytmArtistCatalog(x.name);
+        if (!cat || !cat.tracks || !cat.tracks.length) return;
+        if (cat.tracks.length <= Number(x.worksNum || 0)) return;
+        console.log("[粽子] 「" + x.name + "」平台条目只有 " + Number(x.worksNum || 0)
+          + " 首，改用 YouTube Music 目录 " + cat.albums.length + " 张 / " + cat.tracks.length + " 首");
+        x._ytmCh = cat.id;
+        /* 平台名也跟着换 —— 点进去出来的全是 YouTube 的曲目，
+           还挂着「网易云」的标签会让人以为串源了。 */
+        x.platform = "YouTube";
+        x.worksNum = cat.tracks.length;
+        x.albumNum = cat.albums.length;
+        if (!x.avatar && cat.albums[0] && cat.albums[0].artwork) x.avatar = cat.albums[0].artwork;
+      } catch (e) { /* 拿不到就维持原样 */ }
+    }));
+  }
+
   /* ⚠️「有数字」不等于「数字对」：实测「那我懂你意思了」，
      酷狗把名字指向了冒名歌手（名下只有 2 首），列表就写「2 首」，
      用户会以为源坏了 —— 其实真乐团 31 首。Apple 目录更全时以它为准。 */
-  const fewWorks = deduped.filter((x) => Number(x.worksNum) < 10).slice(0, 3);
+  const fewWorks = deduped.filter((x) => Number(x.worksNum) < 10 && !x._ytmCh).slice(0, 3);
   if (fewWorks.length) {
     await Promise.all(fewWorks.map(async (x) => {
       try {
@@ -9053,6 +9407,31 @@ async function getAlbumDetail(albumItem, page) {
   const id = albumItem && albumItem.id;
   if (!id) return null;
 
+  /* YouTube Music 专辑（ytmal:MPREb_xxx）—— 曲目直接读 YTM 专辑页。
+     YTM 返回的是 ATV 官方音轨，取流走的是同一个 videoId，能直接播。 */
+  if (String(id).indexOf("ytmal:") === 0) {
+    const mid = String(id).slice(6);
+    if (!mid) return null;
+    try {
+      const tr = await ytmAlbumTracks(mid, albumItem.artist || "", albumItem.title || "");
+      if (!tr.length) return null;
+      return {
+        isEnd: true,
+        albumItem: {
+          id: String(id),
+          platform: "YouTube",
+          title: albumItem.title || "",
+          artist: albumItem.artist || "",
+          artwork: (tr[0] && tr[0].artwork) || albumItem.artwork || "",
+          date: albumItem.date || "",
+          description: "",
+          worksNum: tr.length,
+        },
+        musicList: tr,
+      };
+    } catch (e) { return null; }
+  }
+
   /* Apple Music 目录占位专辑：平台没这张唱片，但用户点了得有东西看。
      曲目表从 Apple 的歌手目录里按专辑名捞，再用 YouTube 找可播放的音频 ——
      找到了就能听，找不到至少知道这张专辑有哪几首。 */
@@ -9418,6 +9797,29 @@ async function kuwoSheetsByAlbum(albumId) {
 async function getArtistWorksOf(artistItem, page, type) {
   const id = artistItem && artistItem.id;
   if (!id) return { isEnd: true, data: [] };
+
+  /* YouTube Music 目录歌手（搜索时由 ytmArtistCatalog 打过 _ytmCh 标记）：
+     国内平台上这个人的条目是空的，只有 YTM 有完整目录。
+     直接在目录缓存上切片，不再去打任何平台接口。 */
+  if (artistItem._ytmCh) {
+    try {
+      const cat = await ytmArtistCatalog(artistItem.name || "");
+      if (cat && (cat.albums.length || cat.tracks.length)) {
+        const rn0 = 30;
+        const begin0 = ((page || 1) - 1) * rn0;
+        if (type === "album") {
+          return {
+            isEnd: begin0 + rn0 >= cat.albums.length,
+            data: cat.albums.slice(begin0, begin0 + rn0),
+          };
+        }
+        return {
+          isEnd: begin0 + rn0 >= cat.tracks.length,
+          data: cat.tracks.slice(begin0, begin0 + rn0),
+        };
+      }
+    } catch (e) { /* 落到下面的通用链路 */ }
+  }
 
 
   const pn = (page || 1) - 1;
@@ -11964,7 +12366,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.18",
+  version: "4.10.19",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
