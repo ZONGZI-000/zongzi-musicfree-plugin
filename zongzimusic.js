@@ -1331,6 +1331,10 @@ const MEDIA_VIDEO_RE = /幕后|幕後|花絮|混剪|首播|预告|預告|抢先�
  *
  * 只在**视频平台**上、且去掉歌名歌手后还剩 ≥6 字时才判 ——
  * 《新闻》这种真歌名（长度短、没有媒体署名）不会被误杀。 */
+/** 媒体 / 聚合号频道名。搜歌手时，器材是这些账号发的就不是歌。
+ *  ⚠️ 不敢用单独命中就删：还要看标题去掉查询词后剩多少字（见 _nd 那段）。 */
+const MEDIA_CHANNEL_RE = /腾讯视频|驰訊視頻|爱奇艺|愛奇藝|优酷|優酷|芒果TV|山循|WeTV|wetv|微博视频|西瓜视频|犁视频|看看新闻|东方卫视|浙江卫视|湖南卫视|江苏卫视|北京卫视|新媒体|娱乐号|星闻|明星律动|鏡新聞|鏡速報|鏡週刊|媒体/i;
+
 const NEWS_SOURCE_RE = /蘋果日報|苹果日报|聯合報|联合报|自由時報|自由时报|中國時報|中国时报|星島|星岛|明報|明报|東森新聞|东森新闻|三立新聞|三立新闻|蘋果新聞|苹果新闻|新浪娱乐|新浪娛樂|網易娛樂|网易娱乐|騰訊娛樂|腾讯娱乐|娱乐新闻|娛樂新聞|新聞網|新闻网|新聞台|新闻台|电视台|電視台|[日週周]报|晚报|晚報|周刊|週刊/i;
 
 /** 查询词整串是否就是这位歌手的名字（搜「周杰伦」而不是搜某首歌）。
@@ -14029,6 +14033,18 @@ async function searchMusicAll(query, page) {
       droppedNews++;
       continue;
     }
+    /* ⚠️ 上面那条闸靠 artistQuery，而 artistQuery 在这里可能还没算出来
+       （2026-10-21 实测搜「赵薇」：detectArtistQuery 返回空）。
+       于是那几条娱乐新闻就跟着结果一起出去了：
+         《演员请就位》回忆：赵薇3次推掉《亲爱的》…  —— 腾讯视频
+         趙薇睩違 5 年新加坡公開亮相！…「重看」｜鏡速報 #鏡新聞
+       所以先只打标记不删，等下面 Apple / YTM 目录确认了「这确实是个歌手」
+       之后再一次清掉。这样反向不会误杀真歌（带新闻字样的歌名）。 */
+    if (!isArtistQuery(query, it.artist) &&
+        (NEWS_TITLE_RE.test(it.title) || MEDIA_CHANNEL_RE.test(String(it.artist || "")))) {
+      const residualN = coreTitle(it.title).replace(coreTitle(query), "").length;
+      if (residualN >= 8) it._nd = 1;
+    }
     /* 搜歌手名时，「歌手不是他、标题里也没有他的名字」的条目直接不收。
        ⚠️ 实测 2026-10-21 搜「李志」：名单里混着
           《今生只爱你一个》- 李志洲 / 《月》- 李志成 / 《完美犯罪》- 李志强
@@ -14370,6 +14386,23 @@ async function searchMusicAll(query, page) {
      ⚠️ 只在**补歌和加分**上用 YTM，不用它硬删 —— 见 ytmArtistCatalog 的注释。 */
   const catForFill = appleCat || ytmCat;
 
+  /* ---- 媒体号发的新闻/资讯片段：有了权威目录就彻底清掉 ----
+     上面那一圈只打了 _nd 标记（那时还不知道这是不是个歌手）。
+     现在 Apple / YTM 都问完了，只要任一家认这个名字就是歌手：
+     那些「赵薇推掉《亲爱的》」「睩違 5 年亮相」就一定不是歌，直接不收。
+     ⚠️ 两家都没目录时不动 —— 那时删了可能真把命中歌清光。 */
+  const _isArtistRound = artistQuery || (!!appleCat && normTextZ(appleCat.name) === normTextZ(query)) ||
+    (!!ytmCat && normTextZ(ytmCat.name) === normTextZ(query));
+  if (_isArtistRound) {
+    let ndDrop = 0;
+    for (let i = relevant.length - 1; i >= 0; i--) {
+      if (!relevant[i]._nd) continue;
+      ndDrop++;
+      relevant.splice(i, 1);
+    }
+    if (ndDrop) console.log("[粽子] 清掉媒体号的新闻/资讯片段 " + ndDrop + " 条");
+  }
+
   /* ---- MusicBrainz 目录：Apple 和 YTM 都太薄时的第三份证词 ----
      实测（2026-10-21）搜「赵薇」：
        Apple 只有 1 张 10 首，YTM 也是 1 张 10 首（两边都只认《天使旅行箱》），
@@ -14483,7 +14516,18 @@ async function searchMusicAll(query, page) {
     }
   }
   const _useYtmFill = !appleCat || appleCat.tracks.length < 10 || _catHit < 6;
-  if (ytmCat && _useYtmFill && (artistQuery || artistHits >= 2)) {
+  /* ⚠️ 这道闸必须跟上面 _wantCatalog 用同一个判据（2026-10-21 实测搜「赵薇」）。
+     原来写的是 `artistQuery || artistHits >= 2`，可「赵薇」正好是那种
+     两个都不成立的查询：列表前排被 Apple 白名单清过，剩下几条的
+     artist 写的是繁体「趙薇」或 UP 主昵称，所以 artistQuery 空、
+     artistHits 只有 1。结果 **YTM 目录已经拿到了 1 张 10 首**（日志里明明白白
+     打着「YTM 目录「趙薇」1 张专辑 / 10 首」），却在门口被这句挡掉，
+     一首都没补进来 —— 用户看到的就只剩新闻切片和翻唱。
+     补一条：**YTM 认的这位歌手，名字跟查询词就是同一个** ——
+     这就是最硬的「它在搜歌手」的证据，比 artistHits 可靠得多。 */
+  const ytmIsArtistQuery = artistQuery || artistHits >= 2 ||
+    (!!ytmCat && normTextZ(ytmCat.name) === normTextZ(query));
+  if (ytmCat && _useYtmFill && ytmIsArtistQuery) {
     /* ⚠️⚠️ 这里的 have 必须**按歌手**算，不能只按歌名 ——
        实测（2026-10-21）搜「李志」：
          QQ 上有耿十三翻唱的《关于郑州的记忆》（artist=耿十三）
@@ -14602,7 +14646,14 @@ async function searchMusicAll(query, page) {
          而且补到一批就走人。实测「脆弱少女组」2.7s 起步 + 一批补全 ≈ 3.4s；
          周杰伦/陈奕迅那种大目录根本进不到这里。 */
       const TOTAL_BUDGET = 3600;
-      const FILL_BUDGET = Math.max(0, Math.min(2600, TOTAL_BUDGET - (Date.now() - T0)));
+      /* ⚠️ 必须给补全留一个下限（2026-10-21 实测搜「赵薇」）。
+         原来是 Math.max(0, …)，可「等 YTM 目录」那一段最多占 4.6s，
+         YTM 一超时，这里的剩余预算就是 0 —— 于是「已经拿到的 10 首目录」
+         一首都补不进来，用户看到的就只剩新闻切片和翻唱（实测只回 4 条）。
+         目录都已经拿到手了，多等一批补全（1.0~1.3s）洁净得很。
+         这条只在「Apple 目录 10~60 首且确实缺货」时才走，周杰伦/陈奕迅
+         那种大目录根本进不到这里，不会拖慢常见搜索。 */
+      const FILL_BUDGET = Math.max(1700, Math.min(2600, TOTAL_BUDGET - (Date.now() - T0)));
       const fillT0 = Date.now();
       /* 剩余预算不够跑完一批（8 个并发大约要 0.9~1.3s）就别开这一轮，
          否则必然是「发出去了但没等到」，白白多花一秒多。 */
@@ -16355,7 +16406,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.52",
+  version: "4.10.53",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
