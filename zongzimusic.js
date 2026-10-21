@@ -3989,6 +3989,27 @@ const SINGER_LATIN = {
   "李志": ["li zhi"],
 };
 
+/** 一两字的歌名（赵薇《爱》《变了》《状态》，《春》这种）怎样算对上？
+ *  不能放宽成「包含」—— 《愛之玄》《愛情大魔咒》都会顶到《爱》头上；
+ *  也不能只认全等 —— YouTube 上的写法是「【變了】/ 趙薇」「趙薇 Vicki Zhao
+ *  《變了 Changed》」，全等永远命中不了。
+ *  规则：按装饰符切段，任何一段整段等于歌名就算；或者某段以歌名打头
+ *  且余下只是英文译名（"变了changed"）。余下是汉字的一律不算。 */
+function shortTitleOk(rawTitle, tn) {
+  const raw = String(rawTitle || "");
+  const parts = raw.split(/[\/|｜·•\-–—_]+|【|】|《|》|「|」|\(|\)|（|）|\[|\]|,|，/);
+  for (let i = 0; i < parts.length; i++) {
+    const np = normTextZ(parts[i]);
+    if (!np) continue;
+    if (np === tn) return true;
+    if (np.length > tn.length && np.indexOf(tn) === 0) {
+      const rest = np.slice(tn.length);
+      if (/^[a-z0-9\s'"!?.]+$/.test(rest)) return true;   // 余下只是英文译名
+    }
+  }
+  return false;
+}
+
 /** 这条 YouTube 结果是不是这位歌手本人（标题或频道名里认得出人） */
 function artistHitIn(y, artistName) {
   const want = String(artistName || "").trim();
@@ -10509,10 +10530,11 @@ async function getAlbumDetail(albumItem, page) {
              全是别人的歌。现在歌手命中是第一权重，Topic 只是加分项，
              认不出歌手的 Topic 条目拿不到高分。 */
           const singerHit = artistHitIn(y, artistName);
-          /* 一两个字的歌名（赵薇《爱》、李志《春》）必须**整名对上**：
-             允许「被包含」的话《愛之玄》《愛情大魔咒》全会顶到《爱》头上 ——
-             实测《双》里的《爱》就是这么变成《愛情大魔咒》的。 */
-          if (tn.length <= 2 && yn !== tn && yBare !== tBare) continue;
+          /* 一两个字的歌名（赵薇《爱》《变了》、李志《春》）必须**整名对上**：
+             允许「被包含」的话《愛之玄》《愛情大魔咒》全会顶到《爱》头上；
+             只认全等又永远命不中「【變了】/ 趙薇」这种写法，
+             所以走 shortTitleOk 的切段判断。 */
+          if (tn.length <= 2 && !shortTitleOk(y.title, tn)) continue;
           let sc = 0;
           if (singerHit) sc += 30; else sc -= 30;
           if (/[-–—]\s*Topic$/i.test(String(y.artist || ""))) sc += singerHit ? 60 : 15;
