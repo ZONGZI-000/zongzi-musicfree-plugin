@@ -4340,18 +4340,49 @@ async function ytmArtistCatalog(name) {
      所以：拿到候选后，如果这份目录薄得可疑（<15 首），换下一个候选再试，
      最多试 3 个，取曲目最多的那份。目录厚的（李志 114 首）第一次就定，
      不会多花请求。 */
-  const cands = await ytmFindCandidates(q).catch(function () { return []; });
-  if (!cands.length) return null;
+  const cands0 = await ytmFindCandidates(q).catch(function () { return []; });
+  if (!cands0.length) return null;
+  /* 全等名的那条排在最前面（有的话）—— 它就是这个人，不用再试别的。 */
+  const exactIdx = cands0.findIndex(function (c) { return singerNorm(c.name) === singerNorm(q); });
+  const cands = exactIdx > 0
+    ? [cands0[exactIdx]].concat(cands0.filter(function (_, i) { return i !== exactIdx; }))
+    : cands0;
   let bestV = null;
   for (let ci = 0; ci < Math.min(cands.length, 3); ci++) {
     const v = await buildYtmCatalog(cands[ci]).catch(function () { return null; });
     if (!v) continue;
-    if (!bestV || v.tracks.length > bestV.tracks.length) bestV = v;
-    if (bestV.tracks.length >= 15) break;   // 够厚了，不再试
+    if (!bestV) { bestV = v; }
+    else {
+      /* ⚠️ 不能只比曲目数（2026-10-21 实测「L'Arc-en-Ciel」）：
+         首选是「Georges Aubanel, Ensemble vocal "L'arc en ciel"」——
+         一个唱诗班，1 张专辑 12 首；真身「彩虹樂團」20 张 133 首。
+         加两道：① 全等名字的一律优先 ② 专辑数明显更多的才算更全。 */
+      const bExact = singerNorm(bestV.name) === singerNorm(q);
+      const vExact = singerNorm(v.name) === singerNorm(q);
+      if (vExact && !bExact) bestV = v;
+      else if (vExact === bExact) {
+        const bAlb = (bestV.albums || []).length, vAlb = (v.albums || []).length;
+        if (vAlb > bAlb * 2 || (vAlb >= bAlb && v.tracks.length > bestV.tracks.length)) bestV = v;
+      }
+    }
+    /* 已经匹配到全等名、而且目录够厚 → 不用再试。 */
+    if (singerNorm(bestV.name) === singerNorm(q) && bestV.tracks.length >= 15) break;
+    /* 拉丁名/本地化名这类「一条都不全等」的情况：只有第一份目录明显是
+       小号（<20 首）才值得再试一个，别为了复核每次都多花 3 秒。 */
+    if (exactIdx < 0 && bestV.tracks.length >= 20) break;
   }
   if (!bestV) return null;
   YTM_CAT_CACHE[ck] = { at: Date.now(), v: bestV };
   return bestV;
+}
+
+/** 只要「YTM 认的是谁」——只拉候选，不拉目录（0.4~1 秒）。
+    搜索结果里用它填 _ytmName/_ytmCh，别等完整的曲目表。 */
+async function ytmResolveIdentity(name) {
+  const q = String(name || "").trim();
+  if (!q) return null;
+  const cands = await ytmFindCandidates(q).catch(function () { return []; });
+  return cands.length ? cands[0] : null;
 }
 
 /** 一个候选 → 完整目录（专辑 + 曲目 + 热门）。原来 ytmArtistCatalog 的正文。 */
@@ -12092,7 +12123,33 @@ async function kuwoSheetsByAlbum(albumId) {
 }
 
 /** 歌手作品：酷我按 artistid 拉歌曲/专辑 */
+/* 通用作品列表缓存（2026-10-21）。
+   ⚠️ 不只 YouTube 那条要缓存：MusicFree 进歌手页会把歌曲页和专辑页各调一次，
+   **每次从列表点进来还会再调一遍**，而主流歌手那几条路（酷狗 + Apple 目录
+   并行判断、多源 _alts 合并）实测 2~4 秒。用户来回进出就是在反复等。
+   按「平台 + id + 类型 + 页码」缓存 15 分钟：第二页起不缓存（翻页本来就慢，
+   而且页码会跟合并结果错位）。 */
+const ARTIST_GENERIC_CACHE = {};
+const ARTIST_GENERIC_TTL = 15 * 60 * 1000;
+
 async function getArtistWorksOf(artistItem, page, type) {
+  const id = artistItem && artistItem.id;
+  if (!id) return { isEnd: true, data: [] };
+
+  const gcKey = "g|" + String(artistItem.platform || "") + "|" + String(id) +
+    "|" + String(type || "music") + "|" + String(page || 1);
+  const gcHit = ARTIST_GENERIC_CACHE[gcKey];
+  if (gcHit && Date.now() - gcHit.at < ARTIST_GENERIC_TTL) {
+    return { isEnd: gcHit.isEnd, data: gcHit.data };
+  }
+  const gcOut = await getArtistWorksUncached(artistItem, page, type);
+  if (gcOut && Array.isArray(gcOut.data) && (page || 1) === 1) {
+    ARTIST_GENERIC_CACHE[gcKey] = { at: Date.now(), data: gcOut.data, isEnd: gcOut.isEnd };
+  }
+  return gcOut;
+}
+
+async function getArtistWorksUncached(artistItem, page, type) {
   const id = artistItem && artistItem.id;
   if (!id) return { isEnd: true, data: [] };
 
@@ -15297,7 +15354,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.39",
+  version: "4.10.40",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
