@@ -964,6 +964,25 @@ async function isPreviewOnly(url, durationMs, fallbackMs) {
   return p.total / (useMs / 1000) < MIN_BYTES_PER_SEC;
 }
 
+/* ⚠️ 边界归一化：**从播放器进来**的 duration 是秒，插件内部一律毫秒。
+ *
+ * MusicFree 的 IMusicItem.duration 单位是秒（官方类型定义），
+ * 所以用户点一首歌时，getMediaSource 收到的 musicItem.duration 也是秒。
+ * 而插件内部（试听片段判断、B站选版本、缓存键）全都按毫秒算 ——
+ * 不换算的话，一首 4 分钟的歌会被当成 240 秒 = 240000 毫秒？
+ * 不对，是反过来：240 毫秒，比 TRIAL_SECONDS 小得多，
+ * 于是「完整度=0」，试听检测直接把它当片段判掉，好歌反而被拒。
+ *
+ * 判据：< 3000 的一定是秒（3 秒以下的歌不存在）；
+ *      >= 3000 的按毫秒（3000ms = 3 秒，同样是「不可能更短」的边界）。
+ * 两边都不重叠，不会误判。
+ */
+function durToMs(v) {
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return 0;
+  return n < 3000 ? Math.round(n * 1000) : Math.round(n);
+}
+
 /** 把各平台五花八门的时长写法统一成毫秒。
  *  实测见过的形态：
  *    COCO  netease/qq/kugou → "05:25"（字符串）
@@ -998,7 +1017,7 @@ function parseDuration(raw) {
  *    0 = 时长明显过短 —— 试听片段/切片，实际听两下就断
  */
 function completenessOf(item) {
-  const ms = Number(item && item.duration) || 0;
+  const ms = durToMs(item && item.duration);
   if (ms > 0 && ms < TRIAL_SECONDS * 1000) return 0;
   if (ms > 0) return 3;
   return 2;
@@ -14825,7 +14844,8 @@ async function resolveMediaSource(musicItem, quality) {
   const q = QUALITY_MAP[quality] || "128k";
   const want = { name: musicItem.title, singer: musicItem.artist, album: musicItem.album };
   const provider = musicItem._provider || LABEL_TO_PROVIDER[musicItem.platform] || "netease";
-  const durMs = Number(musicItem.duration) || 0;
+  /* 播放器传进来的 duration 是秒，内部一律毫秒（见 durToMs）。 */
+  const durMs = durToMs(musicItem.duration);
   /* 目标时长也要传给兜底 —— B 站那一路靠它从一堆版本里挑最贴近原盘的那个
      （同一首歌在 B 站常有伴奏 253s / Remix 233s / 剪辑版 103s 一起排队）。
      别的平台用不到，多挂一个字段不影响。 */
@@ -15277,7 +15297,7 @@ function lyricNameHit(cand, want) {
 
 /** 条目时长（毫秒），0 表示未知 */
 function lyricDurMs(item) {
-  const ms = Number(item && item.duration) || 0;
+  const ms = durToMs(item && item.duration);
   return ms > 500 ? ms : 0;
 }
 
@@ -15647,7 +15667,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.44",
+  version: "4.10.45",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -16350,6 +16370,51 @@ function md5Hex(str) {
  * 而是在导出层统一包一层：凡是对外返回曲目列表的方法，出参都过一遍
  * deepFillArt()。以后新加平台也不用再记得手动补封面。
  * ============================================================ */
+/* ============================================================
+ * 导出层的时长单位转换（2026-10-21 修「66:40:00」）
+ *
+ * ⚠️ MusicFree 的 IMusicItem.duration 单位是**秒**（官方类型定义原文：
+ *    「时长(s)  duration: number」）。插件内部一直按**毫秒**存 ——
+ *    因为判断试听片段、比较版本时长、B站选档这些都要毫秒精度。
+ *    两套单位没在边界上对齐，播放器就把 240000 当成 240000 秒：
+ *    240000 / 3600 = 66.67 小时 → 界面显示 **66:40:00**（实测截图）。
+ *
+ * 修法：内部保持毫秒**一处都不动**（改了要连坐几十处判断），
+ *      只在导出层除以 1000 —— 和 deepFillArt 一样做成统一挂载点，
+ *      以后新加方法只要加进这个名单就自动正确。
+ *
+ * ⚠️ 只转「曲目」：IMusicItem / IMusicSheetItem 才有 duration。
+ *    IAlbumItem、IArtistItem 没有这个字段，不能瞎塞。
+ *    id / platform / artist / title 都在，且没有 musicList/data 的，才是曲目。
+ * ============================================================ */
+function msToSec(v) {
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return 0;
+  /* 已经小于 1000 的当成「本来就是秒」，不重复除 —— 万一哪条路径
+     漏了乘 1000，至少不会把一首 4 分钟的歌变成 0 秒。 */
+  return n < 1000 ? Math.round(n) : Math.round(n / 1000);
+}
+
+function convertDuration(o, depth) {
+  if (!o || typeof o !== "object" || depth > 4) return o;
+  if (Array.isArray(o)) {
+    for (let i = 0; i < o.length; i++) convertDuration(o[i], depth + 1);
+    return o;
+  }
+  /* 判「这是一首歌」：必须有 id + (title|name)，且自己不是容器 */
+  const isTrack = (o.id || o.songmid) && (o.title || o.name) &&
+    !o.musicList && !o.data && !o.sheetItem;
+  if (isTrack && o.duration !== undefined && o.duration !== null) {
+    o.duration = msToSec(o.duration);
+    o.__durSec = true;          // 标记：已经是秒了，别再转第二次
+  }
+  const kids = ["data", "musicList", "tracks", "list", "sheetItem"];
+  for (let k = 0; k < kids.length; k++) {
+    if (o[kids[k]]) convertDuration(o[kids[k]], depth + 1);
+  }
+  return o;
+}
+
 (function () {
   ["search", "getAlbumInfo", "getMusicSheetInfo", "getArtistWorks", "getTopLists",
    "getTopListDetail", "getRecommendSheetsByTag", "getMusicComments"].forEach(function (name) {
@@ -16357,8 +16422,9 @@ function md5Hex(str) {
     if (typeof fn !== "function") return;
     module.exports[name] = function () {
       const r = fn.apply(this, arguments);
-      if (r && typeof r.then === "function") return r.then(function (v) { return deepFillArt(v, 0); });
-      return deepFillArt(r, 0);
+      const fix = function (v) { return convertDuration(deepFillArt(v, 0), 0); };
+      if (r && typeof r.then === "function") return r.then(fix);
+      return fix(r);
     };
   });
 })();
