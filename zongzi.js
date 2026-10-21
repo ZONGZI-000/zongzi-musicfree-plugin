@@ -8207,6 +8207,14 @@ function fbHash(str) {
     h ^= t.charCodeAt(i);
     h = (h * 16777619) >>> 0;
   }
+  /* ⚠️ FNV-1a 的低位很脏：乘法不把高位混回低位，取模小数字时几乎全是 0。
+     实测赵薇 9 张专辑全落在 % 4 === 0，一屏九格同一张图，看着像没加载出来。
+     所以再走一遍 murmur3 的 fmix32 做雪崩，把高位搅回低位。 */
+  h ^= h >>> 16;
+  h = Math.imul(h, 2246822507) >>> 0;
+  h ^= h >>> 13;
+  h = Math.imul(h, 3266489909) >>> 0;
+  h ^= h >>> 16;
   return h >>> 0;
 }
 
@@ -12692,9 +12700,18 @@ const MEDIA_URL_TTL = 30 * 60 * 1000;
    每次 quality 都不同 → 缓存全 miss → 每次重新取流 1.2 秒，
    表现就是「每 3 秒转一次」。
    实际上我们各音质档拿到的是同一个文件（YouTube 就是一条流），
-   所以按 platform+id 缓存即可，跟 quality 无关。 */
+   所以按 platform+id 缓存即可，跟 quality 无关。
+
+   ⚠️ 但**没有 id 的条目必须带上歌名**。
+   MusicBrainz 补进来的曲目 id 是空串（MB 没有音源 id，播放走跨平台兜底），
+   如果只按 platform+id 缓存，整张专辑所有曲目的 key 全是 "MusicBrainz|"，
+   谁先播谁占坑，后面每一首都直接命中第一首的音频 ——
+   表现为「点《孰轻孰重》播出来的是《来得及的明天》」。 */
 function mediaCacheKey(item) {
-  return String(item.platform || "") + "|" + String(item.id || "");
+  const id = String(item.id || "");
+  if (id) return String(item.platform || "") + "|" + id;
+  return String(item.platform || "") + "|#" +
+    String(item.title || "") + "|" + String(item.artist || "");
 }
 function mediaCacheGet(item) {
   const k = mediaCacheKey(item);
@@ -13477,7 +13494,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.25",
+  version: "4.10.26",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
