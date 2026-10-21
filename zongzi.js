@@ -1213,6 +1213,21 @@ function officialBone(raw, artist, platform, query, artistQuery) {
   // 标题里带演唱者署名「xxx - 歌名」结构的多半是搬运
   if (/^[^-]{2,20}\s*[-–—]\s*/.test(t) && !/[-–—]\s*Topic$/i.test(a)) bone += 8;
 
+  /* ---- 搜歌手名时：歌手字段没对上这位歌手的，压一档 ----
+     ⚠️ 实测（2026-10-21）搜「李志」：
+        QQ 耿十三翻唱的《关于郑州的记忆》排在真正的原唱前面，
+        B 站《KTV<关于郑州的记忆> 原唱李志》（上传者 tzzyyyyyy）也在里面。
+        它们 tier 都是 3（歌名对上了），apc 都是 -20（YTM 目录没这首），
+        剩下全靠 order 决定 —— 也就是「谁先被搜到谁在前」，纯随机。
+     判据：artistQuery 成立时，条目自己的歌手字段是不是查询里那位。
+        只对「国内平台 + YouTube」用，B 站/YouTube 的搬运条目本来就
+        是频道名，硬压会把有用的音频一起压下去（后面还有 tier 兜着）。 */
+  if (artistQuery && platform !== "Bilibili" && platform !== "YouTube" &&
+      a && singerNorm(a) !== singerNorm(q) &&
+      singerNorm(a).indexOf(singerNorm(q)) < 0 && singerNorm(q).indexOf(singerNorm(a)) < 0) {
+    bone += 25;
+  }
+
   // 内地数字平台上的同名单曲：原唱常常没版权，页面里剩的多是翻唱
   if (platform === "QQ音乐" || platform === "网易云" || platform === "酷狗" || platform === "咪咕") bone += 12;
 
@@ -2238,6 +2253,12 @@ function appleCatScore(item, cat) {
   }
   if (trackHit) return 45;
   if (albumHit) return 30;
+  /* ⚠️ YTM 目录即使 complete 也只能轻压，绝不能 -60 ——
+     实测李志：YTM 有 110 首，但《关于郑州的记忆》《他们》《广场》
+     这些敏感曲目平台上根本没有官方音轨，目录里也就没有。
+     拿它当「完整白名单」重罚，YouTube 上那些真歌会被一起打死。
+     Apple 那边不一样：Apple 缺歌多半是真没有，罚得重才安全。 */
+  if (cat._src === "ytm") return cat.albums.length >= 3 ? -20 : 0;
   /* 两边都没命中 —— 只有目录**确实完整**时才敢降权，
      否则碰上 Apple 里只有一张单曲的小众艺人、或者被截断的大歌手，
      会大面积误伤真歌。 */
@@ -3583,6 +3604,33 @@ async function ytmFindArtist(name) {
   return cands[0];
 }
 
+/**
+ * 艺人页 → 热门歌曲（页面顶部那一排 musicResponsiveListItemRenderer）。
+ *
+ * ⚠️ 这一路很重要：李志的代表作《關於鄭州的記憶》《熱河》《天空之城》
+ *    都是单曲，**不在任何一张专辑的曲目里**，
+ *    只顺着专辑拉曲目会把它们整个漏掉 —— 列表头部于是全是
+ *    《門》《日》《死人》这种冷门 B 面。
+ *    YTM 艺人页顶部那 5 条就是它自己排的热门，正好补上这个洞。
+ */
+async function ytmTopSongs(channelId, artistName) {
+  const d = await ytmCall("browse", { context: ytmCtx(), browseId: channelId });
+  const rows = ytmCollect(d, "musicResponsiveListItemRenderer");
+  const out = [];
+  const seen = {};
+  for (let i = 0; i < rows.length; i++) {
+    const t = ytmRowToTrack(rows[i], artistName, "");
+    if (!t || seen[t.id]) continue;
+    seen[t.id] = 1;
+    /* 艺人页的条目没有专辑名，第 2 列是播放量 ——
+       ytmRowToTrack 会把播放量当 artist 塞进来，这里纠正成歌手本名。 */
+    t.artist = artistName || t.artist;
+    t.album = t.album || "";
+    out.push(t);
+  }
+  return out;
+}
+
 /** 艺人页 → 专辑列表（MPREb...） */
 async function ytmArtistAlbums(channelId) {
   const d = await ytmCall("browse", { context: ytmCtx(), browseId: channelId });
@@ -3649,12 +3697,15 @@ async function ytmArtistCatalog(name) {
     if (!art) return null;
     const al = await ytmArtistAlbums(art.id);
     if (!al.albums.length) return null;
+    /* 热门歌曲跟专辑列表并发拉 —— 但 ytmArtistAlbums 已经用了同一个 browse，
+       这里单独再发一次是「同一份页面」，代价很小。 */
+    const topSongs = await ytmTopSongs(art.id, art.name).catch(function () { return []; });
     /* 逐张拉曲目。李志 13 张，并发 4 路约 4~6 秒 —— 只在兜底路径上跑，
        正常歌手（酷狗/酷我有条目）根本不会走到这里。 */
     const albums = [];
     const tracks = [];
     const seenT = {};
-    const CONC = 4;
+    const CONC = 6;
     for (let i = 0; i < al.albums.length; i += CONC) {
       const batch = al.albums.slice(i, i + CONC);
       const parts = await Promise.all(batch.map(async (a) => {
@@ -3683,7 +3734,55 @@ async function ytmArtistCatalog(name) {
         }
       }
     }
-    const v = { id: art.id, name: art.name, albums: albums, tracks: tracks };
+    /* 跟 Apple 目录同构：带上 trackSet / albumSet，
+       这样 appleCatScore 那套打分可以直接复用。
+       full/complete 语义也照搬：
+         full      = 这份目录没被截断（YTM 艺人频道就是他的全部发行）
+         complete  = 曲目够多（>=15）才敢当「硬删白名单」用
+       ⚠️ 但 YTM 这边**只用来加分和补歌，不用来删** ——
+           YTM 频道缺某些发行（地区/版权）比 Apple 常见得多，
+           拿它当白名单硬删会误伤平台上的真歌。 */
+    const trackSet = {};
+    const albumSet = {};
+    for (let i = 0; i < tracks.length; i++) {
+      const n = normTextZ(tracks[i].title);
+      if (n) trackSet[n] = 1;
+      const c = normTextZ(coreTitle(tracks[i].title));
+      if (c) trackSet[c] = 1;
+    }
+    for (let i = 0; i < albums.length; i++) {
+      const k = normAlbumName(albums[i].title);
+      if (k) albumSet[k] = 1;
+    }
+    /* 热门歌曲并进曲目表：放在最前面（它是 YTM 自己排的「代表作」），
+       去重后不重复计入。 */
+    const mergedTracks = [];
+    const mergedSeen = {};
+    for (let i = 0; i < topSongs.length; i++) {
+      const t = topSongs[i];
+      if (mergedSeen[t.id]) continue;
+      mergedSeen[t.id] = 1;
+      mergedTracks.push(t);
+    }
+    for (let i = 0; i < tracks.length; i++) {
+      const t = tracks[i];
+      if (mergedSeen[t.id]) continue;
+      mergedSeen[t.id] = 1;
+      mergedTracks.push(t);
+    }
+    for (let i = 0; i < mergedTracks.length; i++) {
+      const n = normTextZ(mergedTracks[i].title);
+      if (n) trackSet[n] = 1;
+      const c = normTextZ(coreTitle(mergedTracks[i].title));
+      if (c) trackSet[c] = 1;
+    }
+    const v = {
+      id: art.id, name: art.name, albums: albums, tracks: mergedTracks,
+      top: topSongs,
+      trackSet: trackSet, albumSet: albumSet,
+      _src: "ytm",
+      full: true, complete: tracks.length >= 15,
+    };
     YTM_CAT_CACHE[ck] = { at: Date.now(), v: v };
     return v;
   } catch (e) {
@@ -10303,6 +10402,19 @@ function compareRank(a, b) {
   // bone 越小越好（官方发行版）
   const ba = a._bone || 0, bb = b._bone || 0;
   if (ba !== bb) return ba - bb;
+  /* ---- YTM 代表作优先（2026-10-21）----
+     ⚠️ 实测搜「李志」：他的代表作《關於鄭州的記憶》《天空之城》《忽然》
+        是单曲，不在任何专辑里，YTM 艺人页把它们排在前 5。
+        但下面的「标题越短越前」规则会把《門》《日》《死人》
+        这种一两个字的冷门 B 面顶到最前面 —— 排序完全跑偏。
+     判据：两条都在 YTM 热门里就按热门序；只有一条在，它优先。
+        不在热门的（平台原有条目）排在这些代表作后面，
+        但仍在 bone/tier 已经分好档的同一层里，不会乱。 */
+  const ta = a._ytmTop || 0, tb = b._ytmTop || 0;
+  if (ta || tb) {
+    if (ta && tb) { if (ta !== tb) return ta - tb; }
+    else return ta ? -1 : 1;
+  }
   /* 同档同匹配度、同官方性时，标题短的排前面（2026-10-21）。
      用户的要求：「参考 LX Music，他就是短的在前长的在后」。
      放在 bone 之后是有意的：先把「这首到底是不是正式发行」排明白，
@@ -11128,6 +11240,39 @@ async function searchMusicAll(query, page) {
       + appleCat.albums.length + " 张专辑 / " + appleCat.tracks.length + " 首");
   }
 
+  /* ---- YouTube Music 目录兜底 ----
+     实测搜「李志」（2026-10-21）：单曲列表 47 条里没有一首是他的正经作品，
+     前三条是网易云的《天涯》、QQ 的《苏州河》《阿楚姑娘》，
+     后面全是 B 站搬运和鬼畜（《关于李志是个营销号》《亲戚李志斌的笑容》）。
+     原因：他的作品在国内平台全部下架，Apple Music 也搜不到他，
+     所以上面那套 Apple 白名单整个失效 —— 没有目录就没法区分真伪。
+     但 YouTube Music 上有他完整的 13 张专辑 110 首，而且每条都自带 videoId，
+     拿到就能直接播。
+     所以：**Apple 没有目录、或目录明显残缺时，改问 YTM**。
+     ⚠️ 只在「像在搜歌手」时才问：YTM 目录要 2.6s（逐张拉曲目），
+        搜歌名时白花这 2.6s 是不能接受的。 */
+  let ytmCat = null;
+  const _wantCatalog = artistQuery || artistHits >= 2;
+  const _appleWeak = !appleCat || appleCat.tracks.length < 10;
+  if (_wantCatalog && _appleWeak) {
+    const ytmT0 = Date.now();
+    /* 给 2.8s 上限：目录本身 2.6s，再多就是白等。
+       超时就用已经缓存到的那份（YTM_CAT_CACHE 在函数内部自己写，
+       下次搜同一个歌手直接命中）。 */
+    ytmCat = await Promise.race([
+      ytmArtistCatalog(appleQuery || query).catch(function () { return null; }),
+      new Promise(function (res) { setTimeout(function () { res(null); }, 2800); }),
+    ]);
+    if (ytmCat) {
+      console.log("[粽子] YTM 目录「" + ytmCat.name + "」"
+        + ytmCat.albums.length + " 张专辑 / " + ytmCat.tracks.length + " 首"
+        + "（" + (Date.now() - ytmT0) + "ms）");
+    }
+  }
+  /* 后续打分/补歌统一用这个：Apple 优先，Apple 空就用 YTM。
+     ⚠️ 只在**补歌和加分**上用 YTM，不用它硬删 —— 见 ytmArtistCatalog 的注释。 */
+  const catForFill = appleCat || ytmCat;
+
   /* ---- 有权威目录时，同名冒用的条目直接不收 ----
      搜歌手名时，用户要看的是「这个人的歌」。
      冒名歌手的 artist 字段跟真歌手一模一样，光靠名字永远分不开，
@@ -11181,6 +11326,101 @@ async function searchMusicAll(query, page) {
         频道名是「FragileGirls」，跟查询「脆弱少女组」一个字都不重合，
         排序会因为「歌手对不上」把它们全压到现场视频后面。 */
   let appleFilled = 0;
+
+  /* ---- YTM 目录补全：曲目自带 videoId，直接就是可播音源 ----
+     跟 Apple 那条「逐首去 YouTube 搜」完全不同 —— 这里**零额外请求**，
+     目录里的每一条都已经是 YouTube 上真实的官方音轨（ATV/OMV）。
+     实测「李志」：13 张 110 首，全部带 videoId，取流直接可用。
+     ⚠️ 同样只在像搜歌手时做，且最多补 40 首（别把列表撑成 110 条）。 */
+  /* ⚠️ 只在 Apple 目录**用不上**时才走 YTM 补全。
+     Apple 那边是「逐首去 YouTube 搜 Topic 官方音源」，挑得比 YTM 目录更准
+     （YTM 的专辑排序按新→旧，代表作反而排在后面）。
+     实测「脆弱少女组」：一加 YTM 补全就把它挤掉，头部从
+     「脆弱少女組 - 都市青春戀曲（樂人 Session）」退回到 B 站杀马特搬运。 */
+  const _useYtmFill = !appleCat || appleCat.tracks.length < 10;
+  if (ytmCat && _useYtmFill && (artistQuery || artistHits >= 2)) {
+    /* ⚠️⚠️ 这里的 have 必须**按歌手**算，不能只按歌名 ——
+       实测（2026-10-21）搜「李志」：
+         QQ 上有耿十三翻唱的《关于郑州的记忆》（artist=耿十三）
+         如果只按歌名去重，他就会把李志自己在 YTM 上的原唱挡在门外，
+         结果代表作《關於鄭州的記憶》《天空之城》全被吞掉，
+         头部只剩《門》《日》《死人》这种冷门 B 面。
+       判据：只有当条目的歌手字段确实是这位歌手时，才算「已经有了」。 */
+    const catNameN = normTextZ(ytmCat.name);
+    const sameAsCat = function (it) {
+      const a = normTextZ(splitSingers(it.artist || "")[0] || "");
+      if (!a || !catNameN) return false;
+      return a === catNameN || a.indexOf(catNameN) >= 0 || catNameN.indexOf(a) >= 0;
+    };
+    const have = {};
+    for (let i = 0; i < relevant.length; i++) {
+      if (!sameAsCat(relevant[i])) continue;
+      const n = normTextZ(relevant[i].title);
+      if (n) have[n] = 1;
+      const c = normTextZ(coreTitle(relevant[i].title));
+      if (c) have[c] = 1;
+    }
+    /* 已经在列表里的「他自己的那条」也要按歌手比一遍，
+       否则补进来的会和已有的重复（同名不同平台）。 */
+
+    const add = [];
+    const seenAdd = {};
+    /* ⚠️ YTM 的专辑顺序是「新→旧」，而李志最新那几张恰恰全是
+       《李志、電聲與管弦樂》《爵士樂與不插電新編》《2017跨年版》——
+       也就是改编/现场版。直接按顺序补，列表头部就全是
+       「愛（2017跨年版）」「門（2016跨年版）」，一首原始录音室版都没有。
+       用户搜一个歌手，想看的是他本人的原曲，不是改编合集。
+       所以分两轮挑：先挑「干净的录音室曲目」，不够再补剩下的。 */
+    const YTM_DIRTY_RE = /跨年版|不插電|不插电|管弦|交響|交响|現場|现场|演唱[会會]|巡演|音樂節|音乐节|翻唱|伴奏|純享|纯享|live|unplugged|acoustic/i;
+    const clean = [];
+    const dirty = [];
+    for (let i = 0; i < ytmCat.tracks.length; i++) {
+      const t = ytmCat.tracks[i];
+      const n = normTextZ(t.title);
+      if (!n || have[n] || seenAdd[t.id]) continue;
+      const c = normTextZ(coreTitle(t.title));
+      if (c && have[c]) continue;
+      if (YTM_DIRTY_RE.test(t.title || "") || YTM_DIRTY_RE.test(t.album || "")) dirty.push(t);
+      else clean.push(t);
+    }
+    /* 热门歌曲按 YTM 自己的排位给个序号，排序时要靠它压过「标题越短越前」。 */
+    const topIdx = {};
+    for (let i = 0; i < (ytmCat.top || []).length; i++) {
+      const t = ytmCat.top[i];
+      if (t && t.id) topIdx[t.id] = i + 1;
+    }
+    const ordered = clean.concat(dirty);
+    for (let i = 0; i < ordered.length && add.length < 40; i++) {
+      const t = ordered[i];
+      if (seenAdd[t.id]) continue;
+      seenAdd[t.id] = 1;
+      add.push({
+        id: t.id,
+        platform: "YouTube",
+        /* 标题用 YTM 的，但把「歌手 - 歌名」这种写法剥干净，
+           否则列表里会显示成「李志 - 关于郑州的记忆」 */
+        title: t.title || "",
+        artist: t.artist && normTextZ(t.artist) !== normTextZ(ytmCat.name)
+          ? ytmCat.name
+          : ytmCat.name,
+        album: t.album || "",
+        artwork: t.artwork || "",
+        duration: t.duration || 0,
+        _provider: "youtube",
+        _atv: !!t._atv,
+        _rel: 1,          // 来自已验证的歌手目录，天然相关
+        _ytm: 1,          // 标记：这条是目录补进来的
+        /* YTM 自己排的代表作序号（1 = 最热）。0/undefined = 不在热门里。 */
+        _ytmTop: topIdx[t.id] || 0,
+      });
+    }
+    if (add.length) {
+      for (let i = 0; i < add.length; i++) relevant.push(add[i]);
+      appleFilled = add.length;
+      console.log("[粽子] YTM 目录补全 " + add.length + " 首官方音源");
+    }
+  }
+
   if (appleCat && appleCat.full && appleCat.tracks.length >= 10 &&
       appleCat.tracks.length <= 60) {
     const have = {};
@@ -11325,7 +11565,10 @@ async function searchMusicAll(query, page) {
     it._bone = officialBone(it.title, it.artist, it.platform, query, artistQuery);
     it._hot = hotScore(it.playCount);
     it._auth = authorityScore(it, auth);   // ← 新增：权威库加分
-    it._apc = appleCatScore(it, appleCat); // ← 歌手目录白名单
+    /* ⚠️ 用 catForFill 而不是 appleCat：Apple 没有目录时（李志那种全线下架），
+       要退到 YTM 目录来打分，否则冒名的 B 站搬运会一直顶在最前面。
+       仍然只影响排序，不删条目。 */
+    it._apc = appleCatScore(it, catForFill); // ← 歌手目录白名单
     it._order = order++;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(it);
@@ -12366,7 +12609,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.19",
+  version: "4.10.20",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
