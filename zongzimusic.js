@@ -1472,17 +1472,28 @@ function isTitleQuery(query, items) {
   const qf = flatTitle(query), qc = coreTitle(query);
   if (!qf) return false;
   const list = items || [];
-  let n = 0;
+  let n = 0;      // 标题正好等于查询词、但不是他唱的
+  let hits = 0;   // 歌手字段里写着查询词（说明这串字确实是个人名）
   for (let i = 0; i < list.length; i++) {
     const it = list[i];
-    if (isArtistQuery(query, it.artist)) continue;
+    if (isArtistQuery(query, it.artist)) { hits++; continue; }
     const tf = flatTitle(it.title), tc = coreTitle(it.title);
-    if ((tf && tf === qf) || (tc && tc === qc)) {
-      n++;
-      if (n >= 3) return true;
-    }
+    if ((tf && tf === qf) || (tc && tc === qc)) n++;
   }
-  return false;
+  /* ⚠️⚠️ 踩过的大坑（2026-10-21 实测搜「那我懂你意思了」）：
+     这是**乐队名**。可乐队自己有一首歌就叫《那我懂你意思了》，
+     另外还有三个人写了同名歌（王砚 / DJ海边、皮革 / JiuLingWang），
+     于是「标题等于查询词、歌手不是」正好凑到 3 条 —— 触发否决，
+     整轮被当成搜歌名，网易云/酷狗那三条同名翻唱直接拿 3 档排到最前，
+     而乐队真正的 18 首 YouTube 官方曲全掉到 2 档。
+     用户看到的就是「这个乐队名搜出来一首他的歌都没有」。
+     真正的判据不是「有没有同名标题」，而是**同名标题比歌手命中还多**：
+       那我懂你意思了 → 同名 3 / 歌手命中 21  → 人名，不否决 ✅
+       印第安老斑鸠   → 同名 10 / 歌手命中 3  → 歌名，否决 ✅
+       起风了/晴天    → 同名 10+ / 歌手命中 0 → 歌名，否决 ✅
+     加这一道之后，同名条目多到压倒歌手命中的才算歌名。 */
+  if (n < 3) return false;
+  return n >= hits;
 }
 
 /** 只数命中条数，不做判定。给「要不要去问 Apple」当门槛用 ——
@@ -15490,9 +15501,11 @@ function isUaGatedUrl(url) {
 /** 是不是 B 站 html5 直出的渐进式 mp4（不校验 UA、可安全缓存）。 */
 function isBiliHtml5Url(u) {
   const s2 = String(u || "");
+  /* ⚠️ 这个函数原来最后一行是 `return //upgcxcode/...` —— `//` 直接开了行注释，
+     整条路径判断是死的，只剩上面那半句 platform=html5 在生效。正则补齐。 */
   if (s2.indexOf("platform=html5") >= 0) return true;
-  if (!/bilivideo.(com|cn)/i.test(s2)) return false;
-  return //upgcxcode/.+-1-d+.mp4(?|$)/i.test(s2);
+  if (!/bilivideo\.(com|cn)/i.test(s2)) return false;
+  return /\/upgcxcode\/.+-\d+-\d+\.mp4(\?|$)/i.test(s2);
 }
 
 /** 这条地址是不是「YouTube 的流式裸地址」—— 也就是本该内联、却没内联成的那种。
@@ -16710,7 +16723,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.57",
+  version: "4.10.58",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
