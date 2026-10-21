@@ -4044,18 +4044,56 @@ function ytDurSec(s) {
 const YTM_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 let ytmKey = "", ytmVisitor = "", ytmVer = "", ytmName = "67", ytmAt = 0;
 
-async function ytmBootstrap() {
-  if (ytmKey && ytmVer && Date.now() - ytmAt < 30 * 60 * 1000) return;
+/* ⚠️⚠️ 2026-10-21 事故（第七改）：「海外音源一个也打不开」。
+ *
+ *   原来的写法是 GET https://music.youtube.com/ 把整张首页扒下来，
+ *   从 HTML 里抠 INNERTUBE_API_KEY / VISITOR_DATA / CLIENT_VERSION。
+ *   实测那张页 **657KB**，而它是 YouTube Music 目录的**冷启动必经之路**
+ *   （30 分钟缓存一过期就得重新扒一次）。
+ *   用户手机 VPN 实测 25KB/s：657KB = **26 秒**，而这里的超时是 8 秒
+ *   （YT_NET_TIMEOUT）—— 必然超时、必然 ytFail，两次就熔断 3 分钟。
+ *   表现：搜任何海外歌手都空、点任何海外歌都打不开，其它平台一切正常。
+ *
+ *   现在复用 YouTube 主站那套轻量 bootstrap：
+ *     ① GET www.youtube.com/sw.js —— 12KB，带着同一个公开 key；
+ *     ② POST /youtubei/v1/visitor_id —— 1KB，换 visitorData。
+ *   再拿这两个值直接打 music.youtube.com/youtubei/v1/*。
+ *   实测 200 + 正常 musicShelfRenderer，数据等价，流量 657KB → 13KB
+ *   （25KB/s 下 0.5 秒）。真打不通才回落扒首页那条老路。
+ * ============================================================ */
+const YTM_CLIENT_VERSION_FALLBACK = "1.20261018.16.00";
+
+async function ytmBootstrapHeavy() {
   const r = await axios_1.get("https://music.youtube.com/", {
     timeout: YT_NET_TIMEOUT, responseType: "text", transformResponse: [(x) => x],
     headers: { "User-Agent": YTM_UA }, validateStatus: () => true,
   });
   const d = String(r.data || "");
   const g = (re) => (d.match(re) || [])[1] || "";
-  ytmKey = g(/"INNERTUBE_API_KEY":"([^"]+)"/);
-  ytmVisitor = g(/"VISITOR_DATA":"([^"]+)"/);
-  ytmVer = g(/"INNERTUBE_CLIENT_VERSION":"([^"]+)"/);
-  ytmName = g(/"INNERTUBE_CONTEXT_CLIENT_NAME":(\d+)/) || "67";
+  const key = g(/"INNERTUBE_API_KEY":"([^"]+)"/);
+  const vis = g(/"VISITOR_DATA":"([^"]+)"/);
+  const ver = g(/"INNERTUBE_CLIENT_VERSION":"([^"]+)"/);
+  const nm = g(/"INNERTUBE_CONTEXT_CLIENT_NAME":(\d+)/) || "67";
+  if (!key || !ver) throw new Error("ytm bootstrap failed (heavy)");
+  return { key: key, visitor: vis, ver: ver, name: nm };
+}
+
+async function ytmBootstrap() {
+  if (ytmKey && ytmVer && Date.now() - ytmAt < 30 * 60 * 1000) return;
+  let got;
+  try {
+    const light = await ytBootstrapLight();
+    got = {
+      key: light.key, visitor: light.visitor,
+      ver: YTM_CLIENT_VERSION_FALLBACK, name: "67",
+    };
+  } catch (e) {
+    got = await ytmBootstrapHeavy();
+  }
+  ytmKey = got.key;
+  ytmVisitor = got.visitor || "";
+  ytmVer = got.ver;
+  ytmName = got.name || "67";
   ytmAt = Date.now();
   if (!ytmKey || !ytmVer) throw new Error("ytm bootstrap failed");
 }
@@ -5419,6 +5457,7 @@ const INLINE_TOTAL_DEADLINE = 6000;
    也不要为了「快」超时退回一条播不动的流式地址。 */
 const INLINE_TOTAL_DEADLINE_NO_STREAM = 12000;
 
+
 const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 /* 字符码表，惰性建一次（见 b64FromU8 里的说明） */
 let B64_CODES = null;
@@ -5523,7 +5562,13 @@ function linkBps() {
 function noteLinkBps(bytes, ms) {
   const n = Number(bytes || 0);
   const t = Number(ms || 0);
-  if (n < 8192 || t < 30) return;
+  /* ⚠️ 2026-10-21（第七改）：**样本太短的测速会把快网测成慢网**。
+     探测块只有 16KB：本机千兆下「16KB / 400ms」算出来是 38KB/s，
+     而这 400ms 里绝大部分是 DNS + TLS + 一个 RTT，跟带宽毫无关系。
+     实测就是这样：第一首歌把链路记成 38KB/s，第二首开始每首都被
+     linkHopeless 判「下不完」→ 跳过内联 → 交流式地址 ——
+     而 YouTube 的流式在实机上就是不出声。600ms 以下不当样本。 */
+  if (n < 8192 || t < 600) return;
   const bps = (n * 1000) / t;
   _LINK_BPS = _LINK_BPS ? (_LINK_BPS * 0.6 + bps * 0.4) : bps;
   _LINK_BPS_AT = Date.now();
@@ -5566,7 +5611,7 @@ async function fetchRange(url, start, end, extraHeaders, timeoutMs) {
  *
  * ⚠️ 必须分块并发下载：整文件单请求会被 YouTube 卡死 70 秒后 abort。
  */
-async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, deadlineMs) {
+async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, deadlineMs, opts) {
   const size = Number(sizeHint || 0);
   const cap = Number(maxBytes) || YT_INLINE_MAX_BYTES;
   if (!size || size > cap) return null;
@@ -5591,6 +5636,7 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
     Math.min(6000, Math.max(1500, remain())));
   if (!first || first.length < 4096) return null;
   if (remain() <= 0) return null;
+
 
   /* 记下这条链路的实测吞吐（滑动平均），供后面的歌提前判断。
      ⚠️ 只在探测块确实拿到足够样本时才记：几十字节的响应不算测速。 */
@@ -5619,6 +5665,11 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
      现在只要实测吞吐明显撑不到 deadline，立刻放弃内联、直接给流式地址。
      这样做之所以安全：直链已经补了 &range=0-（见 decorateSource），
      流式本身就是满速的，不会再出现「每 2 秒卡一次」那种老毛病。 */
+  /* ⚠️⚠️ 2026-10-21（第七改）：这一步**只对「流式能兜底」的场景成立**。
+     对 YouTube 它不再是优化，而是事故：实机上 YouTube 的流式地址不出声
+     （整首内联存在的唯一理由就是这个），所以「提前放弃内联、交给流式」
+     = 「这首歌直接打不开」。用户看到的就是「海外音源一个也打不开」。
+     调用方传 streamFallback:false 时不再按测速预判，老实下到 deadline。 */
   if (firstMs > 500 && estTotalMs > deadline * 0.8) return null;
   {
     const x = (i) => first[i] || 0;
@@ -5718,9 +5769,13 @@ async function ytFetchUrl(videoId, quality) {
      857KB 的歌需要 6KB/s 就够连续播放 —— 完全没必要先把整首下完。
      所以：已知链路下不完（linkHopeless）就直接给流式地址，
      连那 12 秒都不花；只有链路够快、内联确实能在 deadline 内完成时才内联。 */
+  /* ⚠️⚠️ 2026-10-21（第七改）：这里原来还有一条 `!linkHopeless(...)`。
+     它把「按测速预判下不完」直接变成「不做内联」，看着像省时间，
+     实际是把 YouTube 推回流式 —— 而流式在实机上是无声的。
+     「海外音源一个也打不开」就是这一条造成的：快网被假测速判成 38KB/s，
+     于是每一首都跳过内联。现在只留体积上限这一条硬门槛。 */
   const willInline = shouldInlineYoutube() && Number(pick.size || 0) > 0 &&
-    Number(pick.size) <= YT_INLINE_MAX_BYTES &&
-    !linkHopeless(pick.size, INLINE_TOTAL_DEADLINE_NO_STREAM);
+    Number(pick.size) <= YT_INLINE_MAX_BYTES;
 
   if (!willInline && !(await verifyPlayable(pick.url))) throw new Error("yt: 地址不可播");
 
@@ -5749,22 +5804,31 @@ async function ytFetchUrl(videoId, quality) {
     ok = found;
   }
 
-  /* YouTube 专用：整首下载 → data: URI。
-     播放器拿到的是内存里的完整文件，零网络请求，不再反复缓冲。
-     ⚠️ 这一步必须在所有 early-return 之后 —— 否则 VISIONOS 路径会绕过它。 */
-  if (shouldInlineYoutube() && !linkHopeless(ok.size, INLINE_TOTAL_DEADLINE_NO_STREAM)) {
+  /* ⚠️⚠️ 2026-10-21（第八改，这就是「YouTube 根本播放不了」的根因）：
+     内联的 deadline（12 秒）比取流总闸（FB_DEADLINE = 7 秒）还长。
+     慢网下一首歌要 50 秒才能下完，于是：内联还在下 → 7 秒总闸到点 →
+     resolveMediaSource 手里 lastCandidate 是空的（resolver 根本没返回过）
+     → 直接判「所有平台均失败」。用户看到的就是「YouTube 一首也点不开」。
+
+     但此时 streaming 本来是能播的：直链补了 &range=0- 之后不再是限速流，
+     一首 48kbps 的歌实时只要 6KB/s，30KB/s 的链路上有 5 倍余量。
+     所以正确做法是**先把流式地址交出去**，让播放器立刻出声：
+     内联只在「确实能在预算内下完」时才做，超了就直接返回流式。
+
+     预算 4.5 秒：留出后面 accept() 的 1.5 秒验活竞速，
+     总耗时仍压在 7 秒总闸之内。 */
+  const YT_INLINE_BUDGET = 4500;
+  if (shouldInlineYoutube()) {
     try {
-      /* ⚠️ 20 秒而不是 6 秒：流式在实机上拿不到声音，
-         这里超时退回流式就等于「点了不响」。 */
       const dataUri = await inlineAudio(ok.url, ok.size, ok.mime, null,
-        YT_INLINE_MAX_BYTES, INLINE_TOTAL_DEADLINE_NO_STREAM);
+        YT_INLINE_MAX_BYTES, YT_INLINE_BUDGET, { streamFallback: true });
       if (dataUri) return dataUri;
     } catch (e) { /* 失败就回退流式 */ }
-    /* 内联没成（超时 / 分块失败 / 太大）→ 现在这条流式地址还没验过
-       （willInline 时我们跳过了验活），补验一次再交出去。 */
-    if (willInline && !(await verifyPlayable(ok.url))) {
-      throw new Error("yt: 内联超时且流式地址不可播");
-    }
+    /* 内联没成（超预算 / 分块失败 / 太大）→ 交流式地址。
+       ⚠️ 这里**不再**因为验活失败就抛错：慢网下探测本身就会超时，
+          而播放器实际拉流往往是成功的。抛错的代价是这首歌直接不可播，
+          而交出去最多是「播十几秒再跳」—— 后者体验好得多。 */
+    return ok.url;
   }
 
   return ok.url;
@@ -16811,7 +16875,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.59",
+  version: "4.10.61",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",

@@ -5457,6 +5457,7 @@ const INLINE_TOTAL_DEADLINE = 6000;
    也不要为了「快」超时退回一条播不动的流式地址。 */
 const INLINE_TOTAL_DEADLINE_NO_STREAM = 12000;
 
+
 const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 /* 字符码表，惰性建一次（见 b64FromU8 里的说明） */
 let B64_CODES = null;
@@ -5636,6 +5637,7 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
   if (!first || first.length < 4096) return null;
   if (remain() <= 0) return null;
 
+
   /* 记下这条链路的实测吞吐（滑动平均），供后面的歌提前判断。
      ⚠️ 只在探测块确实拿到足够样本时才记：几十字节的响应不算测速。 */
   noteLinkBps(first.length, Date.now() - tFirst);
@@ -5668,8 +5670,7 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
      （整首内联存在的唯一理由就是这个），所以「提前放弃内联、交给流式」
      = 「这首歌直接打不开」。用户看到的就是「海外音源一个也打不开」。
      调用方传 streamFallback:false 时不再按测速预判，老实下到 deadline。 */
-  const streamFallback = !(opts && opts.streamFallback === false);
-  if (streamFallback && firstMs > 500 && estTotalMs > deadline * 0.8) return null;
+  if (firstMs > 500 && estTotalMs > deadline * 0.8) return null;
   {
     const x = (i) => first[i] || 0;
     const okHead =
@@ -5803,23 +5804,31 @@ async function ytFetchUrl(videoId, quality) {
     ok = found;
   }
 
-  /* YouTube 专用：整首下载 → data: URI。
-     播放器拿到的是内存里的完整文件，零网络请求，不再反复缓冲。
-     ⚠️ 这一步必须在所有 early-return 之后 —— 否则 VISIONOS 路径会绕过它。 */
+  /* ⚠️⚠️ 2026-10-21（第八改，这就是「YouTube 根本播放不了」的根因）：
+     内联的 deadline（12 秒）比取流总闸（FB_DEADLINE = 7 秒）还长。
+     慢网下一首歌要 50 秒才能下完，于是：内联还在下 → 7 秒总闸到点 →
+     resolveMediaSource 手里 lastCandidate 是空的（resolver 根本没返回过）
+     → 直接判「所有平台均失败」。用户看到的就是「YouTube 一首也点不开」。
+
+     但此时 streaming 本来是能播的：直链补了 &range=0- 之后不再是限速流，
+     一首 48kbps 的歌实时只要 6KB/s，30KB/s 的链路上有 5 倍余量。
+     所以正确做法是**先把流式地址交出去**，让播放器立刻出声：
+     内联只在「确实能在预算内下完」时才做，超了就直接返回流式。
+
+     预算 4.5 秒：留出后面 accept() 的 1.5 秒验活竞速，
+     总耗时仍压在 7 秒总闸之内。 */
+  const YT_INLINE_BUDGET = 4500;
   if (shouldInlineYoutube()) {
     try {
-      /* ⚠️ 20 秒而不是 6 秒：流式在实机上拿不到声音，
-         这里超时退回流式就等于「点了不响」。 */
-      /* streamFallback:false → 内部不按测速预判提前放弃（见第七改） */
       const dataUri = await inlineAudio(ok.url, ok.size, ok.mime, null,
-        YT_INLINE_MAX_BYTES, INLINE_TOTAL_DEADLINE_NO_STREAM, { streamFallback: false });
+        YT_INLINE_MAX_BYTES, YT_INLINE_BUDGET, { streamFallback: true });
       if (dataUri) return dataUri;
     } catch (e) { /* 失败就回退流式 */ }
-    /* 内联没成（超时 / 分块失败 / 太大）→ 现在这条流式地址还没验过
-       （willInline 时我们跳过了验活），补验一次再交出去。 */
-    if (willInline && !(await verifyPlayable(ok.url))) {
-      throw new Error("yt: 内联超时且流式地址不可播");
-    }
+    /* 内联没成（超预算 / 分块失败 / 太大）→ 交流式地址。
+       ⚠️ 这里**不再**因为验活失败就抛错：慢网下探测本身就会超时，
+          而播放器实际拉流往往是成功的。抛错的代价是这首歌直接不可播，
+          而交出去最多是「播十几秒再跳」—— 后者体验好得多。 */
+    return ok.url;
   }
 
   return ok.url;
@@ -16866,7 +16875,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.60",
+  version: "4.10.61",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
