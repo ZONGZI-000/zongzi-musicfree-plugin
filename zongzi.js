@@ -6216,16 +6216,23 @@ async function neteaseSearchArtist(query, page, size) {
      实测同一个词连跑两次，一次 10 条、一次 0 条 —— 不重试的话
      用户看到的就是「搜歌手什么都没有」。重试一次，代价 ~150ms。 */
   const once = async () => {
-    const r = await axios_1.get(NETEASE_SEARCH_WEB, {
-      params: {
-        s: query, type: 100,
-        offset: ((page || 1) - 1) * (size || 10),
-        limit: size || 10,
-      },
-      timeout: 8000,
-      headers: NETEASE_HEADERS,
-      validateStatus: () => true,
-    });
+    /* ⚠️ 必须用 POST 打 /api/cloudsearch/pc（同 neteaseArtistAliases 的坑）：
+       GET /api/search/get/web 现在稳定返回 {"code":405,"msg":"操作频繁"}，
+       于是「搜歌手」这条路径里网易云那一路**永远是 0 条** ——
+       不报错、也没人发现，只是少了最快的那个源。实测 2026-10-21。 */
+    const r = await axios_1.post(
+      "https://music.163.com/api/cloudsearch/pc",
+      "s=" + encodeURIComponent(String(query || "")) + "&type=100" +
+        "&offset=" + ((page || 1) - 1) * (size || 10) +
+        "&limit=" + (size || 10),
+      {
+        timeout: 8000,
+        headers: Object.assign({}, NETEASE_HEADERS, {
+          "Content-Type": "application/x-www-form-urlencoded",
+        }),
+        validateStatus: () => true,
+      }
+    );
     const ar = (r.data && r.data.result && r.data.result.artists) || [];
     return ar.map((a) => ({
       id: String(a.id || ""),
@@ -11957,7 +11964,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.17",
+  version: "4.10.18",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
