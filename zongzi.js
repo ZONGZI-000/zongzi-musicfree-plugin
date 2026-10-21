@@ -5593,8 +5593,10 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
 
 /** 是否开启 YouTube 整首内联（默认开） */
 function shouldInlineYoutube() {
-  /* 同 shouldInlineBili：预取只要流式 URL，不做整首下载。 */
-  if (_prefetchMode) return false;
+  /* 同 shouldInlineBili：预取只要流式 URL，不做整首下载。
+     ⚠️ 但只要有真实点播在场（_playInFlight>0），就不许压制内联 ——
+        用户就在预取那 4 秒里点歌，按全局开关走就是「点了没声音」。 */
+  if (_prefetchMode && _playInFlight === 0) return false;
   try {
     const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
     const v = vars.inlineYoutube;
@@ -6109,15 +6111,24 @@ function biliGuichuEntries() {
   }];
 }
 
-/** 拿音频流。返回按码率降序 */
-async function biliStreams(bvid) {
+/* bvid → cid 只查一次：dash 和 html5 直出两条路都要用，
+   各查一遍纯属白等一个请求（慢网下 1~3 秒）。 */
+const BILI_CID_CACHE = {};
+async function biliCid(bvid) {
+  if (BILI_CID_CACHE[bvid]) return BILI_CID_CACHE[bvid];
   await biliEnsureCookie();
   const vr = await axios_1.get("https://api.bilibili.com/x/web-interface/view", {
     params: { bvid: bvid }, timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
   });
   const vd = vr.data || {};
   if (vd.code !== 0) throw new Error("bili view: " + vd.code);
-  const cid = vd.data.cid;
+  BILI_CID_CACHE[bvid] = vd.data.cid;
+  return vd.data.cid;
+}
+
+/** 拿音频流。返回按码率降序 */
+async function biliStreams(bvid) {
+  const cid = await biliCid(bvid);
 
   const pr = await axios_1.get("https://api.bilibili.com/x/player/playurl", {
     params: { bvid: bvid, cid: cid, fnval: 16, fnver: 0, fourk: 1 },
@@ -6208,8 +6219,9 @@ const BILI_INLINE_FALLBACK_MAX = 4000 * 1024;
 
 function shouldInlineBili() {
   /* 预取阶段一律不内联：那时候用户还没点播放，
-     为了「提前准备好」去下整首音频是本末倒置（见 prefetchTop）。 */
-  if (_prefetchMode) return false;
+     为了「提前准备好」去下整首音频是本末倒置（见 prefetchTop）。
+     ⚠️ 同样给真实点播留口子：预取在场不代表用户在听预取的那首。 */
+  if (_prefetchMode && _playInFlight === 0) return false;
   try {
     const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
     const v = vars.inlineBili;
@@ -6219,6 +6231,44 @@ function shouldInlineBili() {
 }
 
 const BILI_CDN_HEADERS = () => ({ Referer: "https://www.bilibili.com/" });
+
+/* B 站「html5 直出」通道 —— 无 mcdn 节点时的正解。
+ *
+ * ⚠️ 为什么需要（2026-10-21 实测）：
+ *   dash 的音频链路只给 upos-* 集群，而 upos 按 UA 做防盗链：
+ *     桌面 UA / ExoPlayerLib/2.18.1 / okhttp / 空 UA → 206
+ *     stagefright / Lavf / Dalvik / 安卓 Chrome UA  → 403
+ *   播放器到底带哪条 UA 我们管不了，所以 dash 音频在手机上有概率直接 403。
+ *   旧方案是「插件自己把音频下完，转成 data: URI 给播放器」，
+ *   但 5MB 的 base64 串要播放器在主线程解码，表现为整机假死、
+ *   超过 4MB 还会被直接判死 —— 赵薇《天使旅行箱》一半的歌就卡在这。
+ *
+ *   platform=html5 返回的是 **渐进式 mp4（durl）**，实测：
+ *     stagefright / AppleCoreMedia / ExoPlayer / okhttp / Dalvik / 空 UA 全部 206，
+ *     不带 Referer 也 206，Range 中段请求照样 206（能 seek）。
+ *   也就是说这条地址**任何播放器都能直接流式拉**，不需要内联、
+ *   不占主线程、零 base64。
+ *
+ *   代价：mp4 里带了一条画质很低的视频轨（qn=16 时约 20~360kbps），
+ *   会多下一些字节；但「多下一点」远好过「点了没声音」。
+ *   原来只有 mcdn 能用；现在无 mcdn 的条目也有了能播的路。
+ */
+async function biliHtml5Direct(bvid, wantHigh) {
+  const cid = await biliCid(bvid);
+  /* qn=64 → 音轨 116~200kbps；qn=16 → 36~64kbps。
+     拿不到高码率时 B 站会自动降档，所以直接按需求请求即可。 */
+  const qn = wantHigh ? 64 : 16;
+  const r = await axios_1.get("https://api.bilibili.com/x/player/playurl", {
+    params: { bvid: bvid, cid: cid, fnval: 1, platform: "html5", high_quality: 1, qn: qn },
+    timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
+  });
+  const d = r.data && r.data.data;
+  const du = d && d.durl && d.durl[0];
+  if (!du || !du.url) throw new Error("html5: 无 durl（code=" + (r.data && r.data.code) + "）");
+  const pr = await probeAudio(du.url, BILI_CDN_HEADERS());
+  if (!pr.ok) throw new Error("html5: 直链探活失败");
+  return du.url;
+}
 
 async function biliFetchUrl(bvid, quality) {
   const list = await biliStreams(bvid);
@@ -6298,39 +6348,40 @@ async function biliFetchUrl(bvid, quality) {
       return u;
     }
 
-    /* ② 只有 upos 节点 → 流式必 403（播放器 UA 我们控制不了）。
-          由插件自己下完内联，播放器零请求。体积超过兜底上限就放弃这一条，
-          宁可让这一首走跨平台兜底，也不能把主线程拖死。 */
-    if (shouldInlineBili() && pr.total && pr.total <= BILI_INLINE_FALLBACK_MAX) {
-      try {
-        /* deadline 给 15 秒：这条路没有流式备选（upos 对播放器 UA 必 403），
-           内联失败就等于这首歌播不了。而 4MB 在 5G 限速下确实要好一会儿。 */
-        const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(),
-          BILI_INLINE_FALLBACK_MAX, 15000);
-        if (dataUri) {
-          console.log("[粽子] B站无 mcdn 节点，已内联 " + (pr.total / 1024).toFixed(0) + "KB");
-          return dataUri;
-        }
-      } catch (e) { /* 内联失败 → 下面继续找 */ }
-    } else if (pr.total && pr.total > BILI_INLINE_FALLBACK_MAX) {
-      /* ⚠️ 这里**不能 continue 就完事**。之前是 continue，结果：
-           这条视频每一档都 > 1.5MB → errors 里堆满「过大」→ 抛错
-           → resolveBilibili 直接 throw → 整条 B 站兜底路径当它不存在。
-           而实际上「重新搜一个更短的版本」是能成功的
-           （实测搜「周杰伦-晴天」这条 2.2MB+，但同 query 下另有
-            1.1MB 的版本，能被正确内联）。所以这里 break 出循环、
-           走 throw，让上层 resolveBilibili 去尝试「搜索 → 换个条目」。
-          —— 换言之：直取这条太大不代表没有别的可播版本。 */
-      errors.push("无mcdn且" + (pr.total / 1024 / 1024).toFixed(1) + "MB过大");
-      break;
-    }
-    /* ⚠️ 内联失败（慢网/超时）—— **不能**把这条 upos 地址交出去。
-       实测过：upos 对 stagefright/ijkplayer 一律 403，交给播放器就是
-       「点了没声音 / 播两秒跳下一首」，比起直接报错更让用户困惑。
-       抛错退出，让 resolveBilibili 去搜别的条目（通常有 mcdn 或更短的版本），
-       实在没有就走跨平台兜底 —— 至少别把一条明知会 403 的地址塞给播放器。 */
-    errors.push("无mcdn且内联失败");
-    continue;
+    /* ② 只有 upos 节点 → 这条 dash 音频对播放器 UA 有概率 403。
+          先试 html5 直出（渐进式 mp4，任何播放器都能流式拉，见 biliHtml5Direct），
+          拿不到再退回「整首下载内联」这条老路。 */
+    errors.push("无mcdn(" + Math.round(candidates[k].bw / 1000) + "k)");
+    break;
+  }
+  /* mcdn 一个都没有（或全探活失败）→ 换 html5 直出。
+     ⚠️ 这一步不再受 BILI_INLINE_FALLBACK_MAX 限制：durl 是流式的，
+        体积再大也不需要插件下载、不需要 base64，播放器边下边播。
+        旧代码在这里因为「4MB 太大」直接判死，赵薇《天使旅行箱》
+        半张专辑就是这么变成「所有平台均失败」的。 */
+  try {
+    const u5 = await biliHtml5Direct(bvid, lossless(quality) || quality === "320k");
+    console.log("[粽子] B站无 mcdn，改走 html5 直出");
+    return u5;
+  } catch (e) {
+    errors.push("html5直出: " + (e && e.message));
+  }
+
+  /* ③ 兜底老路：整首下载内联。html5 也拿不到时才走到这，
+        而且只在体积可控时做 —— 几 MB 的 base64 会拖死主线程。 */
+  for (let k = 0; k < candidates.length; k++) {
+    const u = candidates[k].u;
+    const pr = await probeAudio(u, BILI_CDN_HEADERS());
+    if (!pr.ok || !pr.total || pr.total > BILI_INLINE_FALLBACK_MAX) continue;
+    if (!shouldInlineBili()) break;
+    try {
+      const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(),
+        BILI_INLINE_FALLBACK_MAX, 15000);
+      if (dataUri) {
+        console.log("[粽子] B站无 mcdn 节点，已内联 " + (pr.total / 1024).toFixed(0) + "KB");
+        return dataUri;
+      }
+    } catch (e) { /* 继续找下一档 */ }
   }
   throw new Error("bili: 没有可播的音频节点（试过 " + errors.join("/") + "）");
 }
@@ -6341,66 +6392,98 @@ async function resolveBilibili(id, want, quality) {
     try { return await biliFetchUrl(id, quality); }
     catch (e) { errors.push("直取: " + e.message); }
   }
+
+  /* 把「过筛 + 打分」抽成纯函数，好让两个分区各跑一遍。 */
+  const scoreList = function (list) {
+    const scored = [];
+    for (let i = 0; i < list.length; i++) {
+      const v = list[i];
+      // 先做硬校验：听书、分集、时长不合理的一律丢
+      if (isAudiobookTitle(v.title)) continue;
+      const d = v.duration / 1000;
+      if (d > 0 && (d < 60 || d > 900)) continue;
+      if (/伴奏|教学|教程|鼓谱|吉他谱|钢琴谱|纯音乐|karaoke/i.test(v.title)) continue;
+      // 标题必须跟查询对得上（复用严格校验，但 artist 传空避免误杀）
+      if (!isDefinitelySameSong({ title: v.title, artist: "" }, { name: want.name, singer: "", album: "" })) continue;
+      /* 兜底时（id 为 null）还要确认**就是这个人**唱的。
+         B站标题里普遍带演唱者（「【点播反馈】超载乐队《不要告别》」），
+         以前只校标题，结果赵薇的歌兜底到了超载乐队的版本。
+         判据：标题或 UP 主名里出现目标歌手。不做「排除别的歌手」的
+         反向判断（名字没法穷举），宁可少给也不给错。 */
+      if (id === null) {
+        const singers = splitSingers(want.singer).map((x) => normText(toSimplified(x))).filter(Boolean);
+        if (singers.length) {
+          const hay = normText(toSimplified(v.title + " " + (v.artist || "")));
+          if (!singers.some((x) => hay.indexOf(x) >= 0)) continue;
+        }
+      }
+
+      let sc = 40;
+      const singer = splitSingers(want.singer)[0] || "";
+      if (singer && (v.title.indexOf(singer) >= 0 || (v.artist || "").indexOf(singer) >= 0)) sc += 20;
+      if (d >= 120 && d <= 600) sc += 15;
+      if (v.play > 100000) sc += 10;
+      /* ---- 变体词降权 + 按时长贴近度挑版本 ----
+         ⚠️ 实测（2026-10-21）《一直下雨的星期天》兜底：
+            赵薇原版 3:50（230s），B 站上同一首歌有一堆
+              伴奏 253 秒、Remix 233 秒、AI 版 222 秒、
+              央视版 103 秒（剪过）、磁带试听 239 秒
+            原来的分只有「时长 120~600s +15」这一档，
+            它们全是 15 分，最后看谁排在搜索结果前面 —— 纯随机，
+            点进去可能是别人唱的，也可能是个伴奏。
+            现在加两条：标题带变体词（伴奏/Remix/AI/片段…）直接扣 25，
+            以及跟目标时长差得越远扣得越多（每差 5 秒扣 1 分、封顶 20）。
+            原版 230s 对 230s 不扣，伴奏 253s 扣 4 分再叠加变体词 25 分，
+            就稳定沉下去了。want.durMs 由 resolveMediaSource 传进来。 */
+      if (VARIANT_RE.test(v.title) || isCoverTitle(v.title)) sc -= 25;
+      const wantMs = Number(want.durMs) || 0;
+      if (wantMs > 0 && d > 0) {
+        const diff = Math.abs(d * 1000 - wantMs) / 1000;
+        sc -= Math.min(20, Math.round(diff / 5));
+      }
+      scored.push({ v: v, sc: sc });
+    }
+    scored.sort((a, b) => b.sc - a.sc);
+    return scored;
+  };
+
   try {
     const kws = buildKeywords(want);
     for (let k = 0; k < kws.length; k++) {
-      let list = [];
-      try { list = await biliSearch(kws[k], 1); } catch (e) { errors.push("搜索: " + e.message); continue; }
-      if (!list.length) continue;
-      // 排序 + 严格过滤。
-      // ⚠️ B站的 artist 是 UP 主昵称，不能拿它跟目标歌手做严格比较（会全灭），
-      //    但**标题必须**过 isDefinitelySameSong 的标题校验。
-      //    以前用宽松的 titleMatch（双向包含）+ sc>=0 就接受，
-      //    结果搜「怎麼都沒有了」会命中一堆标题里带这几个字的无关视频。
-      const scored = [];
-      for (let i = 0; i < list.length; i++) {
-        const v = list[i];
-        // 先做硬校验：听书、分集、时长不合理的一律丢
-        if (isAudiobookTitle(v.title)) continue;
-        const d = v.duration / 1000;
-        if (d > 0 && (d < 60 || d > 900)) continue;
-        if (/伴奏|教学|教程|鼓谱|吉他谱|钢琴谱|纯音乐|karaoke/i.test(v.title)) continue;
-        // 标题必须跟查询对得上（复用严格校验，但 artist 传空避免误杀）
-        if (!isDefinitelySameSong({ title: v.title, artist: "" }, { name: want.name, singer: "", album: "" })) continue;
-        /* 兜底时（id 为 null）还要确认**就是这个人**唱的。
-           B站标题里普遍带演唱者（「【点播反馈】超载乐队《不要告别》」），
-           以前只校标题，结果赵薇的歌兜底到了超载乐队的版本。
-           判据：标题或 UP 主名里出现目标歌手。不做「排除别的歌手」的
-           反向判断（名字没法穷举），宁可少给也不给错。 */
-        if (id === null) {
-          const singers = splitSingers(want.singer).map((x) => normText(toSimplified(x))).filter(Boolean);
-          if (singers.length) {
-            const hay = normText(toSimplified(v.title + " " + (v.artist || "")));
-            if (!singers.some((x) => hay.indexOf(x) >= 0)) continue;
-          }
-        }
+      /* ⚠️⚠️ 2026-10-21 关键修复：**音乐区搜不到就补搜全站**。
+       *
+       *   事故：赵薇《天使旅行箱》整张 10 首，有 4 首（《蝶》《不怕》
+       *   《Morning Love》《大城小戀》）永远「所有平台均失败」。
+       *
+       *   实测根因：这几首在 B 站是**有人气的**，但视频被归到了
+       *   「明星综合」(tzid=137) /「日常」(21) 这些**非音乐区**分类。
+       *   biliSearch 默认打 tids=3（音乐区），
+       *     「赵薇歌曲《蝶》mv 好歌永流传」  typename=明星综合 typeid=137
+       *     「赵薇歌曲《不怕》mv自制」        typename=明星综合 typeid=137
+       *     「赵薇歌曲《大城小恋》」          typename=明星综合 typeid=137
+       *     「赵薇歌曲《Morning love》」      typename=明星综合 typeid=137
+       *   而音乐区对同一关键词返回的 50 条里一条都不是这几首。
+       *
+       *   biliSearch 内部其实有「音乐区空了退全站」的 fallback，
+       *   但它的判据是 raw.length —— 音乐区明明返回了 50 条（只是全不相干），
+       *   于是 fallback 永远不触发。这个判据错了：
+       *   要看的是「**过筛之后还剩几条**」，不是「原始返回了几条」。
+       *
+       *   所以这里改成：音乐区打完分是空的 → 再用 zone="all" 搜一遍。
+       *   代价是慢 0.3~1 秒，换的是整首歌能播；只在「本来就要失败」时才付。
+       */
+      let scored = [];
+      try {
+        const list = await biliSearch(kws[k], 1);
+        scored = scoreList(list);
+      } catch (e) { errors.push("搜索: " + e.message); }
 
-        let sc = 40;
-        const singer = splitSingers(want.singer)[0] || "";
-        if (singer && (v.title.indexOf(singer) >= 0 || (v.artist || "").indexOf(singer) >= 0)) sc += 20;
-        if (d >= 120 && d <= 600) sc += 15;
-        if (v.play > 100000) sc += 10;
-        /* ---- 变体词降权 + 按时长贴近度挑版本 ----
-           ⚠️ 实测（2026-10-21）《一直下雨的星期天》兜底：
-              赵薇原版 3:50（230s），B 站上同一首歌有一堆
-                伴奏 253 秒、Remix 233 秒、AI 版 222 秒、
-                央视版 103 秒（剪过）、磁带试听 239 秒
-              原来的分只有「时长 120~600s +15」这一档，
-              它们全是 15 分，最后看谁排在搜索结果前面 —— 纯随机，
-              点进去可能是别人唱的，也可能是个伴奏。
-              现在加两条：标题带变体词（伴奏/Remix/AI/片段…）直接扣 25，
-              以及跟目标时长差得越远扣得越多（每差 5 秒扣 1 分、封顶 20）。
-              原版 230s 对 230s 不扣，伴奏 253s 扣 4 分再叠加变体词 25 分，
-              就稳定沉下去了。want.durMs 由 resolveMediaSource 传进来。 */
-        if (VARIANT_RE.test(v.title) || isCoverTitle(v.title)) sc -= 25;
-        const wantMs = Number(want.durMs) || 0;
-        if (wantMs > 0 && d > 0) {
-          const diff = Math.abs(d * 1000 - wantMs) / 1000;
-          sc -= Math.min(20, Math.round(diff / 5));
-        }
-        scored.push({ v: v, sc: sc });
+      if (!scored.length) {
+        try {
+          const listAll = await biliSearch(kws[k], 1, "all");
+          scored = scoreList(listAll);
+        } catch (e) { errors.push("全站搜: " + e.message); }
       }
-      scored.sort((a, b) => b.sc - a.sc);
 
       /* 同理放宽到 4 条：加了「必须是这个歌手」的校验后，
          排在前面的常常是别人的翻唱 / 合集，真正的版本排在后面。 */
@@ -14907,6 +14990,17 @@ let _prefetching = false;
 const INLINE_MAX_CHARS = 4096 * 1024;
 /* 持久化在模块作用域：resolveMediaSource 里 read，prefetchTop 里 write */
 var _prefetchMode = false;
+/* 当前有几个「用户真的点了播放」的取流在跑。
+ *
+ * ⚠️ 2026-10-21 事故：「点了没声音」的第二个根因。
+ *   _prefetchMode 是全局开关，预取那 4 秒里它是 true —— 而用户恰恰就是
+ *   在这 4 秒里点歌的（列表刚一出来就点）。于是 shouldInlineYoutube() 返回
+ *   false，用户点下去的 YouTube 曲目被当成预取处理、只拿到流式地址 →
+ *   在实机上就是没声音。
+ *
+ *   现在改成：只要有一个真实播放请求在场，预取模式就不许压制内联。
+ *   预取那边本来就只是「锦上添花」，让它排队等一等，不能反过来伤害点播。 */
+var _playInFlight = 0;
 
 /* 整轮预取的总时间预算（毫秒）。
  *
@@ -14964,6 +15058,15 @@ function prefetchTop(list, count) {
           console.log("[粽子] 预取超预算，收工（已完成 " + i + "/" + targets.length + "）");
           break;
         }
+        /* ⚠️ 2026-10-21：用户点歌时**整轮预取让路**。
+           预取只是锦上添花，它抢带宽、抢状态，唯一的下场就是让点播变慢、
+           或者把点播的内联挤掉（见 _playInFlight 那段）。点播到场就停手，
+           等它结束再接着跑 —— 预算不够就直接收工，反正预热本来也不急。 */
+        while (_playInFlight > 0 && Date.now() < budgetEnd) {
+          await new Promise(function (r) { setTimeout(r, 250); });
+        }
+        if (Date.now() > budgetEnd) break;
+
         const it = targets[i];
         try {
           const r = await resolveMediaSource(it, "128k");
@@ -14975,6 +15078,13 @@ function prefetchTop(list, count) {
              内存里就长期钉着好几条巨串 —— 之后每次 GC 都要扫它们。 */
           if (String(u).indexOf("data:") === 0) {
             if (String(u).length <= INLINE_MAX_CHARS) inlineCachePut(it, u);
+          } else if (isYtStreamUrl(u)) {
+            /* ⚠️ 2026-10-21：YouTube 的流式裸地址**不进缓存**。
+               预取阶段禁止内联，拿到的一定是流式地址；而流式在实机上
+               就是「点了没声音」。把它写进直链池 = 用户点歌时走快速通道
+               直接复用这条流式地址，整首内联永远轮不到。
+               预取对 YouTube 就等于「什么都没预热」，这是对的 ——
+               内联的等待本来也只能发生在用户真的点下去那一刻。 */
           } else {
             mediaCachePut(it, u);
           }
@@ -15247,9 +15357,40 @@ function isUaGatedUrl(url) {
      于是这个判断永远返回 false —— 修复看起来加了，实际一条也没拦住。 */
   let host = "";
   try { host = String(new URL(u).host || ""); } catch (e) { return false; }
+  /* ⚠️ html5 直出的地址（durl）虽然也落在 upos-* 上，但它**不校验 UA**：
+     URL 上带 platform=html5，路径是 xxx-1-16.mp4 这种渐进式 mp4。
+     实测 stagefright / AppleCoreMedia / ExoPlayer / okhttp / Dalvik /
+     空 UA 全部 206，不带 Referer 也 206。所以它属于「可以放心缓存复用」，
+     不能跟着 upos 一起每次重取（那样每首歌白等 1~2 秒）。
+     判据用 URL 参数而不是路径前缀，因为路径规则 B 站改过好几次。 */
+  if (isBiliHtml5Url(u)) return false;
   return /^upos-[a-z0-9-]*\.bilivideo\.(com|cn)$/i.test(host) ||
          /(^|\.)edge\.mountaintoys\.cn$/i.test(host) ||
          /^upos-[a-z0-9-]*\.akamaized\.net$/i.test(host);
+}
+
+/** 是不是 B 站 html5 直出的渐进式 mp4（不校验 UA、可安全缓存）。 */
+function isBiliHtml5Url(u) {
+  const s2 = String(u || "");
+  if (s2.indexOf("platform=html5") >= 0) return true;
+  if (!/bilivideo.(com|cn)/i.test(s2)) return false;
+  return //upgcxcode/.+-1-d+.mp4(?|$)/i.test(s2);
+}
+
+/** 这条地址是不是「YouTube 的流式裸地址」—— 也就是本该内联、却没内联成的那种。
+ *
+ *  为什么要单独判：预取阶段（_prefetchMode）刻意不内联，只拿流式 URL；
+ *  但流式在实机上就是「点了不响」。这条地址要是进了直链缓存，
+ *  用户点歌时会被快速通道直接复用，整首内联永远轮不到 —— 见 getMediaSource 里
+ *  「四改」那段注释。
+ *
+ *  ⚠️ 必须对 host 做匹配（踩过 upos 那次：拿整条 URL 对 ^ 和 \. 永远不中）。 */
+function isYtStreamUrl(url) {
+  const u = String(url || "");
+  if (!u || u.indexOf("data:") === 0) return false;
+  let host = "";
+  try { host = String(new URL(u).host || ""); } catch (e) { return false; }
+  return /(^|\.)googlevideo\.com$/i.test(host);
 }
 
 /* ------------------------------------------------------------
@@ -15430,7 +15571,27 @@ async function getMediaSource(musicItem, quality) {
 
   // 2) 30 分钟内的直链缓存（跟音质无关），不再重走取流链路
   const cached = mediaCacheGet(musicItem);
-  if (cached && !isUaGatedUrl(cached)) {
+  /* ⚠️⚠️ 2026-10-21 四改：「点了没声音」的真正根因就在下面这个 return。
+   *
+   *   预取（prefetchTop，搜索后立刻跑）走的是 resolveMediaSource，那时
+   *   _prefetchMode=true → shouldInlineYoutube 直接返回 false，所以它写进
+   *   MEDIA_URL_CACHE 的是一条 **YouTube 流式裸地址**。
+   *
+   *   然后用户就在这几秒里点了那首歌 → 缓存命中 → 这条流式地址被原样丢给
+   *   播放器，整首内联压根没机会跑。而流式在实机上正是「点了不响 / 每 2 秒
+   *   卡一次」的那条路（见 YT_INLINE_MAX_BYTES 上方的事故记录）。
+   *
+   *   表现就是最难查的那种：**同一首歌，有时内联能播、有时一点声音都没有**，
+   *   取决于你点的时候后台预取跑完没有。实测「周杰倫 晴天」连着点三次，
+   *   第一次内联成功，第二、三次全走缓存 → 无声。
+   *
+   *   正确做法跟下面 B 站 upos 那条完全同构：这类地址不进快速通道，
+   *   丢掉缓存重走一遍完整取流（这次会内联）。 */
+  if (cached && isYtStreamUrl(cached)) {
+    console.log("[粽子] 缓存里是 YouTube 流式地址（应内联），丢弃重取: "
+      + String(musicItem.title || "").slice(0, 20));
+    mediaCacheForget(musicItem);
+  } else if (cached && !isUaGatedUrl(cached)) {
     /* ⚠️ 缓存命中也要过 decorateSource。缓存里存的是裸 URL，
        请求头不在里面 —— 直接返回 { url: cached } 的话，
        B站/酷狗那批「必须带 Referer」的歌第一次能播、第二次 403，
@@ -15462,9 +15623,15 @@ async function getMediaSource(musicItem, quality) {
   if (running) return running;
 
   const job = (async function () {
+    /* 真实点播入场：预取从现在起不许再压制内联、也不许再抢带宽。
+       ⚠️ 必须成对增减，且放在 finally —— 任何异常路径都不能让它漏增，
+          否则预取会被永久卡住（历史上 _prefetching 就踩过这个）。 */
+    _playInFlight++;
     try {
       return await getMediaSourceUncached(musicItem, quality, providerForPlay);
     } finally {
+      _playInFlight--;
+      if (_playInFlight < 0) _playInFlight = 0;
       delete RESOLVE_INFLIGHT[flightKey];
     }
   })();
@@ -16406,7 +16573,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.53",
+  version: "4.10.54",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
