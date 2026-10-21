@@ -1604,18 +1604,38 @@ function hotScore(playCount) {
   return Math.min(12, Math.round(s * 1.2));
 }
 
-function officialBone(raw, artist, platform, query, artistQuery) {
+function officialBone(raw, artist, platform, query, artistQuery, hasAuth, itemAuthOk) {
   const t = String(raw || "");
   const a = String(artist || "");
   const q = toSimplified(String(query || ""));
   let bone = 0;
 
-  // ⚠️ 关键：「- Topic」加分必须**同时要求标题跟查询对得上**。
-  //    否则《我打工的咖啡廳》(IGU Band - Topic) 这种同艺人不同歌，
-  //    会仅凭 Topic 身份被顶到第一位。
+  /* ⚠️ 关键：「- Topic」加分必须**同时要求标题跟查询对得上**。
+     否则《我打工的咖啡廳》(IGU Band - Topic) 这种同艺人不同歌，
+     会仅凭 Topic 身份被顶到第一位。
+
+     ⚠️⚠️ 2026-10-21 二次修（截图事故：搜「亏欠」，前排全是 B 站/YouTube 上
+     Siu-Siu、农茬子我不服、Skiiro、ColdMelodyL 这些零散翻唱，
+     张震岳原唱排在十名开外）：
+     「- Topic」是 YouTube 自动生成的官方频道，但它只保证
+     「这条是本频道发布的」，**不保证这个频道就是查询要找的那位艺人**。
+     一首热门歌在 YouTube 上有几十个同名艺术家的 Topic 版本
+     （杨小壮 - Topic / 宝石Gem - Topic / 海来阿木 - Topic…），
+     它们都能拿到 -45，原唱反而因为挂在繁体名的频道下（張震嶽 ayal komod）
+     一个 Topic 后缀都没有，只能靠 _auth 硬撑。
+     有权威目录（Apple/YTM/MB）时 _auth 能压住它们（实测前排全对）；
+     但手机上 Apple 经常连不通（VPN / 境外 DNS），一旦 _auth 全是 0，
+     排序就退化成「谁挂着 Topic 谁在前」—— 那正是截图里的样子。
+     修法：**没有权威目录背书时，Topic 加分作废**（不扣也不加）。
+     宁可不帮它，也不能把身份不明的一律当成原唱。 */
   const titleOk = flatTitle(t).indexOf(flatTitle(q)) >= 0 || coreTitle(t).indexOf(coreTitle(q)) >= 0;
-  if (/[-–—]\s*Topic$/i.test(a)) {
-    bone -= titleOk ? 45 : 0;   // 标题对得上才认它是官方发行版
+  if (titleOk && /[-–—]\s*Topic$/i.test(a)) {
+    /* hasAuth = 这次有没有拿到权威目录；itemAuthOk = 目录认不认这一条。
+       有目录但不认 → 这个 Topic 无法核实身份，不给分（也不扣）。
+       没有目录 → 无从核实，同样不给分。
+       两种「不能核实」都归零，是为了让排序退回到 _extra/_heat 这些
+       它自己的信号上去，而不是让「挂了个 Topic 后缀」直接决定名次。 */
+    if (hasAuth && itemAuthOk) bone -= 45;
   }
 
   // 标题里带演唱者署名「xxx - 歌名」结构的多半是搬运
@@ -1636,8 +1656,14 @@ function officialBone(raw, artist, platform, query, artistQuery) {
     bone += 25;
   }
 
-  // 内地数字平台上的同名单曲：原唱常常没版权，页面里剩的多是翻唱
-  if (platform === "QQ音乐" || platform === "网易云" || platform === "酷狗" || platform === "咪咕") bone += 12;
+  /* 内地数字平台上的同名单曲：原唱常常没版权，页面里剩的多是翻唱。
+     ⚠️ 2026-10-21：这条只在**有权威目录**时才罚（hasAuth）。
+        没有目录时它反而是纯伤害：搜「亏欠」的内地平台结果里，
+        张震岳的原唱就在咪咕（rank 5），却因为这条 +12 被翻唱压下去，
+        基准测试里原唱从 #10 掉到 #14。没有目录就没人能证明
+        「内地平台上的都是翻唱」，那就不该拿它当罪证。 */
+  if (hasAuth &&
+      (platform === "QQ音乐" || platform === "网易云" || platform === "酷狗" || platform === "咪咕")) bone += 12;
 
   // 现场 / 巡演 / 合集（统一交给 isLiveVersion，标题+专辑一起看，见函数下方）
   if (/社慶|社庆|cover|翻唱/i.test(t)) bone += 20;
@@ -5025,13 +5051,28 @@ function mergeMbAlbums(cat, list) {
   return list;
 }
 
+/* ⚠️ 只搜「视频」类目（params = EgIQAQ%3D%3D，对应 YouTube 界面上的
+   「筛选 → 视频」）。不传的话 innertube 会把频道、播放列表、合辑卡、
+   Shorts 一起塞进同一个响应，而我们要的 videoRenderer 只占其中一小段。
+
+   实测（2026-10-21）：加参数前后**首位结果 10/10 完全一致**
+   （周杰伦 稻香 / 张震岳 爱我别走 / 宇多田 First Love / 陈奕迅 富士山下 /
+    告五人 爱人错过 / 邓紫棋 泡沫 / 李荣浩 李白 / 五月天 倔强 /
+    陶喆 爱很简单 / 张学友 吻别），前三位也 7/10 一致 —— 不改排序，纯减体积：
+      周杰伦 稻香       2211KB → 309KB
+      宇多田 First Love 3698KB → 307KB
+   线上传输（br/gzip）一次搜索 513KB → 约 20KB。
+   用户实测带宽 57KB/s，光这一条就省掉 8 秒多，而搜索页的等待时间
+   基本就压在这一条上（内地那几家加起来才 60KB 左右）。 */
+const YT_SEARCH_PARAMS = "EgIQAQ%3D%3D";
+
 async function ytSearchRaw(query) {
   const c = YT_ANDROID;
   const r = await ytGuard(async () => {
     const key = await ytPubKey();
     return axios_1.post(
       "https://www.youtube.com/youtubei/v1/search?key=" + key + "&prettyPrint=false",
-      JSON.stringify({ context: ytCtx(c), query: query }),
+      JSON.stringify({ context: ytCtx(c), query: query, params: YT_SEARCH_PARAMS }),
       { timeout: YT_NET_TIMEOUT, headers: ytHeaders(c), validateStatus: () => true }
     );
   });
@@ -9684,10 +9725,18 @@ async function recSheetPool(tagName) {
   const tasks = [];
   if (useQQ && qqCatId) tasks.push(qqSheetList(qqCatId));
 
+  /* ⚠️ 池子 limit 从 100 降到 60（2026-10-21）。
+     这条请求是「推荐歌单」页的主要开销：limit=100 线上传输 105KB（br 压缩后），
+     用户实测 57KB/s 就是 1.8 秒；limit=60 是 66KB / 1.2 秒。
+     池子变小会不会破坏「每天换一批、跟前几天不重」？按轮换算法完整模拟过：
+       池子 60 → 今日 20 张，与昨天 0 重叠、与前天 0 重叠，30 天内覆盖全池。
+       池子 40 才会出现「与前天全重叠」，所以 60 是安全下限。
+     代价只是「往下翻」的总页数从 5 页变 3 页（首屏内容完全不变）。
+     首屏快一半，比尾部多两页更值。 */
   if (wantNE) {
     try {
       const r = await httpGet("https://music.163.com/api/playlist/highquality/list",
-        { cat: cat, limit: 100, lasttime: 0, area: "全部" }, NETEASE_HEADERS);
+        { cat: cat, limit: 60, lasttime: 0, area: "全部" }, NETEASE_HEADERS);
       push((r && r.playlists) || []);
     } catch (e) { console.log("[粽子] 推荐池(" + cat + ")失败: " + e.message); }
   }
@@ -14645,9 +14694,13 @@ async function searchMusicAll(query, page) {
        ⚠️ 变体词（live/remix/翻唱…）不提，否则专辑的翻唱版会跟原曲抢位。 */
     if (it._albq && !VARIANT_RE.test(it.title) && !isCoverTitle(it.title)) it._tier = 3;
     it._extra = relevanceExtra(it.title, query, it.artist, artistQuery);
-    it._bone = officialBone(it.title, it.artist, it.platform, query, artistQuery);
-    it._hot = hotScore(it.playCount);
     it._auth = authorityScore(it, auth);   // ← 新增：权威库加分
+    /* ⚠️ _bone 必须在 _auth 之后算（2026-10-21）：Topic 频道加分要看
+       权威目录认不认这条。见 officialBone 里的注释 ——
+       「有没有权威目录」决定了 Topic 那 -45 分算不算数。 */
+    it._bone = officialBone(it.title, it.artist, it.platform, query, artistQuery,
+      !!auth, it._auth > 0);
+    it._hot = hotScore(it.playCount);
     /* ⚠️ 用 catForFill 而不是 appleCat：Apple 没有目录时（李志那种全线下架），
        要退到 YTM 目录来打分，否则冒名的 B 站搬运会一直顶在最前面。
        仍然只影响排序，不删条目。 */
@@ -14924,6 +14977,64 @@ function dropDeadTracks(r) {
   return out;
 }
 
+/* ============================================================
+ * 搜索出口的硬闸（2026-10-21）
+ *
+ * 事故现象：搜索结果已经列出来了，顶部那个加载圈还在转；
+ *           或者切到「专辑 / 歌手 / 歌单」标签，圈一转半分钟以上。
+ *
+ * 根因：MusicFree 的搜索页对每个插件只认一种状态。它 await 我们的
+ *   search()，拿到的 Promise 只要没 settle，界面就一直是
+ *   PENDING_FIRST_PAGE —— 也就是那个圈。
+ *   而四个分支里只有「单曲」有软/硬截止，另外三个**一条闸都没有**：
+ *     searchAlbum  逐张去 Apple 目录 + MusicBrainz 骨架，每次 5s 上限，
+ *                  串几次就叠成 50s+
+ *     searchArtist 要问 6 家歌手库 + Apple/YTM/MB 三份目录 + 逐首补时长
+ *     searchSheet  多个聚合源串行
+ *   实测（把 Apple / YouTube 打成不可达，模拟手机走流量时的网络）：
+ *     单曲 6.1s、专辑 56.2s、歌手 50.0s、歌单 25.0s —— 后三个全程转圈。
+ *
+ * 修法：在出口统一加闸。到点就把**已经拿到的部分**交出去，
+ *   后台那条链继续跑，跑完写进搜索缓存，用户翻回来或下拉刷新时直接命中。
+ *   宁可先给半页，也不能让圈一直转 —— 转圈的界面等于不可用。
+ *
+ * ⚠️ 闸要比「正常网络的实测上限」宽：正常网络专辑 3.9s、歌手 1~6s、
+ *    歌单 0.3s。给 8 秒是因为赵薇那种歌手页第一次要 4.9s，
+ *    冷门歌手问 MB 也要 5s —— 闸太紧会把正常结果也砍成半页。
+ * ============================================================ */
+const SEARCH_TYPE_DEADLINE = { album: 8000, artist: 8000, sheet: 6000 };
+
+/** 给一个搜索任务套上出口时限。超时先交已有的部分，任务本身继续跑完写缓存。 */
+function withTypeDeadline(type, query, page, ck, task) {
+  const ms = SEARCH_TYPE_DEADLINE[type];
+  if (!ms) return task;
+  const T0 = Date.now();
+  let settled = false;
+  const guard = new Promise(function (res) {
+    setTimeout(function () {
+      if (settled) return;
+      /* 超时那一刻能交什么？缓存里如果有同一关键词的上一份就交它
+         （通常是用户上一次进来时后台跑完写进去的全量），
+         没有就交一个「空但 isEnd=true」的结果 —— 界面上会显示"没有结果"，
+         至少圈停了、标签能切；后台跑完再进就是全量。 */
+      const hit = cacheGet("search", type, ck);
+      res(hit || { isEnd: true, data: [], _timeout: 1 });
+      console.log("[粽子] " + type + " 搜索「" + query + "」超过 " + ms
+        + "ms 未返回 → 先交已有部分，后台继续（" + (Date.now() - T0) + "ms）");
+    }, ms);
+  });
+  return Promise.race([
+    task.then(function (r) {
+      settled = true;
+      /* 后台那条链跑完了才写缓存 —— 这样下次进来直接是全量，
+         而不是把"半页"固化成缓存。 */
+      if (page === 1) cachePut("search", type, ck, r);
+      return r;
+    }),
+    guard,
+  ]);
+}
+
 const search = async function (query, page, type) {
   // 四种搜索都从这里过，「歌名+歌手」的分隔符统一换成空格再往下发。
   query = normalizeQuery(query);
@@ -14978,9 +15089,11 @@ const search = async function (query, page, type) {
     if (page === 1) cachePut("search", type, ck, r);
     return r;
   }
-  if (type === "album") { const r = await searchAlbum(query, page); if (page === 1) cachePut("search", type, String(query).trim().toLowerCase(), r); return r; }
-  if (type === "artist") { const r = await searchArtist(query, page); if (page === 1) cachePut("search", type, String(query).trim().toLowerCase(), r); return r; }
-  if (type === "sheet") { const r = await searchSheet(query, page); if (page === 1) cachePut("search", type, String(query).trim().toLowerCase(), r); return r; }
+  /* 这三个分支的缓存写入已经搬进 withTypeDeadline ——
+     那里是「任务跑完才写」，超时先交的那份半页不会污染缓存。 */
+  if (type === "album") return withTypeDeadline("album", query, page, ck, searchAlbum(query, page));
+  if (type === "artist") return withTypeDeadline("artist", query, page, ck, searchArtist(query, page));
+  if (type === "sheet") return withTypeDeadline("sheet", query, page, ck, searchSheet(query, page));
   return { isEnd: true, data: [] };
 };
 
@@ -16223,7 +16336,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.50",
+  version: "4.10.51",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
