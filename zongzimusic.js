@@ -3790,6 +3790,338 @@ async function ytmArtistCatalog(name) {
   }
 }
 
+/* ============================================================
+ * MusicBrainz 目录 —— 只补元数据，不给音源
+ *
+ * 为什么接它（2026-10-21 实测，四个歌手对比 Apple / YTM / MB）：
+ *   赵薇     Apple  1 张 /  10 首   ← 只剩《天使旅行箱》一张
+ *            YTM    1 张 /  10 首
+ *            MB    13 张 / 118 首   ← 连《左耳》都在
+ *   何韵诗   Apple 52 张 / 122 首（截断）
+ *            YTM   20 张 / 157 首
+ *            MB    38 张 / 236 首
+ *   万能青年旅店  Apple 2 张 / 18 首，MB 15 张 / 36 首
+ *
+ * 它就是「这位歌手到底发过哪些片」的权威答案，比 Apple 全、比 YTM 快
+ * （一次请求 1~1.5s，YTM 要逐张拉曲目 2.6s）。但它**没有音频**，
+ * 拿到的只有歌名/专辑名/时长，所以只干两件事：
+ *   1. 专辑页缺片时当骨架（Apple 截断/太薄的那些歌手）
+ *   2. 单曲搜索时给「确实是他作品」的条目标记加分（只加分，不罚）
+ *
+ * ⚠️ 两条硬规矩：
+ *   - 限流 1 req/s，必须串行排队。超了会 503，还不是每次都报，很难查。
+ *   - Cover Art Archive 对华语歌手几乎全是空的（实测抽查 15 张，0 张有封面），
+ *     所以封面一律走 fallback，别指望它。
+ * ============================================================ */
+const MB_API = "https://musicbrainz.org/ws/2";
+const MB_HEADERS = {
+  "User-Agent": "ZongziMusicFree/1.0 ( https://github.com/ZONGZI-000/zongzi-musicfree-plugin )",
+  Accept: "application/json",
+};
+const MB_TIMEOUT = 9000;   // ⚠️ 实测 MB 波动极大：万青 0.4s，赵薇/何韵诗 4.5~6s
+const MB_CAT_TTL = 6 * 60 * 60 * 1000;
+const MB_FAIL_TTL = 5 * 60 * 1000;
+const MB_CACHE = {};
+let _mbChain = Promise.resolve();
+let _mbLast = 0;
+
+/** 排队发一次 MB 请求：只保证「两次请求的**发出时间**间隔 ≥1.1s」。
+ *
+ *  ⚠️ 不能串成「等上一个响应回来才发下一个」——
+ *     实测 MB 单次延迟波动极大（同一个接口 0.3s / 5.4s 都见过），
+ *     一旦排在前面的那个卡住，后面所有请求（哪怕跟自己无关）全被拖着，
+ *     整次搜索就死在队列里。限流要的是「发出的频率」，不是「返回的顺序」。
+ */
+function mbGet(url) {
+  const gap = _mbChain.then(async function () {
+    const wait = 1100 - (Date.now() - _mbLast);
+    if (wait > 0) await new Promise(function (r) { setTimeout(r, wait); });
+    _mbLast = Date.now();
+  });
+  _mbChain = gap.catch(function () { return null; });
+  const once = function () {
+    return gap.then(function () {
+      return axios_1.get(url, {
+        timeout: MB_TIMEOUT,
+        headers: MB_HEADERS,
+        validateStatus: function () { return true; },
+      });
+    });
+  };
+  /* ⚠️ 503 / 429 必须重试一次：MB 的限流计数是**滑动窗口**，
+     连发两个请求时第二个经常照样被拒（实测「赵薇」第一次搜就撞上了，
+     于是那次目录整个拿不到，专辑页只有 1 张，用户以为坏了）。
+     等 1.5s 再来一次基本都能过。 */
+  return once().then(function (r) {
+    if (r.status === 429 || r.status === 503) {
+      return new Promise(function (res) { setTimeout(res, 1500); })
+        .then(once)
+        .then(function (r2) {
+          if (r2.status !== 200) throw new Error("MB " + r2.status);
+          return r2.data;
+        });
+    }
+    if (r.status !== 200) throw new Error("MB " + r.status);
+    return r.data;
+  });
+}
+
+/**
+ * 歌手名 → MusicBrainz 艺人条目。
+ * ⚠️ 必须 exact 匹配：搜「李志」时 MB 会同时给「李志辉 77 分」「李志清 74 分」，
+ *    拿第一条就会把整份目录指到别人身上（跟 Apple 那条坑一模一样）。
+ */
+async function mbFindArtist(name) {
+  const q = String(name || "").trim();
+  if (!q) return null;
+  const qn = singerNorm(q);
+  const ck = "mbart:" + qn;
+  const hit = MB_CACHE[ck];
+  if (hit && Date.now() - hit.at < (hit.v ? MB_CAT_TTL : MB_FAIL_TTL)) return hit.v;
+  let picked = null;
+  try {
+    const d = await mbGet(MB_API + "/artist/?query=" + encodeURIComponent('artist:"' + q + '"')
+      + "&fmt=json&limit=5");
+    const list = (d && d.artists) || [];
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i];
+      if (!a || !a.id) continue;
+      if (!oneNameEq(a.name || "", qn)) continue;
+      // 分太低的多半是同名野鸡条目
+      if (Number(a.score || 0) < 90) continue;
+      picked = { id: a.id, name: a.name || q, score: Number(a.score || 0) };
+      break;
+    }
+  } catch (e) { picked = null; }
+  MB_CACHE[ck] = { at: Date.now(), v: picked };
+  return picked;
+}
+
+/**
+ * 歌手名 → 完整作品表，结构跟 appleArtistCatalog / ytmArtistCatalog 对齐，
+ * 这样 appleCatScore 那套打分和 mergeAppleAlbums 那套骨架合并能直接复用。
+ */
+async function mbArtistCatalog(name) {
+  const q = String(name || "").trim();
+  if (!q) return null;
+  const ck = "mbcat:" + singerNorm(q);
+  const hit = MB_CACHE[ck];
+  if (hit && Date.now() - hit.at < (hit.v ? MB_CAT_TTL : MB_FAIL_TTL)) return hit.v;
+
+  let v = null;
+  try {
+    const art = await mbFindArtist(q);
+    if (art && art.id) {
+      /* ⚠️ 一次请求拿完：release?artist= 带 inc=recordings 就带回了全部曲目，
+         不用像 YTM 那样逐张拉（那是 2.6s，这是 1.2s）。
+         实测 100 条上限够用：李志 64 张 / 赵薇 13 张 / 何韵诗 34 张都在里面；
+         真超过 100 的（周杰伦那种）会带 count 字段，标记成 truncated，
+         这种大歌手本来也不缺目录，直接当没有。 */
+      const d = await mbGet(MB_API + "/release?artist=" + art.id
+        + "&inc=recordings+release-groups+artist-credits&fmt=json&limit=100");
+      const rels = (d && d.releases) || [];
+      const total = Number((d && d.count) || rels.length);
+      const truncated = total > rels.length;
+
+      /* 按 release-group 归并 —— 同一张专辑会有多个版本（赵薇《飘》有 2004
+         和 2004-11-16 两条），不去重的话专辑页会出现两张《飘》。 */
+      const byGroup = {};
+      const groupOrder = [];
+      for (let i = 0; i < rels.length; i++) {
+        const r = rels[i];
+        const rg = r["release-group"] || {};
+        const gid = rg.id || r.id;
+        const tr = [];
+        const media = r.media || [];
+        for (let m = 0; m < media.length; m++) {
+          const tt = media[m].tracks || [];
+          for (let k = 0; k < tt.length; k++) {
+            if (!tt[k] || !tt[k].title) continue;
+            tr.push({
+              title: String(tt[k].title),
+              duration: Number(tt[k].length || 0),
+              no: Number(tt[k].position || 0),
+            });
+          }
+        }
+        /* ⚠️ 类型要连 secondary-types 一起看 —— MB 把演唱会实况标成
+           「primary: Album + secondary: [Live]」，只听 primary-type 会当成录音室专辑。
+           实测何韵诗：28 张骨架里 6 张是 LIVE（On the Pulse of HOCC 2018 LIVE
+           29 首、十八種香港伊館站 28 首…），全被甩到专辑页最前面。
+           赵薇那张《左耳》是 primary: Single、secondary 空，照收。 */
+        const secTypes = (rg["secondary-types"] || []).map(function (x) { return String(x); });
+        const prev = byGroup[gid];
+        if (!prev) {
+          byGroup[gid] = {
+            gid: gid,
+            title: rg.title || r.title || "",
+            date: rg["first-release-date"] || r.date || "",
+            type: rg["primary-type"] || "",
+            sec: secTypes,
+            tracks: tr,
+          };
+          groupOrder.push(gid);
+        } else if (tr.length > prev.tracks.length) {
+          prev.tracks = tr;
+          if (!prev.date) prev.date = rg["first-release-date"] || r.date || "";
+        }
+      }
+
+      const albums = [];
+      const tracks = [];
+      const trackSet = {};
+      const albumSet = {};
+      const seenT = {};
+      for (let i = 0; i < groupOrder.length; i++) {
+        const g = byGroup[groupOrder[i]];
+        if (!g || !g.title) continue;
+        /* ⚠️ Single 要收、LIVE / 精选 不收。
+           赵薇那张《左耳》在 MB 里标成 Single（1 首），可它正是用户要的，
+           所以 Single 留。但演唱会实况和精选集会挤占专辑页前排
+           （实测何韵诗 28 张里有 6 张是全套 LIVE），一律踢掉。
+           注意 LIVE/Compilation 藏在 secondary-types 里，不在 primary-type。 */
+        const type = String(g.type || "");
+        const secStr = (g.sec || []).join(",");
+        if (/compilation|live|remix|dj-mix|mixtape|demo|interview|spokenword|soundtrack/i
+          .test(type + "," + secStr)) continue;
+        const alKey = normAlbumName(g.title);
+        if (alKey) albumSet[alKey] = 1;
+        albums.push({
+          id: "mbal:" + g.gid,
+          platform: "MusicBrainz",
+          title: g.title,
+          artist: art.name,
+          artwork: "",
+          date: g.date || "",
+          description: "MusicBrainz 目录" + (type ? (" · " + type) : ""),
+          worksNum: g.tracks.length,
+          _provider: "mb",
+          _kind: "album",
+          _tracks: g.tracks,
+        });
+        for (let k = 0; k < g.tracks.length; k++) {
+          const t = g.tracks[k];
+          const n = normTextZ(t.title);
+          if (!n || seenT[n]) continue;
+          seenT[n] = 1;
+          trackSet[n] = 1;
+          const c = normTextZ(coreTitle(t.title));
+          if (c) trackSet[c] = 1;
+          tracks.push({
+            title: t.title,
+            album: g.title,
+            artist: art.name,
+            duration: t.duration || 0,
+          });
+        }
+      }
+      if (albums.length) {
+        v = {
+          id: art.id, name: art.name, albums: albums, tracks: tracks,
+          trackSet: trackSet, albumSet: albumSet,
+          _src: "mb",
+          full: !truncated,
+          // MB 的目录很全，但没音频；complete 只影响「硬删」，这边永远不删
+          complete: false,
+        };
+      }
+    }
+  } catch (e) { v = null; }
+  MB_CACHE[ck] = { at: Date.now(), v: v };
+  return v;
+}
+
+/** MB 目录打分：只加分，绝不罚（MB 缺歌比 Apple 少，罚会误伤真歌） */
+function mbCatScore(item, cat) {
+  if (!cat) return 0;
+  const titleN = normTextZ(item.title || "");
+  if (!titleN) return 0;
+  /* ⚠️ 先验歌手，再验歌名 —— 这一步不能省。
+     实测搜「赵薇」：目录里确实有《有一个姑娘》《不能和你分手》，
+     但列表前排那些是周漾玥、还珠格格合唱团、嘟拉儿歌的翻唱。
+     只看歌名就给 +40，等于把别人的翻唱当成赵薇本人的作品推上去。
+     歌手字段对不上目录里的名字 → 不加分（也不扣，它可能真是别的版本）。 */
+  const catN = singerNorm(cat.name);
+  const parts = String(item.artist || "").split(/[\/&、,，]/).map(singerNorm).filter(Boolean);
+  let artistOk = false;
+  for (let i = 0; i < parts.length; i++) {
+    const a = parts[i];
+    if (!a) continue;
+    if (a === catN) { artistOk = true; break; }
+    /* 跨文字体系（何韻詩 / HOCC、赵薇 / Vicki Zhao）只认「一边不含中文」，
+       理由同专辑页的 hitArtist：中文名多一个字就是另一个人。 */
+    const aCJK = /[\u4e00-\u9fff]/.test(a);
+    const nCJK = /[\u4e00-\u9fff]/.test(catN);
+    if (aCJK && nCJK) continue;
+    if (a.indexOf(catN) >= 0 || catN.indexOf(a) >= 0) { artistOk = true; break; }
+  }
+  if (!artistOk) return 0;
+  if (cat.trackSet[titleN]) return 40;
+  const core = normTextZ(coreTitle(item.title));
+  if (core && cat.trackSet[core]) return 40;
+  if (core) {
+    const keys = Object.keys(cat.trackSet);
+    for (let i = 0; i < keys.length; i++) {
+      if (keys[i].length >= 2 && (keys[i].indexOf(core) >= 0 || core.indexOf(keys[i]) >= 0)) return 40;
+    }
+  }
+  const albumN = normAlbumName(item.album || "");
+  if (albumN && cat.albumSet[albumN]) return 25;
+  if (albumN) {
+    const keys2 = Object.keys(cat.albumSet);
+    for (let i = 0; i < keys2.length; i++) {
+      if (keys2[i].length >= 2 && (keys2[i].indexOf(albumN) >= 0 || albumN.indexOf(keys2[i]) >= 0)) return 25;
+    }
+  }
+  return 0;
+}
+
+/** MB 目录够不够当专辑页骨架（跟 appleSkeletonOk 同一套门槛） */
+async function mbSkeletonOk(cat, eq, query) {
+  if (!cat) return false;
+  if (!cat.full) return false;
+  if (cat.tracks.length < 10) return false;
+  const exactNameIdentity = normTextZ(cat.name) === normTextZ(eq);
+  if (!(cat.albums.length >= 2 || exactNameIdentity)) return false;
+  if (await looksLikeSongQuery(eq)) return false;
+  return true;
+}
+
+/**
+ * 把 MB 有、列表里没有的专辑追加进去（只追加，不删任何平台条目）。
+ * 命中的就跳过 —— 同名专辑平台上已经有的（能真播）优先。
+ */
+function mergeMbAlbums(cat, list) {
+  if (!cat || !cat.albums.length) return list;
+  const have = {};
+  for (let i = 0; i < list.length; i++) {
+    const k = normAlbumName(list[i].title || "");
+    if (k) have[k] = 1;
+  }
+  let added = 0;
+  for (let i = 0; i < cat.albums.length; i++) {
+    const a = cat.albums[i];
+    const k = normAlbumName(a.title || "");
+    if (!k || have[k]) continue;
+    have[k] = 1;
+    list.push({
+      id: a.id,
+      platform: "MusicBrainz",
+      title: a.title,
+      artist: a.artist || cat.name,
+      artwork: "",
+      date: a.date || "",
+      description: "MusicBrainz 目录（该平台暂无音源）",
+      worksNum: a.worksNum || 0,
+      _provider: "mb",
+      _kind: "album",
+    });
+    added++;
+  }
+  if (added) console.log("[粽子] MusicBrainz 目录「" + cat.name + "」补 " + added + " 张");
+  return list;
+}
+
 async function ytSearchRaw(query) {
   const c = YT_ANDROID;
   const r = await axios_1.post(
@@ -5559,16 +5891,23 @@ function mergeAppleAlbums(cat, pool, skeleton) {
       if (skeleton) list.push(x);
       continue;
     }
+    /* ⚠️ 占位条目的 id / provider 必须跟着目录来源走 ——
+       骨架现在可能是 Apple，也可能是 MusicBrainz（见 mbArtistCatalog）。
+       以前写死 "apple:" + cat.id，换成 MB 目录时会生成
+       「apple:<MB的uuid>:<i>」，点进去按 Apple 的 id 去查，当然查不到。 */
+    const srcKind = (cat._src === "mb") ? "mb" : "apple";
     const ph = {
-      id: "apple:" + cat.id + ":" + i,
-      platform: "Apple Music",
+      id: srcKind + ":" + cat.id + ":" + i,
+      platform: (srcKind === "mb") ? "MusicBrainz" : "Apple Music",
       title: a.title,
       artist: a.artist,
       artwork: a.artwork,
       date: a.date,
-      description: "Apple Music 目录（该平台暂无音源）",
+      description: (srcKind === "mb")
+        ? "MusicBrainz 目录（该平台暂无音源）"
+        : "Apple Music 目录（该平台暂无音源）",
       worksNum: a.worksNum,
-      _provider: "apple",
+      _provider: srcKind,
       _kind: "album",
     };
     if (skeleton) list.push(ph);
@@ -5775,6 +6114,31 @@ async function searchAlbum(query, page) {
     }
   }
 
+  /* ---- Apple 也不给骨架时，退到 MusicBrainz ----
+     实测（2026-10-21）搜「何韵诗」：
+       酷狗/酷我/咪咕歌手接口全空，Apple 倒是有 52 张 122 首，
+       但 **truncated=true**（lookup 200 条上限把曲目截断了），
+       于是 appleSkeletonOk 直接把整个骨架丢掉 → 专辑页 0 张。
+     而 MB 有 38 张发行 236 首，全都在一次请求里。
+     ⚠️ 只在「本来就没歌手条目、Apple 也没给骨架」时问 MB ——
+        有歌手条目的走上面那条 Apple 补齐的路，不重复问。 */
+  if (!singerHit && !appleAlbums) {
+    try {
+      /* ⚠️ 这里已经是「零结果」了，多等 5s 换一整个页面的唱片值得。
+         请求本身不取消，超了也会写进 MB_CACHE，下次搜就秒回。
+         （实测 MB 延迟波动极大：万青 0.4s，赵薇/何韵诗 4.5~6s。） */
+      const mcat = await Promise.race([
+        mbArtistCatalog(eq).catch(function () { return null; }),
+        new Promise(function (res) { setTimeout(function () { res(null); }, 5000); }),
+      ]);
+      if (await mbSkeletonOk(mcat, eq, query)) {
+        appleAlbums = mcat;
+        console.log("[粽子] Apple 无骨架，改用 MusicBrainz 目录「" + mcat.name + "」"
+          + mcat.albums.length + " 张");
+      }
+    } catch (e) { /* MB 挂了就当没有 */ }
+  }
+
   if (singerHit) {
     // 翻页也要继续用歌手目录，否则第 2 页又变回一堆同名翻唱
     const own = await singerAlbumAll(singerHit.id);
@@ -5855,6 +6219,42 @@ async function searchAlbum(query, page) {
       } catch (e) { /* Apple 挂了就维持平台结果 */ }
     }
 
+    /* ---- 还嫌薄？问 MusicBrainz ----
+       实测（2026-10-21）：
+         赵薇    Apple 1 张 / 10 首   → MB 13 张 / 118 首（《左耳》《双》《飘》全在）
+         五条人？不用 —— 国内平台齐的歌手走不到这里。
+       Apple 那边的问题是「香港区库不全 + lookup 200 条截断」，
+       何韵诗 52 张被截断、赵薇直接只剩一张。MB 是纯社区录入，反而更全。
+       ⚠️ 只在平台 + Apple 都补不够 8 张时才问 —— MB 一次要 1.2~4s，
+          而且全局 1 req/s 限流，不能每个歌手都去问一遍。 */
+    if (page === 1 && kept.length < 8) {
+      try {
+        /* 超时预算按「现在手里有几张」分档 —— 越空越值得等：
+             0 张    → 7s（不等到就是整页空白）
+             1~2 张  → 6s
+             3~7 张  → 2.6s（有东西看就别再拖）
+           ⚠️ MB 走两步（找艺人 + 拉发行），中间还有 1.1s 的限流间隔，
+              所以一次完整调用实测 4~7s，预算给小了必然「第一次没有、
+              第二次才有」。超时只是这一页少几张 —— 请求本身不取消，
+              跑完照样写进 MB_CACHE，用户下次搜同一个歌手立刻就有。 */
+        const mbBudget = kept.length === 0 ? 7000 : (kept.length < 3 ? 6000 : 2600);
+        const mcat = await Promise.race([
+          mbArtistCatalog(singerHit.name).catch(function () { return null; }),
+          new Promise(function (res) { setTimeout(function () { res(null); }, mbBudget); }),
+        ]);
+        if (mcat && mcat.albums.length > kept.length) {
+          /* ⚠️ mergeMbAlbums 是**原地追加**（返回的就是传进去那个数组），
+             别再写成「取返回值 → 清空原数组 → 按返回值回填」——
+             那两行指的是同一个数组，清空的瞬间返回值也空了，
+             实测「平台 4 张 → 补到 0 张」，整页专辑全没。 */
+          const before = kept.length;
+          mergeMbAlbums(mcat, kept);
+          console.log("[粽子] 平台 + Apple 只有 " + before + " 张 → 用 MusicBrainz「"
+            + mcat.name + "」补到 " + kept.length + " 张");
+        }
+      } catch (e) { /* MB 挂了就维持现状 */ }
+    }
+
     // 听书聚合条目照旧带出来（它本来就不是专辑）
     const books = page === 1 ? out.filter((x) => x._isAudiobook) : [];
 
@@ -5900,6 +6300,28 @@ async function searchAlbum(query, page) {
     const kept2 = mergeAppleAlbums(appleAlbums, pool, true);
     console.log("[粽子] Apple 目录「" + appleAlbums.name + "」" + appleAlbums.albums.length
       + " 张，其中 " + kept2.filter((x) => x._provider !== "apple").length + " 张配到平台音源");
+
+    /* ---- Apple 自己就薄的时候，再让 MusicBrainz 补一次 ----
+       实测（2026-10-21）搜「赵薇」：Apple 目录只有《天使旅行箱》一张，
+       骨架跑完专辑页就 1 张；而 MB 有 13 张 118 首（《双》《飘》《左耳》
+       全在）。DB 里她的其它片子 Apple 香港区根本没有。
+       ⚠️ 只在骨架跑出来不到 8 张时补，别让周杰伦那种走这条（他本来就齐）。 */
+    if (kept2.length < 8) {
+      try {
+        /* 预算同理（越空越值得等）：0 张 7s / 1~2 张 6s / 3 张以上 2.6s。 */
+        const mbBudget2 = kept2.length === 0 ? 7000 : (kept2.length < 3 ? 6000 : 2600);
+        const mcat = await Promise.race([
+          mbArtistCatalog(appleAlbums.name || eq).catch(function () { return null; }),
+          new Promise(function (res) { setTimeout(function () { res(null); }, mbBudget2); }),
+        ]);
+        if (mcat && mcat.albums.length > kept2.length) {
+          const before = kept2.length;
+          mergeMbAlbums(mcat, kept2);
+          console.log("[粽子] Apple 只有 " + before + " 张 → 用 MusicBrainz「"
+            + mcat.name + "」补到 " + kept2.length + " 张");
+        }
+      } catch (e) { /* MB 挂了就维持 Apple 骨架 */ }
+    }
 
     const full2 = sortAlbums(kept2, appleAlbums.name);
     const begin2 = (page - 1) * 30;
@@ -9506,6 +9928,96 @@ async function getAlbumDetail(albumItem, page) {
   const id = albumItem && albumItem.id;
   if (!id) return null;
 
+  /* MusicBrainz 专辑（mbal:<release-group-id>）—— MB 没有音频，
+     曲目表照 MB 给，每首再去 YouTube 找官方音源（跟 Apple 占位那条同一个套路）。
+     ⚠️ 曲目一律从 MB 目录缓存里取，不信条目自带的 _tracks：
+        列表可能被用户刷新/缓存过，_tracks 会丢。 */
+  if (albumItem._provider === "mb" || String(id).indexOf("mbal:") === 0) {
+    const albumTitle = String(albumItem.title || "");
+    const albumN = normAlbumName(albumTitle);
+    const artistName = String(albumItem.artist || "");
+    let cat = null;
+    try { cat = await mbArtistCatalog(artistName); } catch (e) { cat = null; }
+    let mbAlb = null;
+    if (cat) {
+      for (let i = 0; i < cat.albums.length; i++) {
+        if (normAlbumName(cat.albums[i].title || "") === albumN) { mbAlb = cat.albums[i]; break; }
+      }
+    }
+    if (!mbAlb || !(mbAlb._tracks || []).length) return null;
+
+    const tracks = mbAlb._tracks.slice().sort(function (a, b) {
+      return Number(a.no || 0) - Number(b.no || 0);
+    });
+    /* 逐首去 YouTube 找官方音源。MB 的时长（毫秒）正好用来卡时长差，
+       这对压掉「翻唱 / 现场 / 加速版」特别有效 —— MB 的时长是权威的。 */
+    const musicList = [];
+    const CONC = 6;
+    for (let i = 0; i < tracks.length; i += CONC) {
+      const batch = tracks.slice(i, i + CONC);
+      const parts = await Promise.all(batch.map(async function (t) {
+        const tn = normTextZ(t.title);
+        const tBare = tn.replace(/[.,!?;:'"·、。，！？；：…—–\-]/g, "");
+        let list = [];
+        try { list = await ytSearchRaw(t.title + " " + artistName); } catch (e) { return null; }
+        let best = null, bestSc = -Infinity;
+        for (let j = 0; j < (list || []).length; j++) {
+          const y = list[j];
+          const yn = normTextZ(y.title || "");
+          if (!yn) continue;
+          const yBare = yn.replace(/[.,!?;:'"·、。，！？；：…—–\-]/g, "");
+          const hitTitle = yn.indexOf(tn) >= 0 || tn.indexOf(yn) >= 0 ||
+            (tBare && yBare.indexOf(tBare) >= 0) ||
+            (tBare && tBare.indexOf(yBare) >= 0 && yBare.length >= 2);
+          if (!hitTitle) continue;
+          let sc = 0;
+          if (/[-–—]\s*Topic$/i.test(String(y.artist || ""))) sc += 100;
+          if (yn === tn) sc += 40;
+          else if (yBare === tBare) sc += 30;
+          else sc -= Math.max(0, yn.length - tn.length);
+          if (/歌词|歌詞|lyrics|翻唱|cover|remix|dj|伴奏|純享|纯享|live|現場|现场|演唱[会會]/i.test(y.title || "")) sc -= 60;
+          const sec = ytDurSec(y.durationText);
+          if (sec > 0 && t.duration > 0) {
+            const dd = Math.abs(sec - Math.round(t.duration / 1000));
+            sc += dd <= 12 ? 45 : (dd <= 40 ? 5 : -100);
+          }
+          if (sc > bestSc) { bestSc = sc; best = y; }
+        }
+        if (!best || bestSc <= 0) return null;
+        return best;
+      }));
+      for (let j = 0; j < batch.length; j++) {
+        const t = batch[j];
+        const y = parts[j];
+        musicList.push({
+          id: y ? String(y.id) : "",
+          platform: y ? "YouTube" : "MusicBrainz",
+          title: t.title,
+          artist: artistName,
+          album: albumTitle,
+          artwork: (y && y.artwork) || albumItem.artwork || "",
+          duration: y && ytDurSec(y.durationText) > 0
+            ? ytDurSec(y.durationText) * 1000 : Number(t.duration || 0),
+          _provider: y ? "youtube" : "mb",
+        });
+      }
+    }
+    return {
+      isEnd: true,
+      albumItem: {
+        id: String(id),
+        platform: "MusicBrainz",
+        title: albumTitle,
+        artist: artistName,
+        artwork: albumItem.artwork || "",
+        date: albumItem.date || "",
+        description: albumItem.description || "",
+        worksNum: musicList.length || Number(albumItem.worksNum || 0),
+      },
+      musicList: musicList,
+    };
+  }
+
   /* YouTube Music 专辑（ytmal:MPREb_xxx）—— 曲目直接读 YTM 专辑页。
      YTM 返回的是 ATV 官方音轨，取流走的是同一个 videoId，能直接播。 */
   if (String(id).indexOf("ytmal:") === 0) {
@@ -11252,7 +11764,17 @@ async function searchMusicAll(query, page) {
      ⚠️ 只在「像在搜歌手」时才问：YTM 目录要 2.6s（逐张拉曲目），
         搜歌名时白花这 2.6s 是不能接受的。 */
   let ytmCat = null;
-  const _wantCatalog = artistQuery || artistHits >= 2;
+  /* ⚠️ 「像在搜歌手」这道闸要放宽一档（2026-10-21 实测搜「赵薇」）：
+     artistHits 只有 1 —— 列表前排被 Apple 白名单清过，剩下的她自己那条
+     artist 写的是繁体「趙薇」，另外几条是别人挂名。于是 artistQuery 和
+     artistHits>=2 都不成立，目录这条路整个不触发，可它明明就是个人名。
+     补一条：**Apple 认的这位歌手，名字跟查询词就是同一个**，
+     且列表里没有任何一条标题正好等于查询词（那才是搜歌名）。
+     ⚠️ 「名字跟查询词同一个」这句不能省：组合查询「赵薇 左耳」取的尾词是
+        「左耳」，Apple 会给一首叫《左耳》的歌开一个 1 张 1 首的「目录」，
+        不比对名字就会拿它去问 YTM（实测白花 1.7s）。 */
+  const _wantCatalog = artistQuery || artistHits >= 2 ||
+    (!!appleCat && !exactTitleHit && normTextZ(appleCat.name) === normTextZ(query));
   const _appleWeak = !appleCat || appleCat.tracks.length < 10;
   if (_wantCatalog && _appleWeak) {
     const ytmT0 = Date.now();
@@ -11272,6 +11794,40 @@ async function searchMusicAll(query, page) {
   /* 后续打分/补歌统一用这个：Apple 优先，Apple 空就用 YTM。
      ⚠️ 只在**补歌和加分**上用 YTM，不用它硬删 —— 见 ytmArtistCatalog 的注释。 */
   const catForFill = appleCat || ytmCat;
+
+  /* ---- MusicBrainz 目录：Apple 和 YTM 都太薄时的第三份证词 ----
+     实测（2026-10-21）搜「赵薇」：
+       Apple 只有 1 张 10 首，YTM 也是 1 张 10 首（两边都只认《天使旅行箱》），
+       而 MB 有 13 张 118 首 —— 《双》《飘》《我们都是大导演》全在。
+     这种时候只靠 Apple/YTM 打分，列表里一半的真歌会被当成「不在目录里」，
+     排序反而被 B 站搬运顶上去。
+     ⚠️ MB 一次请求 1.2~4.5s，而且全局限流 1 req/s，
+        所以只在「前面两家都薄（<20 首）」且判定是搜歌手时才问。
+     ⚠️ MB 缺歌比 Apple 少，所以 mbCatScore **只加分不罚分**。 */
+  let mbCat = null;
+  /* ⚠️ 只在苹果和 YouTube Music **都没有目录**时才在这里问 MB。
+     试过放宽（Apple 目录薄一点就问），实测反而更差：
+     搜「赵薇」Apple 有 1 张 10 首，问 MB 花掉 1.6s 之后，
+     后面「Apple 目录补全官方音源」那一段的总预算就只剩 575ms，
+     一首都没补到 —— 头部从「蝶 / 恰恰愛 / 小蜜蜂」（赵薇本人的 YouTube
+     官方音源）退成「嘤嘤怪」「葛瑞特音樂」这些搬运。
+     MB 的分数再好，也补不出一个能播的音源；而 Apple 补全能。
+     真正需要 MB 的场合是**两家都没有目录**（列表本来就一片乱），
+     那时多等它 5s 是净赚。其余情况走下面的后台预热，第二次搜直接命中。 */
+  if (_wantCatalog && !appleCat && !ytmCat) {
+    const mbT0 = Date.now();
+    /* 5s 预算：MB 是两步调用（找艺人 + 拉发行），中间还有 1.1s 限流间隔，
+       实测完整跑一次 4~7s。这里本来就是最乱的一档，等得起。 */
+    mbCat = await Promise.race([
+      mbArtistCatalog(appleQuery || query).catch(function () { return null; }),
+      new Promise(function (res) { setTimeout(function () { res(null); }, 5000); }),
+    ]);
+    if (mbCat) {
+      console.log("[粽子] MusicBrainz 目录「" + mbCat.name + "」"
+        + mbCat.albums.length + " 张 / " + mbCat.tracks.length + " 首"
+        + "（" + (Date.now() - mbT0) + "ms）");
+    }
+  }
 
   /* ---- 有权威目录时，同名冒用的条目直接不收 ----
      搜歌手名时，用户要看的是「这个人的歌」。
@@ -11568,7 +12124,10 @@ async function searchMusicAll(query, page) {
     /* ⚠️ 用 catForFill 而不是 appleCat：Apple 没有目录时（李志那种全线下架），
        要退到 YTM 目录来打分，否则冒名的 B 站搬运会一直顶在最前面。
        仍然只影响排序，不删条目。 */
-    it._apc = appleCatScore(it, catForFill); // ← 歌手目录白名单
+    /* ⚠️ MB 目录叠在 Apple/YTM 之上，但**只加分不罚** ——
+       它缺歌比 Apple 少（赵薇的敏感曲目 MB 也没有），
+       罚分会把平台上真有的歌一起打下去。 */
+    it._apc = appleCatScore(it, catForFill) + mbCatScore(it, mbCat); // ← 歌手目录白名单
     it._order = order++;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(it);
@@ -12609,7 +13168,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.20",
+  version: "4.10.21",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
