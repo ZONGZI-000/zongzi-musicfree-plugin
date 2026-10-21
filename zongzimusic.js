@@ -1335,6 +1335,30 @@ const NO_MATCH_EXTRA = 700;
  * 注意只影响排序打分，不改变发出去的查询词。
  * ============================================================ */
 let _t2sMap = null;
+/* 繁简之外还要处理的**异体字**。
+ * ⚠️ 这不是「繁→简」，是「同一个人的两种写法」——
+ *    实测（2026-10-21）搜「叶倩文」：QQ/酷我给的都是「叶蒨文」，
+ *    蒨 在繁简表里没有对应字（它本来就是简体里也合法的异体），
+ *    于是 singerNorm 之后一个「叶倩文」一个「叶蒨文」，永远对不上：
+ *    歌手条目指向 QQ 那个 0 首的号，MusicBrainz 也查不到人（它写「葉蒨文」）。
+ *    换成「叶蒨文」搜就一切正常，19 张 201 首。
+ *    同类还有：峯/峰、恒/恆、姗/姍、修/脩、赞/讚、滨/濱、茜/蒨。
+ * 这里只做「归一化到一个写法」，方向统一取更常见的那一侧。 */
+/* ⚠️ 表里只放「确实是同一个字的两种写法」，别塞近音字：
+   茜 / 珊 / 燊 都是**独立的姓名用字**（张茜、林珊、何燊），
+   把它们并到倩/姗/燊上会认错人，这正是之前「赵薇 vs 赵薇薇」那类误伤的翻版。 */
+const VARIANT_CHARS = {
+  "蒨": "倩",   // 叶蒨文 = 叶倩文
+  "峯": "峰",   // 林峯 = 林峰
+  "恆": "恒",
+  "姍": "姗",
+  "脩": "修",
+  "讚": "赞",
+  "濱": "滨",
+  "喆": "哲",   // 陶喆 的 喆 是 哲 的异体（只在比对时归一，不改发出去的词）
+  "啟": "启",
+};
+
 function t2sMap() {
   if (_t2sMap) return _t2sMap;
   const m = {};
@@ -1344,6 +1368,10 @@ function t2sMap() {
     // T2S_PAIRS 是「繁:简」，方向就是我们要的，直接建表
     if (p.length === 2 && p[0] && p[1] && !m[p[0]]) m[p[0]] = p[1];
   }
+  /* ⚠️ 异体字必须**覆盖**繁简表的结果（后写），不能只补空缺：
+     蒨 在繁简表里可能被映射成别的字，覆盖才能保证统一到「倩」。 */
+  const vk = Object.keys(VARIANT_CHARS);
+  for (let i = 0; i < vk.length; i++) m[vk[i]] = VARIANT_CHARS[vk[i]];
   _t2sMap = m;
   return m;
 }
@@ -6864,6 +6892,13 @@ async function searchArtist(query, page) {
        酷我/咪咕压根没有。但李志在 YouTube Music 上有 13 张官方专辑 110 首 ATV。
      判据：条目作品数少得离谱（<10）→ 问 YTM。YTM 明显更全才接管，
      否则不动（周杰伦 1708 首永远走国内源，不会去问 YTM）。 */
+      /* ⚠️ 别让 YTM 抢走本来更全的平台条目（2026-10-21 实测「木马」）：
+         酷我「木马Muma」有 101 首，但列表里第一条是 YTM 的「木马」9 首，
+         于是网易云那条 9 首的野鸡条目被判「只有 9 首」→ 改用 YTM 目录 →
+         用户点进去看到 9 首《旧城之王 (Live)》，以为乐队只有现场版。
+         判据改成「YTM 要明显更全（1.5 倍以上）才接管」，
+         而且接管后**别把 platform 改成 YouTube** —— 酷我那 101 首还在 _alts 里，
+         标成 YouTube 会让它看起来只有一个源。 */
   const ytmTargets = deduped.filter((x) => Number(x.worksNum) < 10).slice(0, 2);
   if (ytmTargets.length) {
     await Promise.all(ytmTargets.map(async (x) => {
@@ -6871,6 +6906,25 @@ async function searchArtist(query, page) {
         const cat = await ytmArtistCatalog(x.name);
         if (!cat || !cat.tracks || !cat.tracks.length) return;
         if (cat.tracks.length <= Number(x.worksNum || 0)) return;
+        /* ⚠️ 比较基准不能只看这一条自己的 worksNum ——
+           同一个乐队在各平台的名字常写成「木马 / 木马Muma / muma木马」，
+           分开成三条，而第一条（YTM 那条）写着 4 首。
+           实测「木马」：第一条 4 首 → YTM 9 首「明显更全」→ 接管，
+           可酷我「木马Muma」明明有 101 首，用户只看到 9 首 Live。
+           所以基准取「自己 + 名字相近的兄弟条目」里最大的那个。 */
+        let base = Number(x.worksNum || 0);
+        const selfN = singerNorm(x.name || "");
+        for (let i = 0; i < deduped.length; i++) {
+          const s = deduped[i];
+          if (!s || s === x) continue;
+          const sn = singerNorm(s.name || "");
+          if (!sn || !selfN) continue;
+          if (sn !== selfN && !oneNameEq(s.name, selfN) && !oneNameEq(x.name, sn)) continue;
+          if (Number(s.worksNum || 0) > base) base = Number(s.worksNum || 0);
+        }
+        /* 「明显更全」才接管（1.5 倍），否则留在原平台（能直取音源）。 */
+        if (cat.tracks.length <= base) return;
+        if (cat.tracks.length < base * 1.5 && base >= 5) return;
         console.log("[粽子] 「" + x.name + "」平台条目只有 " + Number(x.worksNum || 0)
           + " 首，改用 YouTube Music 目录 " + cat.albums.length + " 张 / " + cat.tracks.length + " 首");
         x._ytmCh = cat.id;
@@ -6895,6 +6949,140 @@ async function searchArtist(query, page) {
         if (cat && cat.tracks.length > Number(x.worksNum)) x.worksNum = cat.tracks.length;
       } catch (e) { /* 忽略 */ }
     }));
+  }
+
+  /* ---- 空壳号指向真身（八仙饭店 1 首 → 八仙 8Immortals 22 首）----
+     ⚠️ 别名那条路不可靠：aliasCandidates 要联网反查，实测同一个词
+        有时给「八仙 8Immortals」有时只给原名，于是补条目时灵时不灵。
+     换一个**完全本地**的判据：同一次搜索的两条结果，名字共享 ≥2 个汉字前缀，
+     且一条几乎没作品（≤3 首）、另一条有货（≥5 首）——
+     这种组合实际就是「空壳号 + 真身」（网易云/QQ 各建了一条）。
+     ⚠️ 只改数字 + 登记 id，**不删条目**：万一那 2 首是真的，
+        合并过去用户照样能看到（_alts 会把两边的曲目并起来）。 */
+  const shellTargets = deduped.filter((x) => Number(x.worksNum || 0) <= 3).slice(0, 3);
+  if (shellTargets.length) {
+    await Promise.all(shellTargets.map(async (x) => {
+      const xn = normTextZ(x.name || "");
+      if (xn.length < 2) return;
+      let twin = null;
+      for (let i = 0; i < deduped.length; i++) {
+        const y = deduped[i];
+        if (!y || y === x) continue;
+        if (Number(y.worksNum || 0) < 5) continue;
+        const yn = normTextZ(y.name || "");
+        if (yn.length < 2) continue;
+        let shared = 0;
+        while (shared < xn.length && shared < yn.length && xn[shared] === yn[shared]) shared++;
+        /* 前缀要 ≥2 个**汉字**（数字/拉丁不算，否则「8」开头的会乱撞） */
+        let cjk = 0;
+        for (let k = 0; k < shared; k++) if (/[\u4e00-\u9fff]/.test(xn[k])) cjk++;
+        if (cjk < 2) continue;
+        if (!twin || Number(y.worksNum) > Number(twin.worksNum)) twin = y;
+      }
+      if (!twin) return;
+      console.log("[粽子] 「" + x.name + "」只有 " + Number(x.worksNum || 0)
+        + " 首，同批里的「" + twin.name + "」有 " + twin.worksNum + " 首 → 合并取源");
+      x.worksNum = Number(twin.worksNum);
+      if (!x._alts) x._alts = [{ id: x.id, platform: x.platform, provider: x._provider }];
+      const ta = twin._alts && twin._alts.length
+        ? twin._alts
+        : [{ id: twin.id, platform: twin.platform, provider: twin._provider }];
+      for (let i = 0; i < ta.length; i++) {
+        let dup3 = false;
+        for (let j = 0; j < x._alts.length; j++) if (x._alts[j].id === ta[i].id) { dup3 = true; break; }
+        if (!dup3) x._alts.push(ta[i]);
+      }
+    }));
+  }
+
+  const aliasTargets = deduped.filter((x) => Number(x.worksNum) < 10 && !x._ytmCh).slice(0, 2);
+  if (aliasTargets.length) {
+    try {
+      const ap = await aliasCandidates(query).catch(() => null);
+      const names = (ap && ap.names) || [];
+      const siblings = names.filter((n) => n && singerNorm(n) !== singerNorm(query));
+      /* ⚠️ 别名那条可能根本没出现在这次的条目里 —— 实测「八仙饭店」：
+         别名解析给出「八仙 8Immortals」，但各平台歌手搜索只回了「八仙饭店」
+         这一条（那个带着 22 首的网易云条目这次没搜出来）。
+         所以别名查不到兄弟条目时，得**自己拿别名再搜一次歌手列表**。 */
+      if (siblings.length && !deduped.some((y) =>
+        siblings.some((n) => singerNorm(n) === singerNorm(y.name)))) {
+        try {
+          /* 三家一起问。⚠️ 不能只问酷我/酷狗 ——
+             实测「八仙 8Immortals」这个写法**只有网易云有**，
+             酷我/酷狗搜它一条都不回，于是补了个寂寞，
+             下一轮搜索又退回到「八仙饭店 | 1 首」那条野鸡号。
+             （网易云那次搜索本身是间歇性的：它偶尔返回 405「操作频繁」，
+               所以同一首歌有时候第一条是 1 首、有时候是 22 首。） */
+          const [kwA, kgA, neA] = await Promise.all([
+            kuwoSearchTyped(siblings[0], "artist", 1, 10).catch(() => ({ total: 0, list: [] })),
+            kugouSearchSinger(siblings[0], 1, 10).catch(() => []),
+            neteaseSearchArtist(siblings[0], 1, 10).catch(() => []),
+          ]);
+          const extra = [];
+          for (let i = 0; i < (kwA.list || []).length; i++) {
+            const a2 = kwA.list[i];
+            if (!a2 || !a2.name || !a2.id) continue;
+            if (!siblings.some((n) => singerNorm(n) === singerNorm(a2.name))) continue;
+            extra.push({
+              id: String(a2.id), platform: "酷我", name: a2.name,
+              avatar: a2.pic || "", worksNum: Number(a2.musiccnt || 0),
+              _provider: "kuwo",
+            });
+          }
+          for (let i = 0; i < (kgA || []).length; i++) {
+            const a2 = kgA[i];
+            if (!a2 || !a2.name) continue;
+            if (!siblings.some((n) => singerNorm(n) === singerNorm(a2.name))) continue;
+            extra.push({
+              id: "kgs:" + a2.id, platform: "酷狗", name: a2.name,
+              avatar: a2.avatar || "", worksNum: 0, _provider: "kugou",
+            });
+          }
+          for (let i = 0; i < (neA || []).length; i++) {
+            const a2 = neA[i];
+            if (!a2 || !a2.name || !a2.id) continue;
+            if (!siblings.some((n) => singerNorm(n) === singerNorm(a2.name))) continue;
+            extra.push({
+              id: "neart:" + a2.id, platform: "网易云", name: a2.name,
+              avatar: a2.avatar || "", worksNum: Number(a2.worksNum || 0),
+              albumNum: Number(a2.albumNum || 0), _provider: "netease",
+            });
+          }
+          if (extra.length) {
+            for (let i = 0; i < extra.length; i++) deduped.push(extra[i]);
+            console.log("[粽子] 别名「" + siblings[0] + "」补回 " + extra.length + " 条歌手条目");
+          }
+        } catch (e) { /* 补不到就算了 */ }
+      }
+      if (siblings.length) {
+        await Promise.all(aliasTargets.map(async (x) => {
+          let best = Number(x.worksNum || 0);
+          for (let i = 0; i < siblings.length; i++) {
+            try {
+              const sib = deduped.filter((y) => singerNorm(y.name) === singerNorm(siblings[i]))[0];
+              if (sib && Number(sib.worksNum) > best) best = Number(sib.worksNum);
+            } catch (e) { /* 忽略 */ }
+          }
+          if (best > Number(x.worksNum || 0)) {
+            console.log("[粽子] 「" + x.name + "」同名号只有 " + Number(x.worksNum || 0)
+              + " 首 → 按别名「" + siblings[0] + "」记 " + best + " 首");
+            x.worksNum = best;
+          }
+          /* ⚠️ 光改数字没用 —— 数字说 22 首，点进去还是 2 首，更难受。
+             把别名那条更全的 id 登记进 _alts，歌手页会两边一起取再合并
+             （_alts 那套本来就是给跨平台版权分流用的，这里正好复用）。 */
+          for (let i = 0; i < siblings.length; i++) {
+            const sib = deduped.filter((y) => singerNorm(y.name) === singerNorm(siblings[i]))[0];
+            if (!sib || sib.id === x.id) continue;
+            if (!x._alts) x._alts = [{ id: x.id, platform: x.platform, provider: x._provider }];
+            let dup2 = false;
+            for (let j = 0; j < x._alts.length; j++) if (x._alts[j].id === sib.id) { dup2 = true; break; }
+            if (!dup2) x._alts.push({ id: sib.id, platform: sib.platform, provider: sib._provider });
+          }
+        }));
+      }
+    } catch (e) { /* 别名解析失败就算了 */ }
   }
 
   return { isEnd: deduped.length < KUWO_PAGE_SIZE, data: deduped };
@@ -10647,8 +10835,45 @@ async function getArtistWorksOf(artistItem, page, type) {
        ⚠️ 只按频道名搜一次是拿不全的 —— 实测「IGU Band」的 Topic 频道
           实际有 31 首，按频道名搜只回 5~6 条（其余都排在别的视频后面）。
           Apple 目录能给出整套 3 张专辑 31 首的歌名，照歌名逐首搜
-          「歌名 + 频道名」，实测 9/9 全部命中 Topic 官方频道，耗时 <1s。 */
-    const cat = await appleArtistCatalog(chName);
+          「歌名 + 频道名」，实测 9/9 全部命中 Topic 官方频道，耗时 <1s。
+
+       ⚠️ Apple 目录太薄时改用 YTM 目录（2026-10-21 实测「宇多田ヒカル」）：
+          Apple 只给 19 首，YTM 有 73 张 109 首 —— 而且两边都是「歌名 → YouTube
+          搜官方音源」的同一条路子，YTM 的曲目表本来就从 YouTube 上抓的，
+          命中率只会更高。这条要花 15 秒左右，但那种目录量级的歌手本来就这样。 */
+    let cat = await appleArtistCatalog(chName);
+    if (!cat || cat.tracks.length < 30) {
+      try {
+        const ycat = await Promise.race([
+          ytmArtistCatalog(chName).catch(function () { return null; }),
+          new Promise(function (res) { setTimeout(function () { res(null); }, 9000); }),
+        ]);
+        if (ycat && ycat.tracks.length > (!cat ? 0 : cat.tracks.length)) {
+          console.log("[粽子] Apple 目录「" + chName + "」"
+            + (!cat ? "无" : cat.tracks.length + " 首") + " → 改用 YouTube Music "
+            + ycat.albums.length + " 张 / " + ycat.tracks.length + " 首");
+          /* 转成 appleArtistCatalog 的结构，后面那段逐首搜音源的代码不用改。 */
+          cat = {
+            id: ycat.id,
+            name: ycat.name,
+            tracks: ycat.tracks.map(function (t) {
+              return {
+                title: t.title,
+                album: t.album || "",
+                dur: Number(t.duration || 0),
+              };
+            }),
+            albums: ycat.albums.map(function (a) {
+              return {
+                title: a.title, artist: a.artist, artwork: a.artwork || "",
+                date: a.date || "", worksNum: a.worksNum || 0,
+              };
+            }),
+            _src: "ytm",
+          };
+        }
+      } catch (e) { /* YTM 拿不到就继续用 Apple 那份 */ }
+    }
     if (cat && cat.tracks && cat.tracks.length) {
       const CONC = 8;   // YouTube 这边并发开大会被限流
       for (let i = 0; i < cat.tracks.length; i += CONC) {
@@ -10774,6 +10999,9 @@ async function getArtistWorksOf(artistItem, page, type) {
 
   const appleRich = !!(appleCat && appleCat.id &&
     (appleCat.tracks.length >= 10 || appleCat.albums.length >= 2));
+  /* ⚠️ 判据不能只看「<10 条」——顺手放宽到 15 条没有意义，
+     真正的病根在下面 YTM 接管那一段（木马被 YTM 的 9 首 Live 抢走，
+     而酷我那边其实有 101 首）。这里保持原样。 */
   const platformPoor = !kgTry || kgTry.data.length < 10;
   if (appleRich && platformPoor) {
     console.log("[粽子] 酷狗目录不全（" + (kgTry ? kgTry.data.length : 0)
@@ -13249,7 +13477,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.22",
+  version: "4.10.23",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
