@@ -1,7 +1,11 @@
-no exact hit; first 6:
-  趙薇 - 不要告别 | 958md | YouTube | BwP-nfhrJ2k | art=https://i.ytimg.com/vi_webp/BwP-nfhrJ2k/sddefault.webp
-  趙薇 - 不要告别 | 姜令宜 | YouTube | eJjHJ3bPV60 | art=https://i.ytimg.com/vi/eJjHJ3bPV60/sddefault.jpg
-  趙薇 Zhao Wei 【不要告別】 | Elber Zhan | YouTube | U4cWpNHII3Y | art=https://i.ytimg.com/vi/U4cWpNHII3Y/sddefault.jpg?sqp=-oaymwEmCIAFEOAD8quKqQMa8AEB-AH-CYAC0
-  趙薇 Vicki Zhao《不要告別 No Farewell》HQ 高音質 | CJM Chin | YouTube | EJhj-VlhJmY | art=https://i.ytimg.com/vi/EJhj-VlhJmY/sddefault.jpg?sqp=-oaymwEmCIAFEOAD8quKqQMa8AEB-AHOBYAC0
-  赵薇 趙薇，Zhao Wei ，Vicki Zhao Wei《双》十七周年歌曲展播——《不要告别》 | Hongyu Li | YouTube | MR51ut3e_zM | art=https://i.ytimg.com/vi/MR51ut3e_zM/sddefault.jpg?sqp=-oaymwEmCIAFEOAD8quKqQMa8AEB-AHKAoAC0
-  不要告别 | 沈星燃 | 酷我 | MUSIC_576583214 | art=https://cdn.jsdelivr.net/gh/ZONGZI-000/zongzi-musicfree-plugin@master/covers/fb-01.jpg
+ALBUM_ART: (无)
+舊玩具 | Apple Music | vid=apt:1824423829:0 | art=https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/b7/8e/94/b78e9430-ff3d-24f6-3f14-829374c8fceb/4711140371535.jpg/600x600bb.jpg
+天使旅行箱 | Apple Music | vid=apt:1824423829:1 | art=https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/b7/8e/94/b78e9430-ff3d-24f6-3f14-829374c8fceb/4711140371535.jpg/600x600bb.jpg
+Morning Love | Apple Music | vid=apt:1824423829:2 | art=https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/b7/8e/94/b78e9430-ff3d-24f6-3f14-829374c8fceb/4711140371535.jpg/600x600bb.jpg
+多愛自己一些 | Apple Music | vid=apt:1824423829:3 | art=https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/b7/8e/94/b78e9430-ff3d-24f6-3f14-829374c8fceb/4711140371535.jpg/600x600bb.jpg
+恰恰愛 | Apple Music | vid=apt:1824423829:4 | art=https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/b7/8e/94/b78e9430-ff3d-24f6-3f14-829374c8fceb/4711140371535.jpg/600x600bb.jpg
+蝶 | Apple Music | vid=apt:1824423829:5 | art=https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/b7/8e/94/b78e9430-ff3d-24f6-3f14-829374c8fceb/4711140371535.jpg/600x600bb.jpg
+小蜜蜂 | Apple Music | vid=apt:1824423829:6 | art=https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/b7/8e/94/b78e9430-ff3d-24f6-3f14-829374c8fceb/4711140371535.jpg/600x600bb.jpg
+樹葉的崇拜 | Apple Music | vid=apt:1824423829:7 | art=https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/b7/8e/94/b78e9430-ff3d-24f6-3f14-829374c8fceb/4711140371535.jpg/600x600bb.jpg
+不怕 | Apple Music | vid=apt:1824423829:8 | art=https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/b7/8e/94/b78e9430-ff3d-24f6-3f14-829374c8fceb/4711140371535.jpg/600x600bb.jpg
+大城小戀 | Apple Music | vid=apt:1824423829:9 | art=https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/b7/8e/94/b78e9430-ff3d-24f6-3f14-829374c8fceb/4711140371535.jpg/600x600bb.jpg

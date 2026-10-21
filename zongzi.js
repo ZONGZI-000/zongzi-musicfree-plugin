@@ -3929,6 +3929,10 @@ async function mbFindArtist(name) {
  * 歌手名 → 完整作品表，结构跟 appleArtistCatalog / ytmArtistCatalog 对齐，
  * 这样 appleCatScore 那套打分和 mergeAppleAlbums 那套骨架合并能直接复用。
  */
+/* Cover Art Archive 的 release-group 正面图直链。
+   只有 MusicBrainz 标了 front=true 才拼，否则 404 会变成灰块。 */
+const CAA_RG = "https://coverartarchive.org/release-group/";
+
 async function mbArtistCatalog(name) {
   const q = String(name || "").trim();
   if (!q) return null;
@@ -3978,6 +3982,13 @@ async function mbArtistCatalog(name) {
            29 首、十八種香港伊館站 28 首…），全被甩到专辑页最前面。
            赵薇那张《左耳》是 primary: Single、secondary 空，照收。 */
         const secTypes = (rg["secondary-types"] || []).map(function (x) { return String(x); });
+        /* Cover Art Archive 有没有正面图，MusicBrainz 在 release 上直接给了
+           cover-art-archive.front —— 不用逐张去 CAA 查（那是每张一个请求，
+           赵薇 9 张就是 9 次，还多半撞 404）。有就拼 front-500 直链。 */
+        const caa = r["cover-art-archive"] || {};
+        const caaArt = (caa.front && Number(caa.count) > 0)
+          ? (CAA_RG + gid + "/front-500")
+          : "";
         const prev = byGroup[gid];
         if (!prev) {
           byGroup[gid] = {
@@ -3986,12 +3997,14 @@ async function mbArtistCatalog(name) {
             date: rg["first-release-date"] || r.date || "",
             type: rg["primary-type"] || "",
             sec: secTypes,
+            artwork: caaArt,
             tracks: tr,
           };
           groupOrder.push(gid);
         } else if (tr.length > prev.tracks.length) {
           prev.tracks = tr;
           if (!prev.date) prev.date = rg["first-release-date"] || r.date || "";
+          if (!prev.artwork && caaArt) prev.artwork = caaArt;
         }
       }
 
@@ -4019,7 +4032,7 @@ async function mbArtistCatalog(name) {
           platform: "MusicBrainz",
           title: g.title,
           artist: art.name,
-          artwork: "",
+          artwork: g.artwork || "",
           date: g.date || "",
           description: "MusicBrainz 目录" + (type ? (" · " + type) : ""),
           worksNum: g.tracks.length,
@@ -4137,7 +4150,9 @@ function mergeMbAlbums(cat, list) {
       platform: "MusicBrainz",
       title: a.title,
       artist: a.artist || cat.name,
-      artwork: "",
+      /* ⚠️ 这里以前写死空串，MB 目录补进来的每张专辑都掉进兜底占位图。
+         cat.albums 已带 CAA front-500 直链（见 mbArtistCatalog），有就用。 */
+      artwork: a.artwork || "",
       date: a.date || "",
       description: "MusicBrainz 目录（该平台暂无音源）",
       worksNum: a.worksNum || 0,
@@ -13618,7 +13633,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.27",
+  version: "4.10.28",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
