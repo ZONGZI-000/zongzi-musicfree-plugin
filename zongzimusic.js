@@ -9957,14 +9957,26 @@ function fbArt(item) {
  *    白等一轮。这些域名 https 全部可用（实测 200），升级零风险。
  * ⚠️ 纯字符串改写，不发请求、不解析，零成本。
  * ============================================================ */
+/* 曲目行（歌曲/榜单详情里的一行一条）用 TRACK_THUMB_PX，其余（歌单卡、
+   专辑卡、榜单分类卡这些需要认图的）用 THUMB_PX。 */
 const THUMB_PX = 300;
+/* ⚠️ 曲目行缩到 150（2026-10-21）。MusicFree 列表左侧那张图物理尺寸是
+   rpx(80)：750 设计宽度下屏幕最短边 360dp 时 ≈ 38dp ≈ 115px（3x 屏）。
+   以前一律给 300px，等于每张多下 2.4 倍像素 —— 实测热歌榜 200 首去重后
+   195 张封面，300px 合计 10.5MB、150px 只有 2.9MB。
+   用户 57KB/s：10.5MB 是 188 秒，2.9MB 是 52 秒。列表「能点但很钝」
+   就是这 188 秒在抢连接池。
+   150px 在 3x 屏上按 115px 显示，仍有余量，肉眼无差别。 */
+const TRACK_THUMB_PX = 150;
+/* 歌单卡/专辑卡在首页是 rpx(210) 宽（≈ 300px@3x），保持 300 不动。 */
 
 const THUMB_HOSTS = [
   "music.126.net", "hdslb.com", "y.gtimg.cn", "qpic.cn",
   "qpic.y.qq.com", "imge.kugou.com", "musicapp.migu.cn",
 ];
 
-function thumbArt(url) {
+function thumbArt(url, px) {
+  const THUMB_PX = Number(px) > 0 ? Number(px) : 300;
   let u = String(url || "");
   if (!u || u.indexOf("data:") === 0) return u;
   try {
@@ -10015,8 +10027,15 @@ function deepFillArt(o, depth) {
     !o.musicList && !o.sheetItem && !o.data;
   if (isCard) {
     const art = String(o.artwork || "").trim();
+    /* 曲目行进小图；歌单卡 / 专辑卡 / 榜单分类卡保持 300。
+       ⚠️ 判据不能用 artist —— 歌单卡也有 artist（歌单作者昵称）、
+          榜单分类卡也有（「更新18首」），实测全被误判成曲目行。
+          真正的区别在 worksNum：歌单卡和专辑卡都有「收录多少首」，
+          曲目行没有；曲目行才有 duration / album。 */
+    const isTrackRow = !o.worksNum && (o.duration !== undefined || !!o.album);
+    const px = isTrackRow ? TRACK_THUMB_PX : THUMB_PX;
     if (!art) o.artwork = fbArt(o);
-    else o.artwork = thumbArt(art);
+    else o.artwork = thumbArt(art, px);
   }
   const kids = ["data", "musicList", "tracks", "list", "sheetItem"];
   for (const k of kids) if (o[k]) deepFillArt(o[k], depth + 1);
@@ -16336,7 +16355,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.51",
+  version: "4.10.52",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
