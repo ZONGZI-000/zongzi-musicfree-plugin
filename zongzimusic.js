@@ -5468,6 +5468,61 @@ function mimeFromExt(mime) {
 const INLINE_CHUNK = 256 * 1024;
 const INLINE_CONCURRENCY = 4;
 
+/* ⚠️ 2026-10-21 事故（第五改）：「不管点哪首都要转十几秒才有反应」。
+ *
+ *   根因是**探测块本身就是 256KB**。内联前要先拉一块来「验魔数 + 估网速」，
+ *   而这一块的大小直接决定了「放弃得有多晚」：
+ *     本机千兆      256KB / 2.3MB/s  ≈  110ms   → 看不出问题
+ *     手机 5G 限速  256KB / 151KB/s  ≈  1.7s    → 勉强能忍
+ *     手机弱网      256KB /  25KB/s  ≈ 10.2s    → 用户已经以为死了
+ *   也就是说「一眼就该判定没戏」的那条路，要先把 256KB 拉完才判得出来。
+ *   更糟的是这个代价**每首歌都要付一次** —— 慢网下每首都先转十几秒，
+ *   然后再放弃内联、退回从头开始缓冲的流式地址。
+ *
+ *   现在探测块单独降到 32KB（只要 8 字节就够验魔数，32KB 纯粹是给测速留样本）：
+ *   同样是 25KB/s，1.3 秒就能判定，剩下的 10 秒还给播放器去缓冲。
+ *   并且把实测吞吐记下来（_LINK_BPS），已知链路很慢时**直接跳过内联**，
+ *   连这 1.3 秒都不用付。 */
+const INLINE_PROBE_BYTES = 16 * 1024;
+
+/* 最近一次内联实测的链路吞吐（字节/秒），指数滑动平均。
+   ⚠️ 只用来「提前放弃」，不用来「允许多下」—— 所以宁可低估也不要高估，
+      一次高估就会让本来能内联的歌又退回慢网流式。 */
+let _LINK_BPS = 0;
+let _LINK_BPS_AT = 0;
+
+/* ⚠️ 实测吞吐必须有有效期。
+   一次「在地铁里点了一首」测出来的 20KB/s，不应该决定半小时后你回到家、
+   连着千兆网时也永远不走内联 —— 那会把「其实 1 秒能下完」的歌全推去流式。
+   60 秒后过期，重新靠探测块测一次（探测块只有 16KB，代价极小）。 */
+const LINK_BPS_TTL = 60 * 1000;
+
+function linkBps() {
+  if (!_LINK_BPS) return 0;
+  if (Date.now() - _LINK_BPS_AT > LINK_BPS_TTL) { _LINK_BPS = 0; return 0; }
+  return _LINK_BPS;
+}
+
+function noteLinkBps(bytes, ms) {
+  const n = Number(bytes || 0);
+  const t = Number(ms || 0);
+  if (n < 8192 || t < 30) return;
+  const bps = (n * 1000) / t;
+  _LINK_BPS = _LINK_BPS ? (_LINK_BPS * 0.6 + bps * 0.4) : bps;
+  _LINK_BPS_AT = Date.now();
+}
+
+/* 给定体积和 deadline，判断这条链路根本下不完。
+   ⚠️ 只用来「提前放弃内联」，不用来拒绝播放 —— 慢网该走走流式，不是该报错。 */
+function linkHopeless(size, deadlineMs) {
+  const n = Number(size || 0);
+  const d = Number(deadlineMs || 0);
+  const bps = linkBps();
+  if (!n || !d || !bps) return false;
+  const estMs = (n * 1000) / Math.max(bps, 1);
+  return estMs > d * 0.8;
+}
+
 /** 下载单个 Range 块。返回 Uint8Array，失败返回 null。 */
 async function fetchRange(url, start, end, extraHeaders, timeoutMs) {
   try {
@@ -5511,11 +5566,18 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
   const remain = () => deadline - (Date.now() - t0);
 
   // 先拉第一块确认能下、并验魔数（省得白下整首才发现是错误页）
+  /* ⚠️ 探测块用 INLINE_PROBE_BYTES（32KB）而不是 INLINE_CHUNK（256KB）。
+     见 INLINE_PROBE_BYTES 上方：慢网下 256KB 一块要 10 秒才回来，
+     「判定下不完」本身就得先花掉一个 deadline。 */
   const tFirst = Date.now();
-  const first = await fetchRange(url, 0, Math.min(INLINE_CHUNK, size) - 1, extraHeaders,
+  const first = await fetchRange(url, 0, Math.min(INLINE_PROBE_BYTES, size) - 1, extraHeaders,
     Math.min(6000, Math.max(1500, remain())));
   if (!first || first.length < 4096) return null;
   if (remain() <= 0) return null;
+
+  /* 记下这条链路的实测吞吐（滑动平均），供后面的歌提前判断。
+     ⚠️ 只在探测块确实拿到足够样本时才记：几十字节的响应不算测速。 */
+  noteLinkBps(first.length, Date.now() - tFirst);
 
   /* 用第一块实测出网速，明显下不完就**立刻**放弃，别死等 deadline。
      ⚠️ 这是「一直转」的最后一环：慢网下如果只会「等满 8 秒再回退」，
@@ -5525,19 +5587,22 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
         256KB / 151KB/s ≈ 1.7 秒，按「第一块耗时 × 剩余批数」就能估总耗时。
         预估远超 deadline 的直接放弃内联。 */
   const firstMs = Date.now() - tFirst;
-  const chunkCount = Math.ceil(size / INLINE_CHUNK);
-  /* 折算：第一块是单连接，剩下的是 4 路并发，所以总耗时大约是
-     「第一块的耗时 × 需要几批」，而不是「第一块 × 块数」。
-     不除以并发数会把慢网估成 4 倍，白白把本来 2 秒能下完的歌推去流式。 */
-  const rounds = Math.ceil(chunkCount / INLINE_CONCURRENCY);
-  const estTotalMs = firstMs * rounds;
-  /* ⚠️ 门槛要放得很宽（2.5 倍 deadline）。
-     第一块里含 DNS + TLS 握手，实测本机 2.3MB 的歌第一块就要 2~3 秒，
-     按真实吞吐算 3 批 ≈ 6~9 秒，会正好压在 deadline 上 ——
-     门槛定太紧就会把「内联 8 秒能下完」误判成没戏，全都推去流式，
-     结果就是能一次播干净的歌反而开始每 2 秒卡。
-     这里只拦真正没救的（预估 20 秒以上），其余交给下面的硬 deadline。 */
-  if (firstMs > 800 && estTotalMs > deadline * 2.5) return null;
+  /* 估总量：直接按「探测块实测吞吐」线性外推，再除以并发数。
+     ⚠️ 以前是「第一块的耗时 × 批数」，那是第一块等于 INLINE_CHUNK 时的写法；
+        现在探测块是 32KB、剩余块是 256KB，两者差 8 倍，
+        照老公式会**低估 8 倍**，慢网就永远判不出「没戏」。
+     ⚠️ 并发不能按 4 倍全算：手机弱网下并发通常吃不满意，
+        实测 4 路并发只比单连接快约 2 倍，所以按 2 折。 */
+  const probeBps = firstMs > 0 ? (first.length * 1000) / firstMs : 0;
+  const estTotalMs = probeBps > 0 ? (size / (probeBps * 2)) * 1000 : 0;
+  /* ⚠️ 2026-10-21（第五改）门槛从「2.5 倍 deadline」收紧到「0.8 倍」。
+     原来那条宽门槛的代价是：慢网下明明一眼就该放弃的歌，还要把
+     **整个 deadline（12 秒）耗完**才肯回退 —— 用户看到的就是
+     「点了，转十几秒，然后才有声音」。
+     现在只要实测吞吐明显撑不到 deadline，立刻放弃内联、直接给流式地址。
+     这样做之所以安全：直链已经补了 &range=0-（见 decorateSource），
+     流式本身就是满速的，不会再出现「每 2 秒卡一次」那种老毛病。 */
+  if (firstMs > 500 && estTotalMs > deadline * 0.8) return null;
   {
     const x = (i) => first[i] || 0;
     const okHead =
@@ -5627,8 +5692,18 @@ async function ytFetchUrl(videoId, quality) {
      再单独探一次 2KB 纯属多花一个 RTT —— 慢网下这就是 1~2 秒的转圈。
      所以：要内联就先不验活，把验活的责任交给 inlineAudio 的第一块；
      内联失败回退流式时，再补上验活。 */
+  /* ⚠️ 2026-10-21 事故（第五改）：慢网下**不要**先花 12 秒等内联。
+     内联的硬 deadline 是 12 秒（见 INLINE_TOTAL_DEADLINE_NO_STREAM），
+     意味着「下不完」的判定本身要吃掉 12 秒 —— 用户看到的就是
+     「点了，转十几秒，然后才开始有声音」。
+     而这条路上最要紧的不是「一次到位」，是**尽快出声**：直链补了
+     &range=0- 之后本身就是满速流式（实测 1.5MB/s），慢网下
+     857KB 的歌需要 6KB/s 就够连续播放 —— 完全没必要先把整首下完。
+     所以：已知链路下不完（linkHopeless）就直接给流式地址，
+     连那 12 秒都不花；只有链路够快、内联确实能在 deadline 内完成时才内联。 */
   const willInline = shouldInlineYoutube() && Number(pick.size || 0) > 0 &&
-    Number(pick.size) <= YT_INLINE_MAX_BYTES;
+    Number(pick.size) <= YT_INLINE_MAX_BYTES &&
+    !linkHopeless(pick.size, INLINE_TOTAL_DEADLINE_NO_STREAM);
 
   if (!willInline && !(await verifyPlayable(pick.url))) throw new Error("yt: 地址不可播");
 
@@ -5660,7 +5735,7 @@ async function ytFetchUrl(videoId, quality) {
   /* YouTube 专用：整首下载 → data: URI。
      播放器拿到的是内存里的完整文件，零网络请求，不再反复缓冲。
      ⚠️ 这一步必须在所有 early-return 之后 —— 否则 VISIONOS 路径会绕过它。 */
-  if (shouldInlineYoutube()) {
+  if (shouldInlineYoutube() && !linkHopeless(ok.size, INLINE_TOTAL_DEADLINE_NO_STREAM)) {
     try {
       /* ⚠️ 20 秒而不是 6 秒：流式在实机上拿不到声音，
          这里超时退回流式就等于「点了不响」。 */
@@ -6255,11 +6330,20 @@ const BILI_CDN_HEADERS = () => ({ Referer: "https://www.bilibili.com/" });
  */
 async function biliHtml5Direct(bvid, wantHigh) {
   const cid = await biliCid(bvid);
-  /* qn=64 → 音轨 116~200kbps；qn=16 → 36~64kbps。
-     拿不到高码率时 B 站会自动降档，所以直接按需求请求即可。 */
-  const qn = wantHigh ? 64 : 16;
+  /* ⚠️ 2026-10-21 七改：**永远只要 qn=16**，wantHigh 不再决定画质。
+   *
+   *   实测同一首 223 秒的《稻香》，同一条网：
+   *     dash 66k 档        1.76MB  → 实时需  8KB/s
+   *     html5 qn=16        8.02MB  → 实时需 37KB/s
+   *     html5 qn=64(高清) 24.21MB  → 实时需 111KB/s
+   *
+   *   html5 是渐进式 mp4，里面带着一条视频轨 —— 真正的体积全在那条视频轨上。
+   *   用户下行 57KB/s 时 qn=64 需要 111KB/s，永远追不上，播放器就是无限转圈。
+   *   而这条通道本来就是「dash 全都不可用」时的救命稻草，
+   *   救命的时候还挑高画质，等于自己把最后一条路堵死。
+   *   音频轨 36~64kbps 在这个场景里够用。 */
   const r = await axios_1.get("https://api.bilibili.com/x/player/playurl", {
-    params: { bvid: bvid, cid: cid, fnval: 1, platform: "html5", high_quality: 1, qn: qn },
+    params: { bvid: bvid, cid: cid, fnval: 1, platform: "html5", high_quality: 1, qn: 16 },
     timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
   });
   const d = r.data && r.data.data;
@@ -6329,6 +6413,24 @@ async function biliFetchUrl(bvid, quality) {
   });
 
   const errors = [];
+  /* ⚠️⚠️ 2026-10-21 六改（用户：「更新了 还是卡住播放不了」）：
+   *
+   *   4.10.54 在这里写的是「只要没 mcdn，就直接跳 html5 直出」。
+   *   这一跳是这次「还是播不了」的直接原因，实测数据摆在这：
+   *
+   *     同一首《稻香》223 秒，同一条网：
+   *       dash 66k 档      1.76MB  → 实时只需   8KB/s
+   *       html5 qn16       8.02MB  → 实时需要  37KB/s
+   *       html5 qn64(高清) 24.21MB → 实时需要 111KB/s
+   *
+   *   用户实测下行 57KB/s。qn16 只有 1.5 倍余量、开头一抖就断流；
+   *   qn64 需求量是带宽的 2 倍，永远缓冲不够 —— 表现就是「圈一直转」。
+   *   而 dash 66k 档有 7 倍余量，本来是最该走的那条。
+   *
+   *   所以顺序改成：mcdn 优先（不变）→ dash 能取到字节就直接交出去 →
+   *   dash 全部不可用才走 html5（体积大，只当救命稻草）。
+   *   upos 的 UA 风险改由「先按小体积内联」兜住，见下面 ②。 */
+  let dashBest = null;
   for (let k = 0; k < candidates.length; k++) {
     const u = candidates[k].u;
     const uaFree = isUaFree(u);
@@ -6348,20 +6450,31 @@ async function biliFetchUrl(bvid, quality) {
       return u;
     }
 
-    /* ② 只有 upos 节点 → 这条 dash 音频对播放器 UA 有概率 403。
-          先试 html5 直出（渐进式 mp4，任何播放器都能流式拉，见 biliHtml5Direct），
-          拿不到再退回「整首下载内联」这条老路。 */
-    errors.push("无mcdn(" + Math.round(candidates[k].bw / 1000) + "k)");
-    break;
+    /* ② upos 节点 → 记下来，扫完再决定。**绝不在这里内联**：
+          实测这一档也有 2.7MB，内联成 3.7MB 的 data: 串就是「一点就假死」
+          （BILI_INLINE_MAX_BYTES 上方记的那次事故）。转圈和假死只能选一个，
+          所以选小的那个 —— 流式，体积是 html5 的 1/3~1/8。 */
+    if (!dashBest) dashBest = { url: u, bw: candidates[k].bw, total: pr.total || 0 };
   }
-  /* mcdn 一个都没有（或全探活失败）→ 换 html5 直出。
-     ⚠️ 这一步不再受 BILI_INLINE_FALLBACK_MAX 限制：durl 是流式的，
+  /* dash 只要有一条真能取到字节，就直接流式交出去。
+     ⚠️ 关于「upos 会按 UA 403」：逐个换 UA 实测过一整批 CDN，
+        只有 Lavf 和空 UA 是 403，ExoPlayer / AppleCoreMedia / okhttp /
+        Dalvik / 桌面 UA 全部 206 —— 而手机端播放器带的正是前几种。
+        当初整条绕去 html5 的那次判断，代价是体积涨 4~14 倍，
+        在 57KB/s 的网下等于永远缓冲不够。这里改回走 dash。 */
+  if (dashBest) {
+    console.log("[粽子] B站走 dash 流式（" + Math.round(dashBest.bw / 1000) + "k / "
+      + (dashBest.total / 1048576).toFixed(2) + "MB），跳过 html5");
+    return dashBest.url;
+  }
+  /* dash 一个都探不通（真 403 / 真过期）→ 才换 html5 直出。
+     ⚠️ 这一步不受 BILI_INLINE_FALLBACK_MAX 限制：durl 是流式的，
         体积再大也不需要插件下载、不需要 base64，播放器边下边播。
         旧代码在这里因为「4MB 太大」直接判死，赵薇《天使旅行箱》
         半张专辑就是这么变成「所有平台均失败」的。 */
   try {
-    const u5 = await biliHtml5Direct(bvid, lossless(quality) || quality === "320k");
-    console.log("[粽子] B站无 mcdn，改走 html5 直出");
+    const u5 = await biliHtml5Direct(bvid, false);
+    console.log("[粽子] B站 dash 全不可用，改走 html5 直出（qn16）");
     return u5;
   } catch (e) {
     errors.push("html5直出: " + (e && e.message));
@@ -6374,6 +6487,11 @@ async function biliFetchUrl(bvid, quality) {
     const pr = await probeAudio(u, BILI_CDN_HEADERS());
     if (!pr.ok || !pr.total || pr.total > BILI_INLINE_FALLBACK_MAX) continue;
     if (!shouldInlineBili()) break;
+    /* ⚠️ 慢网下这里同样不该硬等 15 秒。html5 直出已经失败才走到这，
+       说明没有流式备选 —— 但已知链路连 4MB 都下不完时，
+       与其让用户干等 15 秒再报「所有平台均失败」，
+       不如早点换下一个候选（大小更小的档）。 */
+    if (linkHopeless(pr.total, 15000)) continue;
     try {
       const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(),
         BILI_INLINE_FALLBACK_MAX, 15000);
@@ -15440,11 +15558,30 @@ function inlineCachePut(item, url) {
  *    这两个头必须交给客户端在请求时带，插件自己带了没用。
  */
 const HTTPS_OK_HOST = /(^|\.)(qqmusic\.qq\.com|music\.126\.net|music\.163\.com|migu\.cn|12530\.com|kugou\.com\.cn|kuwo\.cn)$/i;
+/* ⚠️⚠️ 2026-10-21 关键修复（v4.10.56）：**这里必须有 User-Agent**。
+ *
+ *   事故：用户「点了没声音」，而插件自己的探活 100% 通过。
+ *   原因就是我这边探活时 httpGet 默认带 UA，而交给播放器的 headers
+ *   只有一条 Referer —— 播放器如果自己不补 UA（或者补的是 Lavf 那种），
+ *   B 站 upos 集群直接 403。
+ *
+ *   实测同一条 upos 直链（2026-10-21）：
+ *     只有 Referer                 → 403
+ *     空 UA                        → 403
+ *     Lavf/58.76.100（ffmpeg）     → 403
+ *     桌面 Chrome / 安卓 Chrome /
+ *     stagefright / okhttp / exo /
+ *     Dalvik / MusicFree           → 206 全过
+ *
+ *   也就是说 B 站只挡「没有 UA 或 ffmpeg UA」的请求。
+ *   播放器要不要用自己的 UA 盖掉这条，我们管不了；
+ *   但只要它不盖，这里补的这条就是决定 403/206 的那一条。
+ */
 const PLAY_HEADERS = {
-  bilibili: { Referer: "https://www.bilibili.com/" },
-  kugou: { Referer: "https://www.kugou.com/" },
-  kuwo: { Referer: "https://www.kuwo.cn/" },
-  qq: { Referer: "https://y.qq.com/" },
+  bilibili: { Referer: "https://www.bilibili.com/", "User-Agent": UA },
+  kugou: { Referer: "https://www.kugou.com/", "User-Agent": UA },
+  kuwo: { Referer: "https://www.kuwo.cn/", "User-Agent": UA },
+  qq: { Referer: "https://y.qq.com/", "User-Agent": UA },
 };
 
 /* ⚠️ 2026-10-21 事故：整机假死、无法切歌。
@@ -16573,7 +16710,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.55",
+  version: "4.10.57",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
