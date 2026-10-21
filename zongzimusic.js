@@ -3966,6 +3966,15 @@ async function ytmAlbumTracks(albumId, artistFallback, albumFallback) {
 const YTM_CAT_CACHE = {};
 const YTM_CAT_TTL = 60 * 60 * 1000;
 
+/* getArtistWorks 的结果缓存（2026-10-21 修「歌手列表卡死」）。
+   起因：YouTube 频道路径要**逐首**去 YouTube 搜「歌名 + 频道名」配音源，
+   宇多田ヒカル这种 86 首目录实测 17~22 秒，而 MusicFree 进歌手页
+   会把歌曲页和专辑页各调一次、每次挂载再来一遍 —— 以前零缓存，
+   等于每切一个标签就重跑 20 秒，用户看到的就是整页卡死。
+   按「频道名 + 类型」缓存 30 分钟，第二次起 0 秒。 */
+const ARTIST_WORKS_CACHE = {};
+const ARTIST_WORKS_TTL = 30 * 60 * 1000;
+
 async function ytmArtistCatalog(name) {
   const q = String(name || "").trim();
   if (!q) return null;
@@ -11828,6 +11837,20 @@ async function getArtistWorksOf(artistItem, page, type) {
     const chNorm = flatTitle(chName);
     const music = [];
     const used = {};
+
+    /* ---- 结果缓存（2026-10-21 修「歌手列表卡死」）----
+       下面这条链路是**逐首**去 YouTube 搜「歌名 + 频道名」给目录配音源，
+       YTM 目录大的歌手（宇多田ヒカル 86 首）实测要 17~22 秒。
+       而 MusicFree 进歌手页时会**至少调两次** getArtistWorks
+       （歌曲页一次、切「专辑」页再一次，每次挂载还各来一遍），
+       以前一点缓存都没有 → 每切一次标签就重跑 20 秒，
+       用户看到的就是「点进歌手页就卡死」。
+       现在按「频道名 + 类型」缓存 30 分钟，第二次起 0 秒返回。 */
+    const chKey = "ytch|" + chNorm + "|" + type;
+    const chHit = ARTIST_WORKS_CACHE[chKey];
+    if (chHit && Date.now() - chHit.at < ARTIST_WORKS_TTL) {
+      return { isEnd: true, data: chHit.data };
+    }
     const pushTrack = (x, album, dur) => {
       if (!x || !x.id || used[x.id]) return;
       used[x.id] = 1;
@@ -11864,7 +11887,12 @@ async function getArtistWorksOf(artistItem, page, type) {
           console.log("[粽子] Apple 目录「" + chName + "」"
             + (!cat ? "无" : cat.tracks.length + " 首") + " → 改用 YouTube Music "
             + ycat.albums.length + " 张 / " + ycat.tracks.length + " 首");
-          /* 转成 appleArtistCatalog 的结构，后面那段逐首搜音源的代码不用改。 */
+          /* 转成 appleArtistCatalog 的结构，后面那段逐首搜音源的代码不用改。
+             ⚠️ 必须带上 vid（2026-10-21）：YTM 的曲目表本来就从 YouTube 上抓的，
+                每条都自带 videoId，可以直接当音源 id 用。
+                以前这里只把 title/album/dur 搬过来，videoId 丢掉，
+                于是 86 首每一首又要重新搜一次 YouTube 去把它找回来
+                —— 这才是「点进歌手页卡 20 秒」的真正根因。 */
           cat = {
             id: ycat.id,
             name: ycat.name,
@@ -11873,6 +11901,8 @@ async function getArtistWorksOf(artistItem, page, type) {
                 title: t.title,
                 album: t.album || "",
                 dur: Number(t.duration || 0),
+                vid: t.id || "",
+                artwork: t.artwork || "",
               };
             }),
             albums: ycat.albums.map(function (a) {
@@ -11886,6 +11916,27 @@ async function getArtistWorksOf(artistItem, page, type) {
         }
       } catch (e) { /* YTM 拿不到就继续用 Apple 那份 */ }
     }
+    /* ---- 专辑列表：根本不需要逐首配音源（2026-10-21 修）----
+       专辑页只要「有哪些专辑」，以前这一段却放在逐首匹配之后，
+       于是切到「专辑」标签 = 把 86 首的 YouTube 匹配又跑一遍（实测 27 秒）。
+       专辑列表只依赖目录里的 albums 字段，直接返回，0 请求。 */
+    if (type === "album") {
+      const albums = ((cat && cat.albums) || []).map((a, i) => ({
+        id: "apple:" + cat.id + ":" + i,
+        platform: "Apple Music",
+        title: a.title,
+        artist: a.artist || chName,
+        artwork: a.artwork || "",
+        date: a.date || "",
+        description: "Apple Music 目录",
+        worksNum: a.worksNum || 0,
+        _provider: "apple",
+        _kind: "album",
+      }));
+      ARTIST_WORKS_CACHE[chKey] = { at: Date.now(), data: albums };
+      return { isEnd: true, data: albums };
+    }
+
     if (cat && cat.tracks && cat.tracks.length) {
       const CONC = 8;   // YouTube 这边并发开大会被限流
       for (let i = 0; i < cat.tracks.length; i += CONC) {
@@ -11893,6 +11944,13 @@ async function getArtistWorksOf(artistItem, page, type) {
         await Promise.all(batch.map(async (t) => {
           const wantN = normTextZ(t.title);
           if (!wantN) return;
+          /* 目录条目自带 YouTube videoId（YTM 那条路）→ 直接落库，
+             不必再搜一次去找它自己的视频。这是 20 秒 → 1 秒的关键。 */
+          if (t.vid) {
+            pushTrack({ id: t.vid, title: t.title, artwork: t.artwork || "" },
+              t.album, t.dur || 0);
+            return;
+          }
           /* YouTube 标题里的标点跟 Apple 经常对不上 ——
              Apple「沒有的, 啊!?」/ YouTube「沒有的 啊」，
              逗号问号感叹号都得去掉才比得上。 */
@@ -11963,25 +12021,7 @@ async function getArtistWorksOf(artistItem, page, type) {
       }));
     }
 
-    if (type === "album") {
-      /* YouTube 自己没有「专辑」概念，但 Apple 目录里是分好专辑的 ——
-         直接用它的分组当专辑列表，点进去 getAlbumDetail 会按 albumId
-         把曲目再拉出来配 YouTube 音源。 */
-      if (!(cat && cat.albums && cat.albums.length)) return { isEnd: true, data: [] };
-      const albums = cat.albums.map((a, i) => ({
-        id: "apple:" + cat.id + ":" + i,
-        platform: "Apple Music",
-        title: a.title,
-        artist: a.artist || chName,
-        artwork: a.artwork || "",
-        date: a.date || "",
-        description: "Apple Music 目录",
-        worksNum: a.worksNum || 0,
-        _provider: "apple",
-        _kind: "album",
-      }));
-      return { isEnd: true, data: albums };
-    }
+    ARTIST_WORKS_CACHE[chKey] = { at: Date.now(), data: music };
     return { isEnd: true, data: music };
   }
 
@@ -14762,7 +14802,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.37",
+  version: "4.10.38",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
