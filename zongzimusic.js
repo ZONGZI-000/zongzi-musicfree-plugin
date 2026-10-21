@@ -255,6 +255,14 @@ const LABEL_TO_PROVIDER = {
   // Apple 目录条目没有平台 id —— 标成 "apple" 让它跳过「本平台直取」，
   // 直接进跨平台兜底（按歌名+歌手搜 YouTube / 各家）
   "Apple Music": "apple",
+  /* ⚠️ MusicBrainz 必须有自己的映射，否则 _provider 一旦丢失
+     （客户端复制/序列化 musicItem 时会把下划线开头的自定义字段吞掉），
+     provider 就退回默认的 "netease"，然后兜底循环第一行
+     `if (p === provider) continue` 把**网易云**这一条最强的兜底跳过去，
+     整条链少一个平台 —— 表现就是「明明别的平台搜得到，插件却说播不了」。
+     MB 没有音频、也没有 RESOLVERS 条目，映射到这里等于「不进本平台直取、
+     直接开始兜底」，正是我们想要的。 */
+  "MusicBrainz": "mb",
 };
 
 /* ============================================================
@@ -3962,6 +3970,24 @@ async function mbFindArtist(name) {
  * 歌手名 → 完整作品表，结构跟 appleArtistCatalog / ytmArtistCatalog 对齐，
  * 这样 appleCatScore 那套打分和 mergeAppleAlbums 那套骨架合并能直接复用。
  */
+/* MusicBrainz 曲目没有音源 id（MB 本身没有音频，播放全靠跨平台兜底）。
+   ⚠️ 不能留空串：空串会让整张专辑所有曲目在客户端里「同 id」——
+      播放缓存（mediaCacheKey）把它们并成一条、队列去重把它们当成同一首歌、
+      列表刷新时也认不出谁是谁。实测赵薇《双》整张 11 首：
+      列表只留下 4 首、点《孰轻孰重》播出来是《来得及的明天》。
+   给它一个按「歌手 + 歌名」算出的稳定合成 id：同一首歌跨专辑/跨刷新都是
+   同一个 id（不会重复下载），不同歌之间又彼此区分。前缀 mbt: 明确表示
+   「这不是任何平台的真实 id」。 */
+function mbTrackId(artist, title) {
+  const s = String(artist || "") + "|" + String(title || "");
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return "mbt:" + h.toString(36);
+}
+
 /* Cover Art Archive 的 release-group 正面图直链。
    只有 MusicBrainz 标了 front=true 才拼，否则 404 会变成灰块。 */
 const CAA_RG = "https://coverartarchive.org/release-group/";
@@ -10514,15 +10540,38 @@ async function getAlbumDetail(albumItem, page) {
         const tBare = tn.replace(/[.,!?;:'"·、。，！？；：…—–\-]/g, "");
         let list = [];
         try { list = await ytSearchRaw(t.title + " " + artistName); } catch (e) { return null; }
+        /* 两轮筛选：先只认「认得出本歌手」的候选，一个都没有才退到不限歌手。
+           ⚠️ 只靠加减分不够 —— 《不能和你分手》在 YouTube 上全是
+           「铁木冰冰 - Topic」这种别人的正版，Topic 分加满照样把赵薇顶掉。
+           两轮筛选才能保证「有本人的就一定要用本人的」。 */
+        const pickBest = function (onlySinger) {
         let best = null, bestSc = -Infinity;
         for (let j = 0; j < (list || []).length; j++) {
           const y = list[j];
           const yn = normTextZ(y.title || "");
           if (!yn) continue;
           const yBare = yn.replace(/[.,!?;:'"·、。，！？；：…—–\-]/g, "");
+          /* 除了双向包含，长标题还允许「差一两个字」的近似命中：
+             MB 写《这一刻我相信你说爱你》，YouTube 上是
+             《這一刻我相信你說我愛你》（多了个「我」），
+             严格包含永远对不上，但这确实是同一首。
+             门槛 0.88 且要求歌名 ≥5 字，短标题不放（会把整片都放进来）。 */
+          /* ⚠️ 相似度必须比「切段」，不能直接比整条标题：
+             YouTube 标题是「【這一刻我相信你說我愛你】/ 趙薇」，
+             整条比只有 0.77，拆出【】里的那一段就是 1.00。 */
+          let fuzzy = false;
+          if (tBare.length >= 5) {
+            const segs = String(y.title || "").split(/[\/|｜·•\-–—_]+|【|】|《|》|「|」|\(|\)|（|）|\[|\]|,|，/);
+            for (let q = 0; q < segs.length && !fuzzy; q++) {
+              const sg = String(segs[q] || "").trim();
+              if (!sg) continue;
+              if (titleSimZ(sg, t.title) >= 0.85) fuzzy = true;
+            }
+          }
           const hitTitle = yn.indexOf(tn) >= 0 || tn.indexOf(yn) >= 0 ||
             (tBare && yBare.indexOf(tBare) >= 0) ||
-            (tBare && tBare.indexOf(yBare) >= 0 && yBare.length >= 2);
+            (tBare && tBare.indexOf(yBare) >= 0 && yBare.length >= 2) ||
+            fuzzy;
           if (!hitTitle) continue;
           /* ⚠️ 原来是「Topic 频道 +100」，等于把打分变成「谁的频道最像官方」，
              标题和歌手都退居其次。实测赵薇《双》：11 首里 3 首被 Topic 抢走 ——
@@ -10530,6 +10579,7 @@ async function getAlbumDetail(albumItem, page) {
              全是别人的歌。现在歌手命中是第一权重，Topic 只是加分项，
              认不出歌手的 Topic 条目拿不到高分。 */
           const singerHit = artistHitIn(y, artistName);
+          if (onlySinger && !singerHit) continue;
           /* 一两个字的歌名（赵薇《爱》《变了》、李志《春》）必须**整名对上**：
              允许「被包含」的话《愛之玄》《愛情大魔咒》全会顶到《爱》头上；
              只认全等又永远命不中「【變了】/ 趙薇」这种写法，
@@ -10543,6 +10593,10 @@ async function getAlbumDetail(albumItem, page) {
           else sc -= Math.max(0, yn.length - tn.length);
           if (/歌词|歌詞|lyrics|翻唱|cover|remix|dj|伴奏|純享|纯享|live|現場|现场|演唱[会會]|公益|karaoke|教学|教程/i.test(y.title || "")) sc -= 70;
           const sec = ytDurSec(y.durationText);
+          /* 一首歌不可能 15 分钟以上，也不该短于 40 秒。视频剪了整张专辑、
+             电影片段（实测《爱》曾经命中 40 分钟的《爱 LOVE》电影 CUT）
+             都靠这条挡掉。 */
+          if (sec > 900 || (sec > 0 && sec < 40)) continue;
           if (sec > 0 && t.duration > 0) {
             const dd = Math.abs(sec - Math.round(t.duration / 1000));
             sc += dd <= 12 ? 45 : (dd <= 40 ? 5 : -100);
@@ -10551,12 +10605,14 @@ async function getAlbumDetail(albumItem, page) {
         }
         if (!best || bestSc <= 0) return null;
         return best;
+        };
+        return pickBest(true) || pickBest(false);
       }));
       for (let j = 0; j < batch.length; j++) {
         const t = batch[j];
         const y = parts[j];
         musicList.push({
-          id: y ? String(y.id) : "",
+          id: y ? String(y.id) : mbTrackId(artistName, t.title),
           platform: y ? "YouTube" : "MusicBrainz",
           title: t.title,
           artist: artistName,
@@ -11105,7 +11161,7 @@ async function getArtistWorksOf(artistItem, page, type) {
               if (!k || have[k]) continue;
               have[k] = 1;
               head.push({
-                id: "",           // 没有音源 id，播放走跨平台兜底
+                id: mbTrackId(mcat.name, t.title),   // MB 无音源 id，用稳定合成 id
                 platform: "MusicBrainz",
                 title: t.title,
                 artist: mcat.name,
@@ -13939,7 +13995,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.29",
+  version: "4.10.30",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -14404,11 +14460,51 @@ function isDefinitelySameSong(it, want) {
     const wantList = splitSingers(want.singer).map((x) => normText(toSimplified(x))).filter(Boolean);
     const candList = splitSingers(rawArtist).map((x) => normText(toSimplified(x))).filter(Boolean);
     if (a && wantList.length) {
-      const hit = wantList.some((s) => candList.some((c) => c.indexOf(s) >= 0 || s.indexOf(c) >= 0));
+      const hit = wantList.some((s) => candList.some((c) => artistNameHit(s, c)));
       if (!hit) return false;
     }
   }
   return true;
+}
+
+/**
+ * 歌手名命中判断（兜底用，宁严不宽）。
+ *
+ * ⚠️ 只做「包含」会认错人：**赵薇薇** 里就包含「赵薇」，
+ *    实测搜「赵薇」的兜底会接受赵薇薇的歌。
+ *    所以纯中文名必须过右边界校验（复用 cjkTailOk），
+ *    「赵薇 的」「赵薇Vicki」放行，「赵薇薇」「赵薇轩」拒绝。
+ *    英文名没有这种拼接习惯（Adele / AdeleAdkins 极少见），保持包含即可。
+ */
+function artistNameHit(want, cand) {
+  if (!want || !cand) return false;
+  const isCJK = (x) => /^[一-鿿]+$/.test(x);
+  // 候选里包含目标（「赵薇」⊂「赵薇vickizhao」）
+  if (cand.indexOf(want) >= 0) {
+    if (!isCJK(want)) return true;
+    let from = 0;
+    while (true) {
+      const at = cand.indexOf(want, from);
+      if (at < 0) break;
+      if (cjkTailOk(cand, at, want.length)) return true;
+      from = at + 1;
+    }
+    return false;
+  }
+  // 目标里包含候选（候选写成简称）：候选至少 2 个字，且同样要过右边界
+  if (want.indexOf(cand) >= 0) {
+    if (cand.length < 2) return false;
+    if (!isCJK(cand)) return true;
+    let from = 0;
+    while (true) {
+      const at = want.indexOf(cand, from);
+      if (at < 0) break;
+      if (cjkTailOk(want, at, cand.length)) return true;
+      from = at + 1;
+    }
+    return false;
+  }
+  return false;
 }
 
 /* ⚠️ 这里原本还有一个「宽松版」isDefinitelySameSong。函数声明会被提升，
