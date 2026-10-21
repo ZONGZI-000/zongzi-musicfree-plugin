@@ -722,7 +722,15 @@ const PLATFORM_TRUST = {
  *
  *  ⚠️ 查询词里的歌名和歌手要分开算：用户写「起风了 买辣椒也用券」时，
  *  整串拿去比字数永远对不上，得先把歌手那一截拆出来。 */
-const VARIANT_RE = /翻唱|伴奏|ktv|dj|remix|童声|女声|男声|钢琴|吉他|纯音乐|铃声|片段|cover|instrumental|深情版|伤感版|抖音|加速|降调|慢速|咚鼓|氛围版|纯享|现场|live|演唱会|合辑|串烧|精选|连播|循环/i;
+/* ⚠️ 2026-10-21 补 女版|男版|童声版。
+   实测搜「一直下雨的星期天 赵薇」：内地四平台没有赵薇的原版，
+   返回的头部全是别人照着赵薇那版翻的「(赵薇女版)」——
+   凌奈 / 柒月 / 日落情歌，每个都顶着「赵薇女版」四个字。
+   原来的判据只看「标题里有没有赵薇」，于是这仨跟真原版一样是 3 档，
+   靠数组顺序随机排，一屏十条里八条是翻唱。
+   「女版 / 男版 / 童声版」是「换个人重唱」的行话，出现在标题里
+   就等于自报翻唱 —— 跟已有的 女声|男声|童声 是同一类，只是说法不同。 */
+const VARIANT_RE = /翻唱|伴奏|ktv|dj|remix|童声|女声|男声|女版|男版|童声版|钢琴|吉他|纯音乐|铃声|片段|cover|instrumental|深情版|伤感版|抖音|加速|降调|慢速|咚鼓|氛围版|纯享|现场|live|演唱会|合辑|串烧|精选|连播|循环/i;
 
 /** 去掉括号里的整段内容：「起风了（2019版）」→「起风了」 */
 function coreTitle(s) {
@@ -4659,8 +4667,23 @@ function ytPickAudio(list, quality) {
  *   所以不能像 B 站那样彻底退回纯流式 —— 那样受限曲目播到 1MB 就断。
  *
  *   折中：2MB 以内（覆盖绝大多数 mv 音轨，实测《晴天》1.56MB）照旧内联，
- *   超过就走流式。内联池 3 条 × 2MB ≈ 8MB，Hermes 吃得下。 */
-const YT_INLINE_MAX_BYTES = 2 * 1024 * 1024;
+ *   超过就走流式。 */
+/* ⚠️ 上限从 2MB 收到 600KB（2026-10-21「整个 App 无响应、无法切歌」）。
+ *
+ *   实测到两处会被这个体积拖死，两处都在 JS 主线程上、都随体积线性增长：
+ *
+ *   ① 播放器拿到 data: URI 要解码整条字符串；
+ *   ② **更要命**：MusicFree 会把当前曲目整个 JSON.stringify 落盘
+ *      （persistStatus 的 music.musicItem / music.playList，写进 MMKV）。
+ *      track.url 里装着这条 data: URI，于是每次切歌都要在 JS 线程上
+ *      序列化 + 写一个几 MB 的字符串。4MB 的那首实测直接把线程堵住，
+ *      切歌的点击事件排在后面进不来 —— 用户看到的就是「整个 App 死了」。
+ *      而且它还会留在本地状态里，下次启动读回来同一坨。
+ *
+ *   600KB 的音频内联后约 800KB，写盘和解码都在「察觉不到」的量级。
+ *   整首歌不内联也不会播不了：B站/YouTube 的流式地址现在都能带对头
+ *   正常拉（见 HOST_HEADER_RULES 的说明），播放器边下边播即可。 */
+const YT_INLINE_MAX_BYTES = 600 * 1024;
 
 /* ⚠️ 内联必须有**总超时**（2026-10-21 事故：「一直转」）。
    原来只有每块的 20 秒超时，整首是 4 路并发分块下载，
@@ -4675,28 +4698,54 @@ const YT_INLINE_MAX_BYTES = 2 * 1024 * 1024;
 const INLINE_TOTAL_DEADLINE = 6000;
 
 const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/* 字符码表，惰性建一次（见 b64FromU8 里的说明） */
+let B64_CODES = null;
 
 /** Uint8Array → base64（纯 JS，Hermes 里没有 Buffer，btoa 也不一定有） */
 function b64FromU8(u8) {
   const len = u8.length;
-  const parts = [];
+  /* ⚠️ 改成「按批拼字符串」而不是「一个三元组一个数组元素」。
+     旧写法对 1MB 文件要往 parts 里 push 35 万个小字符串，
+     再 join 成一条 1.33MB 的长串 —— Hermes 上这是一次几十 MB 的
+     瞬时分配 + 一次巨型字符串拼接，主线程被整段占住（实测 Node 上
+     3.3MB 就要 383ms、堆涨到 76MB，手机上是好几倍）。
+     这正是「点一下整个 App 无响应、连锁屏都点不动」的直接来源：
+     解码还没开始，光是造这条字符串就把 JS 线程堵死了。
+
+     现在按 3KB 一组先拼成小串（每批 4096 字符），最后只 join 几百段，
+     峰值分配降一个数量级，单批耗时都在亚毫秒级，中间还能让出事件循环。 */
+  const blocks = [];
+  const GROUP = 1024;                       // 1024 组 = 3072 字节 → 4096 字符
+  const buf = new Array(GROUP * 4);
+  /* 存字符码而不是字符本身：String.fromCharCode.apply 只认数字，
+     传字符串会静默变成 (空字节)（踩过一次，整条 base64 全是空字节）。 */
+  if (!B64_CODES) {
+    B64_CODES = new Array(64);
+    for (let c = 0; c < 64; c++) B64_CODES[c] = B64_CHARS.charCodeAt(c);
+  }
+  const fullEnd = len - (len % 3);
   let i = 0;
-  for (; i + 2 < len; i += 3) {
-    const x = (u8[i] << 16) | (u8[i + 1] << 8) | u8[i + 2];
-    parts.push(
-      B64_CHARS[(x >> 18) & 63] + B64_CHARS[(x >> 12) & 63] +
-      B64_CHARS[(x >> 6) & 63] + B64_CHARS[x & 63]
-    );
+  while (i < fullEnd) {
+    const groups = Math.min(GROUP, (fullEnd - i) / 3);
+    let k = 0;
+    for (let g = 0; g < groups; g++, i += 3) {
+      const x = (u8[i] << 16) | (u8[i + 1] << 8) | u8[i + 2];
+      buf[k++] = B64_CODES[(x >> 18) & 63];
+      buf[k++] = B64_CODES[(x >> 12) & 63];
+      buf[k++] = B64_CODES[(x >> 6) & 63];
+      buf[k++] = B64_CODES[x & 63];
+    }
+    blocks.push(String.fromCharCode.apply(null, k === buf.length ? buf : buf.slice(0, k)));
   }
   const rem = len - i;
   if (rem === 1) {
     const x = u8[i] << 16;
-    parts.push(B64_CHARS[(x >> 18) & 63] + B64_CHARS[(x >> 12) & 63] + "==");
+    blocks.push(B64_CHARS[(x >> 18) & 63] + B64_CHARS[(x >> 12) & 63] + "==");
   } else if (rem === 2) {
     const x = (u8[i] << 16) | (u8[i + 1] << 8);
-    parts.push(B64_CHARS[(x >> 18) & 63] + B64_CHARS[(x >> 12) & 63] + B64_CHARS[(x >> 6) & 63] + "=");
+    blocks.push(B64_CHARS[(x >> 18) & 63] + B64_CHARS[(x >> 12) & 63] + B64_CHARS[(x >> 6) & 63] + "=");
   }
-  return parts.join("");
+  return blocks.join("");
 }
 
 function mimeFromExt(mime) {
@@ -4834,6 +4883,8 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes) {
 
 /** 是否开启 YouTube 整首内联（默认开） */
 function shouldInlineYoutube() {
+  /* 同 shouldInlineBili：预取只要流式 URL，不做整首下载。 */
+  if (_prefetchMode) return false;
   try {
     const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
     const v = vars.inlineYoutube;
@@ -5384,12 +5435,20 @@ async function biliStreams(bvid) {
  *   Referer 压根没附上。现在按流域名补头，播放器能正常流式拉 B 站音频了
  *   （直搜的 B 站曲目一直能播，就是证据：那条路径 provider 正好是 bilibili）。
  *
- *   所以内联退回「只给小文件用」：短音频、鬼畜片段（< 1MB）内联确实省事，
+ *   所以内联退回「只给小文件用」：短音频、鬼畜片段内联确实省事，
  *   整首歌一律走流式 —— 播放器边下边播，主线程不再被字符串解码占住。
- *   缓存 3 条 × 1MB ≈ 3MB，Hermes 无压力。 */
-const BILI_INLINE_MAX_BYTES = 1 * 1024 * 1024;
+ *   缓存 2 条 × 400KB ≈ 800KB，Hermes 无压力。 */
+/* 1MB → 400KB。理由同 YT_INLINE_MAX_BYTES：真正的杀手不是解码，
+   是 MusicFree 每次切歌都会把当前曲目（含 url 字段）整个 JSON.stringify
+   落盘到 MMKV —— 一条 1.3MB 的 data: URI 就是每次切歌多写 1.3MB 的字符串。
+   400KB 内联后约 540KB，还在「写下也不疼」的范围里。
+   完整的歌走流式，B站 CDN 现在能带对 Referer（见 HOST_HEADER_RULES）。 */
+const BILI_INLINE_MAX_BYTES = 400 * 1024;
 
 function shouldInlineBili() {
+  /* 预取阶段一律不内联：那时候用户还没点播放，
+     为了「提前准备好」去下整首音频是本末倒置（见 prefetchTop）。 */
+  if (_prefetchMode) return false;
   try {
     const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
     const v = vars.inlineBili;
@@ -5482,6 +5541,24 @@ async function resolveBilibili(id, want, quality) {
         if (singer && (v.title.indexOf(singer) >= 0 || (v.artist || "").indexOf(singer) >= 0)) sc += 20;
         if (d >= 120 && d <= 600) sc += 15;
         if (v.play > 100000) sc += 10;
+        /* ---- 变体词降权 + 按时长贴近度挑版本 ----
+           ⚠️ 实测（2026-10-21）《一直下雨的星期天》兜底：
+              赵薇原版 3:50（230s），B 站上同一首歌有一堆
+                伴奏 253 秒、Remix 233 秒、AI 版 222 秒、
+                央视版 103 秒（剪过）、磁带试听 239 秒
+              原来的分只有「时长 120~600s +15」这一档，
+              它们全是 15 分，最后看谁排在搜索结果前面 —— 纯随机，
+              点进去可能是别人唱的，也可能是个伴奏。
+              现在加两条：标题带变体词（伴奏/Remix/AI/片段…）直接扣 25，
+              以及跟目标时长差得越远扣得越多（每差 5 秒扣 1 分、封顶 20）。
+              原版 230s 对 230s 不扣，伴奏 253s 扣 4 分再叠加变体词 25 分，
+              就稳定沉下去了。want.durMs 由 resolveMediaSource 传进来。 */
+        if (VARIANT_RE.test(v.title) || isCoverTitle(v.title)) sc -= 25;
+        const wantMs = Number(want.durMs) || 0;
+        if (wantMs > 0 && d > 0) {
+          const diff = Math.abs(d * 1000 - wantMs) / 1000;
+          sc -= Math.min(20, Math.round(diff / 5));
+        }
         scored.push({ v: v, sc: sc });
       }
       scored.sort((a, b) => b.sc - a.sc);
@@ -13474,6 +13551,25 @@ function shouldPrefetch() {
 }
 
 let _prefetching = false;
+
+/* 预取期间禁止整首内联。
+ *
+ * ⚠️ 这是「一进 App 就卡死」的真正根部：预取原本和正式播放走同一条
+ *   resolveMediaSource，命中 YouTube/B站时那条路会把整首音频下下来再 base64。
+ *   于是「搜索完」这个瞬间，后台会接连去拉 3 首各几 MB 的音频 ——
+ *   用户根本没点播放，钱和内存都已经花掉了，主线程还被 base64 占着。
+ *
+ *   预取只需要一条**流式签名 URL**（几百字节，播放器自己边下边播）。
+ *   内联是「点播放那一刻」才该做的决定，而且现在它只对小文件生效。
+ *   INLINE_MAX_CHARS 兜住极端情况：万一路径没拦住，超过这个长度的 data:
+ *   一律不进内存缓存 —— 那是留在内存里、还会被整段写进本地状态的大字符串。 */
+/* 900KB 字符 ≈ 675KB 音频。内联上限是 400KB(B站)/600KB(YouTube)，
+   转成 base64 最多约 800KB 字符，所以正常内联的结果一定在闸门之内。
+   这条闸门只拦「历史上塞进来的几 MB 巨串」和老缓存。 */
+const INLINE_MAX_CHARS = 900 * 1024;
+/* 持久化在模块作用域：resolveMediaSource 里 read，prefetchTop 里 write */
+var _prefetchMode = false;
+
 function prefetchTop(list, count) {
   if (_prefetching) return;          // 避免上一轮还没跑完又开一轮
   if (!list || !list.length) return;
@@ -13484,23 +13580,39 @@ function prefetchTop(list, count) {
     const it = list[i];
     // 已经有缓存的跳过
     if (mediaCacheGet(it)) continue;
+    if (inlineCacheGet(it)) continue;
     targets.push(it);
   }
   if (!targets.length) { _prefetching = false; return; }
 
-  // 并发取流（不 await，让它在后台跑）
-  const done = [];
-  for (let i = 0; i < targets.length; i++) {
-    const it = targets[i];
-    done.push(
-      resolveMediaSource(it, "128k").then((r) => {
-        if (r && r.url) mediaCachePut(it, r.url);
-      }).catch(() => { /* 预取失败无所谓 */ })
-    );
-  }
-
-  // 用 Promise.all 收尾，清掉标志位
-  Promise.all(done).then(() => { _prefetching = false; }).catch(() => { _prefetching = false; });
+  /* ⚠️ 预取必须**串行**，不能三路并发。
+     2026-10-21 事故「一进 App 就卡死、切歌都点不动」的另一半就在这里：
+     预取走的是裸 resolveMediaSource，命中的是 YouTube/B站时那条路会
+     把整首音频下载下来再 base64 —— 3 首并发 = 三个几 MB 的 Uint8Array
+     同时建起来，手机上直接撞内存上限，GC 一跑整个界面就僵住。
+     串行之后同一时刻只有一份大缓冲，而且每首之间还能让出事件循环。 */
+  (async function () {
+    _prefetchMode = true;
+    for (let i = 0; i < targets.length; i++) {
+      const it = targets[i];
+      try {
+        const r = await resolveMediaSource(it, "128k");
+        const u = r && r.url;
+        if (!u) continue;
+        /* 内联结果（data: URI）**绝对不能**塞进直链池：
+           它是几 MB 的字符串，MEDIA_URL_CACHE 是给几百字节的签名 URL 用的，
+           混进去以后 cachePut 的排序/淘汰会拿它当普通条目一起挪，
+           内存里就长期钉着好几条巨串 —— 之后每次 GC 都要扫它们。 */
+        if (String(u).indexOf("data:") === 0) {
+          if (String(u).length <= INLINE_MAX_CHARS) inlineCachePut(it, u);
+        } else {
+          mediaCachePut(it, u);
+        }
+      } catch (e) { /* 预取失败无所谓 */ }
+    }
+    _prefetchMode = false;
+    _prefetching = false;
+  })();
 }
 
 /* ============================================================
@@ -13659,7 +13771,7 @@ function mediaCachePut(item, url) {
  * ------------------------------------------------------------ */
 const INLINE_CACHE = {};
 const INLINE_CACHE_TTL = 2 * 60 * 60 * 1000;
-const INLINE_CACHE_MAX = 3;
+const INLINE_CACHE_MAX = 2;
 
 function inlineCacheGet(item) {
   const k = mediaCacheKey(item);
@@ -13798,7 +13910,12 @@ async function getMediaSource(musicItem, quality) {
 
   // 1) 内存里已有完整音频（data: URI）→ 直接复用，别重复下载
   const inline = inlineCacheGet(musicItem);
-  if (inline) return { url: inline };
+  if (inline) {
+    /* 老版本可能往池子里塞过几 MB 的巨串（当年内联上限是 8MB）。
+       命中一条那种串就是「一点就假死」，还会被带进落盘。 */
+    if (String(inline).length <= INLINE_MAX_CHARS) return { url: inline };
+    inlineCachePut(musicItem, "");   // 丢了它，走下面的正常取流
+  }
 
   // 2) 30 分钟内的直链缓存（跟音质无关），不再重走取流链路
   const cached = mediaCacheGet(musicItem);
@@ -13835,8 +13952,10 @@ async function getMediaSourceUncached(musicItem, quality, providerForPlay) {
 
   const isInline = result.url && String(result.url).indexOf("data:") === 0;
   if (isInline) {
-    // data: URI 只进 inline 池（3MB 字符串不进 URL 池，也不往飞书推）
-    inlineCachePut(musicItem, result.url);
+    /* data: URI 只进 inline 池（不进 URL 池，也不往飞书推）。
+       超过 INLINE_MAX_CHARS 的不缓存：那已经不是「顺手留一份」，
+       是一坨留在内存里、还会被写进本地状态的大字符串。 */
+    if (String(result.url).length <= INLINE_MAX_CHARS) inlineCachePut(musicItem, result.url);
   } else {
     mediaCachePut(musicItem, result.url);
     pushToFeishu([
@@ -13854,6 +13973,10 @@ async function resolveMediaSource(musicItem, quality) {
   const want = { name: musicItem.title, singer: musicItem.artist, album: musicItem.album };
   const provider = musicItem._provider || LABEL_TO_PROVIDER[musicItem.platform] || "netease";
   const durMs = Number(musicItem.duration) || 0;
+  /* 目标时长也要传给兜底 —— B 站那一路靠它从一堆版本里挑最贴近原盘的那个
+     （同一首歌在 B 站常有伴奏 253s / Remix 233s / 剪辑版 103s 一起排队）。
+     别的平台用不到，多挂一个字段不影响。 */
+  want.durMs = durMs;
   const errors = [];
   // 拿到过、但只是试听片段的地址。全平台都只给片段时，退回用它 ——
   // 片段总比「点击报错」好，至少能听个开头。
@@ -14505,7 +14628,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.35",
+  version: "4.10.36",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
