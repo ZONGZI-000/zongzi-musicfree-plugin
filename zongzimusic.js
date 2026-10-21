@@ -280,25 +280,82 @@ let ytApiKey = "";
 
 /** 从 watch 页抓 INNERTUBE_API_KEY + VISITOR_DATA */
 let ytBootInflight = null;
+/** 抓页面的 UA（sw.js / visitor_id 用，普通浏览器 UA 即可） */
+const YT_BOOT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/** 轻量路径：sw.js（key）+ visitor_id（visitorData），合计约 13KB */
+async function ytBootstrapLight() {
+  const sw = await axios_1.get("https://www.youtube.com/sw.js", {
+    timeout: YT_NET_TIMEOUT,
+    headers: { "User-Agent": YT_BOOT_UA },
+    validateStatus: () => true,
+    responseType: "text",
+    transformResponse: [(x) => x],
+  });
+  const km = String(sw.data || "").match(/"INNERTUBE_API_KEY":"([^"]+)"/);
+  if (!km) throw new Error("sw.js 无 API key");
+  const key = km[1];
+  const vr = await axios_1.post(
+    "https://www.youtube.com/youtubei/v1/visitor_id?key=" + key,
+    JSON.stringify({
+      context: {
+        client: { clientName: "WEB", clientVersion: "2.20250101.00.00", hl: "en", gl: "US", visitorData: "" },
+      },
+    }),
+    {
+      timeout: YT_NET_TIMEOUT,
+      headers: { "Content-Type": "application/json", "User-Agent": YT_BOOT_UA },
+      validateStatus: () => true,
+    }
+  );
+  const rc = (vr.data && vr.data.responseContext) || {};
+  if (!rc.visitorData) throw new Error("visitor_id 无 visitorData");
+  return { key: key, visitor: rc.visitorData };
+}
+
+/** 老路径：抓整张 watch 页抠 key + visitorData（563KB，仅作兜底） */
+async function ytBootstrapHeavy(videoId) {
+  const r = await axios_1.get("https://www.youtube.com/watch?v=" + encodeURIComponent(videoId), {
+    timeout: YT_NET_TIMEOUT,
+    headers: { "User-Agent": YT_VISIONOS.ua },
+    validateStatus: () => true,
+    responseType: "text",
+    transformResponse: [(x) => x],
+  });
+  const html = String(r.data || "");
+  const km = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
+  const vm = html.match(/"VISITOR_DATA":"([^"]+)"/);
+  if (!km || !vm) throw new Error("yt: 无法从网页获取 API key / visitorData");
+  return { key: km[1], visitor: vm[1] };
+}
+
 async function ytBootstrap(videoId) {
   if (ytVisitorData && ytApiKey && Date.now() - ytVisitorAt < 10 * 60 * 1000) {
     return { key: ytApiKey, visitor: ytVisitorData };
   }
   if (ytBootInflight) return ytBootInflight;
   ytBootInflight = (async () => {
-    const r = await axios_1.get("https://www.youtube.com/watch?v=" + encodeURIComponent(videoId), {
-      timeout: YT_NET_TIMEOUT,
-      headers: { "User-Agent": YT_VISIONOS.ua },
-      validateStatus: () => true,
-      responseType: "text",
-      transformResponse: [(x) => x],
-    });
-    const html = String(r.data || "");
-    const km = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
-    const vm = html.match(/"VISITOR_DATA":"([^"]+)"/);
-    if (!km || !vm) throw new Error("yt: 无法从网页获取 API key / visitorData");
-    ytApiKey = km[1];
-    ytVisitorData = vm[1];
+    /* ⚠️⚠️ 2026-10-21 事故：手机上「刷新很久，最后还是失败」。
+       原来这里是抓一整张 watch 页（/watch?v=xxx）再从 HTML 抠 key 和
+       visitorData —— 实测那张页 563KB，而且它是「冷启动必经之路」：
+       缓存 10 分钟一过期，点第一首歌就得先下完它。用户实测带宽 57KB/s，
+       563KB 就是 10 秒；叠上重试和后面的搜索，播放器早超时了。
+
+       现在改成两步都很轻：
+         ① GET /sw.js（12KB）—— service worker 脚本里带着同一个公开 key；
+         ② POST /youtubei/v1/visitor_id（1KB）换 visitorData。
+       实测冷启动 565ms（原来 1.5s 且 563KB），VISIONOS player 照常出流。
+       ⚠️ visitorData 不能省：不带它的 player 请求直接回 LOGIN_REQUIRED。
+       ⚠️ watch 页保留成兜底 —— sw.js 改版时还能活。 */
+    let got = null;
+    try {
+      got = await ytBootstrapLight();
+    } catch (e) {
+      console.log("[粽子] YouTube 轻量 bootstrap 失败（" + e.message + "），退回抓网页");
+      got = await ytBootstrapHeavy(videoId);
+    }
+    ytApiKey = got.key;
+    ytVisitorData = got.visitor;
     ytVisitorAt = Date.now();
     return { key: ytApiKey, visitor: ytVisitorData };
   })();
@@ -396,25 +453,27 @@ async function ytPubKey() {
   if (ytPubKeyCache && Date.now() - ytPubKeyAt < 60 * 60 * 1000) return ytPubKeyCache;
   if (ytPubKeyInflight) return ytPubKeyInflight;
   ytPubKeyInflight = (async () => {
-    /* 两个 url 并发发，谁先给出 key 用谁 —— 不串行等第一个超时再来第二个。 */
-    const urls = [
-      "https://www.youtube.com/",
-      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    ];
-    const tries = urls.map((u) => axios_1.get(u, {
-      timeout: YT_NET_TIMEOUT,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      },
-      validateStatus: () => true,
-      responseType: "text",
-      transformResponse: [(x) => x],
-    }).then((r) => {
+    /* ⚠️ 2026-10-21：不再并发抓首页 + watch 页。
+       那两个页面实测 936KB / 1377KB。并发发的话两份都会下载完 ——
+       省的是时间，烧的是用户的流量（实测 57KB/s，2.3MB = 40 秒）。
+       sw.js 里带着同一个公开 key，只有 12KB，是它们的 1/120。
+       串行：先 sw.js，失败再退回首页。 */
+    async function keyFrom(u) {
+      const r = await axios_1.get(u, {
+        timeout: YT_NET_TIMEOUT,
+        headers: { "User-Agent": YT_BOOT_UA },
+        validateStatus: () => true,
+        responseType: "text",
+        transformResponse: [(x) => x],
+      });
       const m = String(r.data || "").match(/"INNERTUBE_API_KEY":"([^"]+)"/);
       return (m && m[1]) || "";
-    }).catch(() => ""));
-    const results = await Promise.all(tries);
-    const key = results.find(Boolean);
+    }
+    let key = "";
+    try { key = await keyFrom("https://www.youtube.com/sw.js"); } catch (e) { key = ""; }
+    if (!key) {
+      try { key = await keyFrom("https://www.youtube.com/"); } catch (e) { key = ""; }
+    }
     if (!key) throw new Error("yt: 无法从网页获取 innertube API key");
     ytPubKeyCache = key;
     ytPubKeyAt = Date.now();
@@ -6057,13 +6116,20 @@ const BILI_INLINE_MAX_BYTES = 400 * 1024;
  *   但实测约 7/8 的条目**只有 upos、没有 mcdn**，这类条目走流式必 403。
  *
  *   所以这类条目必须由插件自己把音频下下来内联成 data: URI。
- *   代价是主线程要处理这条长字符串，体积越大越危险 ——
- *   400KB 时切歌会有轻微顿挫，1.5MB 时（内联后 2MB 字符串）
- *   用户反馈是「整个软件卡顿」。1.5MB 是实测还能接受的上限，
- *   再大就宁可让它 403（至少不卡死整个 App），或者退到别的平台。
+ *   代价是主线程要处理这条长字符串，体积越大越危险：
+ *   实测 4MB 音频（内联后 5.3MB 字符串）用户反馈就是「整个 App 无响应、
+ *   无法切歌」；1.5MB（2MB 字符串）是能感觉到顿挫但还能用。
+ *
+ *   2.5MB（≈3.3MB 字符串）是这两者之间的折中：
+ *   B 站音频体积中位数 ~4MB，1.5MB 只能覆盖不到三分之一，
+ *   剩下的会整条判失败（实测「周杰伦-晴天」这类热门曲目 2.2~3.1MB，
+ *   全被 1.5MB 卡掉，表现就是「点了没反应、最后没播放」）。
+ *
+ *   ⚠️ 这是**只在没有 mcdn 节点时**才走的路 —— 有 mcdn 就直接流式，
+ *   根本不内联。所以正常热门视频不会付这个代价。
  *
  *   mcdn 条目**不**走这个上限：它们能流式，没必要内联。 */
-const BILI_INLINE_FALLBACK_MAX = 1500 * 1024;
+const BILI_INLINE_FALLBACK_MAX = 2500 * 1024;
 
 function shouldInlineBili() {
   /* 预取阶段一律不内联：那时候用户还没点播放，
@@ -6169,8 +6235,16 @@ async function biliFetchUrl(bvid, quality) {
         }
       } catch (e) { /* 内联失败 → 下面继续找 */ }
     } else if (pr.total && pr.total > BILI_INLINE_FALLBACK_MAX) {
+      /* ⚠️ 这里**不能 continue 就完事**。之前是 continue，结果：
+           这条视频每一档都 > 1.5MB → errors 里堆满「过大」→ 抛错
+           → resolveBilibili 直接 throw → 整条 B 站兜底路径当它不存在。
+           而实际上「重新搜一个更短的版本」是能成功的
+           （实测搜「周杰伦-晴天」这条 2.2MB+，但同 query 下另有
+            1.1MB 的版本，能被正确内联）。所以这里 break 出循环、
+           走 throw，让上层 resolveBilibili 去尝试「搜索 → 换个条目」。
+          —— 换言之：直取这条太大不代表没有别的可播版本。 */
       errors.push("无mcdn且" + (pr.total / 1024 / 1024).toFixed(1) + "MB过大");
-      continue;
+      break;
     }
     /* 内联也失败（慢网/超时）→ 把流式地址交出去赌一次，
        反正它至少比「直接报错」有机会播。 */
@@ -13227,11 +13301,14 @@ async function searchMusicAll(query, page) {
   const ytFirstRawP = shouldUseYoutube()
     ? ytSearchRaw(query).catch(function () { return []; })
     : null;
-  /* ⚠️ 首发就打 3 页并发（见 biliSearchPages 的实测数据：3 页以内不花额外时间），
-     返回的是第 1 页优先、按页序拼接去重后的 150 条上限。
-     后面如果发现过完过滤条数太少，会再补第 4~6 页。 */
+  /* ⚠️ 首发只打 1 页（2026-10-21）。
+     原来是 3 页并发 —— 桌面宽带上「3 页不多花时间」成立，
+     但单页响应 65~70KB（B 站搜索不压缩），3 页就是 210KB。
+     实测用户手机 57KB/s，光 B 站这一路就吃掉 4 秒，
+     而且它和 8 个平台的请求在抢同一条带宽。
+     现在先 1 页（约 70KB），过完滤不够才按档补。 */
   const biliFirstRawP = shouldUseBilibili()
-    ? biliSearchPages(query, 3).catch(function () { return []; })
+    ? biliSearchPages(query, 1).catch(function () { return []; })
     : null;
 
   /* iTunes 权威目录也提前发出去（只依赖 query，见 authorityPrefetch 的说明） */
@@ -13306,7 +13383,11 @@ async function searchMusicAll(query, page) {
   }
 
   const jobs = [];
+  /* 每一路对应的平台名，跟 jobs 下标一一对齐 ——
+     截止线要判断「关键平台回来了没有」，就得知道第 i 个格子是谁。 */
+  const JOB_PROVIDERS = [];
   if (!delisted) {
+    JOB_PROVIDERS.push("netease", "qq", "kugou", "migu", "kuwo");
     jobs.push(
       mk("netease", () => cocoSearch("netease", query)),
       mk("qq", () => cocoSearch("qq", query)),
@@ -13318,6 +13399,7 @@ async function searchMusicAll(query, page) {
 
   // JOOX 只在配了 Cookie 时参与
   if (getJooxCookie() && !delisted) {
+    JOB_PROVIDERS.push("joox");
     jobs.push(
       withRetry("JOOX", () => jooxSearch(query, 20)).then((list) => {
         let l = list || [];
@@ -13329,6 +13411,7 @@ async function searchMusicAll(query, page) {
 
   // YouTube
   if (shouldUseYoutube()) {
+    JOB_PROVIDERS.push("youtube");
     jobs.push(
       // YouTube 也走一次原名反查：搜「摇晃帝国」在 YouTube 上是空手，
       // 换成反查到的「Yura Yura Teikoku」就能搜到。
@@ -13413,6 +13496,7 @@ async function searchMusicAll(query, page) {
 
   // Bilibili
   if (shouldUseBilibili()) {
+    JOB_PROVIDERS.push("bilibili");
     jobs.push(
       // ⚠️ 先做一次原名反查（网易云歌手接口），把译名/别名一起拿来搜。
       //    B 站不认「摇晃帝国」这个中文译名，只认「ゆらゆら帝国」；
@@ -13438,33 +13522,50 @@ async function searchMusicAll(query, page) {
             playCount: Number(x.play || 0),   // 只有 B 站有这个字段
             _provider: "bilibili", _raw: x,
           }));
-        /* ⚠️ 补页：首发只拼了 3 页（150 条）。搜歌手时这 150 条里能过
-           时长/相关性过滤的往往只有三四十条，而 numResults 通常报 1000+，
-           第 4~6 页里还有大量正经现场和翻唱。所以过完滤不足 BILI_WANT 条
-           就再并发拉 3 页补上 —— 多花约 0.3~0.6s，只在「本来就少」时发生。 */
-        const BILI_WANT = 60;
+        /* ⚠️ 补页（2026-10-21 重写）。
+           B 站单页原始 50 条，但过完「时长 + 标题必须命中 + 歌手对得上」
+           这几道滤之后常常只剩个位数 —— 实测搜「痛苦之歌」第 1 页只过 2 条。
+           旧逻辑是「不够 40 条就一直补到第 6 页」，结果这种歌名查询也要烧
+           6 页 × 70KB = 420KB，慢网 7 秒，换回来的只是几条没人会听的翻唱。
+           用户看到的「刷新很久」就是这么来的。
+
+           现在分两档，按「B 站是不是这条链的关键来源」决定：
+             · 普通查询（主流平台有货）→ 最多 2 页
+             · 下架歌手模式（内地五家被跳过，B 站是唯二来源）→ 最多 4 页
+           而且每补一页都检查「有没有新增」，没新增就不再翻。 */
+        const biliIsKeySource = shouldDelistedDirect() && !!delistedArtistOf(query);
+        const BILI_PAGE_CAP = biliIsKeySource ? 4 : 2;
+        const BILI_WANT = biliIsKeySource ? 25 : 12;
         const supplement = async (kw, anchList, have, usedPages) => {
-          if (have.length >= BILI_WANT) return have;
-          if (usedPages >= 6) return have;
-          let more = [];
-          try { more = await biliSearchPages(kw, 3, undefined, 4); } catch (e) { return have; }
-          const got = shape(more, anchList);
-          const seen = Object.create(null);
-          const merged2 = [];
-          for (const x of have.concat(got)) {
-            if (!x || !x.id || seen[x.id]) continue;
-            seen[x.id] = 1;
-            merged2.push(x);
+          const mergeIn = (base, extra) => {
+            const got = shape(extra, anchList);
+            const seen = Object.create(null);
+            const out = [];
+            for (const x of base.concat(got)) {
+              if (!x || !x.id || seen[x.id]) continue;
+              seen[x.id] = 1;
+              out.push(x);
+            }
+            return out;
+          };
+          let cur = have;
+          while (cur.length < BILI_WANT && usedPages < BILI_PAGE_CAP) {
+            let more = [];
+            try { more = await biliSearchPages(kw, 1, undefined, usedPages + 1); } catch (e) { return cur; }
+            usedPages += 1;
+            const before = cur.length;
+            cur = mergeIn(cur, more);
+            if (cur.length === before) break;   // 这一页没新东西，再翻也一样
           }
-          return merged2;
+          return cur;
         };
         const tryOne = async (kwList, anchList, preRaw) => {
         for (let k = 0; k < kwList.length; k++) {
           let raw = [];
           let usedPages = 1;
-          if (k === 0 && preRaw) { raw = preRaw; usedPages = 3; }
+          if (k === 0 && preRaw) { raw = preRaw; usedPages = 1; }
           else {
-            try { raw = await biliSearchPages(kwList[k], 3); usedPages = 3; } catch (e) { continue; }
+            try { raw = await biliSearchPages(kwList[k], 1); usedPages = 1; } catch (e) { continue; }
           }
           let keep = shape(raw, anchList);
           keep = await supplement(kwList[k], anchList, keep, usedPages);
@@ -13502,6 +13603,7 @@ async function searchMusicAll(query, page) {
   // ⚠️ 鬼畜区**不**参与「音乐区搜空就退全站」的兜底 —— 那一路退的是全站，
   //    会把时政、游戏、影视区一起卷进来，跟鬼畜不是一回事。
   if (shouldUseBilibili() && shouldBiliGuichu()) {
+    JOB_PROVIDERS.push("guichu");
     jobs.push(
       aliasPromise.then(async (aliases) => {
         const anchors = [query].concat(aliases);
@@ -13536,6 +13638,7 @@ async function searchMusicAll(query, page) {
 
   // 咪咕官方直出（下架歌手同样跳过：它也是内地域，赵薇在里面只有同名翻唱）
   if (shouldUseMiguApi() && !delisted) {
+    JOB_PROVIDERS.push("miguapi");
     jobs.push(
       withRetry("咪咕直出", () => miguApiSearch(query, 10)).then((l) =>
         (l || []).map((x) => ({
@@ -13598,7 +13701,25 @@ async function searchMusicAll(query, page) {
         不靠砍这条线。 */
   const SOFT_DEADLINE = 1700;
   const HARD_DEADLINE = 3000;
+  /* 慢网专用上限（2026-10-21）。
+     固定的 1700/3000 是按桌面宽带调的。用户手机实测 57KB/s，
+     而 YouTube 一次搜索响应体 273KB —— 下载就要 4.8 秒，
+     永远赶不上 3 秒硬截止，于是每一路「重」平台都被整路丢弃。 */
+  const HARD_DEADLINE_SLOW = 9000;
+  const HARD_DEADLINE_LAST = 12000;
   const MIN_EARLY_ITEMS = 25;
+  /* 哪几路是「没有它就没有正确结果」的。
+     判据和补页那边一致：下架歌手模式下内地五家压根不发请求，
+     B 站 + YouTube 是唯二来源，缺一路就等于缺一半结果。 */
+  const KEY_SLOTS = (function () {
+    if (!(shouldDelistedDirect() && delistedArtistOf(query))) return [];
+    const out = [];
+    for (let i = 0; i < jobs.length; i++) {
+      const nm = JOB_PROVIDERS[i];
+      if (nm === "bilibili" || nm === "youtube") out.push(i);
+    }
+    return out;
+  })();
   /* ⚠️ 截止时间从**搜索开始**算，不是从「等到这里」的时候算。
      原来的写法是 setTimeout(ms)，而调用它的地方已经在入口之后
      跑了 100~150ms（别名反查、Apple 预热、九个平台的任务组装），
@@ -13642,11 +13763,39 @@ async function searchMusicAll(query, page) {
     }
     return n;
   }
+  /* ⚠️⚠️ 2026-10-21 事故：「还是没有对上音源，会刷新很久最后也是失败」。
+     上面那两条固定的 1700/3000ms 截止线是**按桌面宽带实测**调出来的。
+     用户手机实测 57KB/s，而 YouTube 一次搜索的响应体就有 273KB ——
+     光下载就得 4.8 秒，永远赶不上 3 秒的硬截止。
+     于是每一路「重」平台（YouTube / B 站 / 咪咕）都被整路丢弃，
+     只剩几 KB 就能回来的内地平台同名翻唱：
+       搜「亏欠」排第一的是 Siu-Siu，张震岳那条根本没进列表
+       搜「怎麼都沒有了」正确结果全在 YouTube，而它每次都在截止之后才回来
+       搜「赵薇 飘」B 站 9 条真原唱一条都进不来
+     界面就是「刷新很久，最后给出来的还是错的」。
+
+     现在：关键平台没回来就不提前收工，硬截止放宽到 9 秒，
+     并且用「一条精确命中都没有」作为最后一搏的判据 ——
+     慢网 + 下架歌手这种组合下，别的平台回的几条同名翻唱会让条数
+     早早过线，但它们一条都不对，这时候返回等于给用户一个错的列表。 */
   await waitUpTo(SOFT_DEADLINE);
-  if (earlyCount() < MIN_EARLY_ITEMS || earlyExactHits() < 3) await waitUpTo(HARD_DEADLINE);
+  const missingKey = KEY_SLOTS.some(function (i) {
+    return i >= 0 && SLOTS[i] === undefined;
+  });
+  const hardNow = missingKey ? HARD_DEADLINE_SLOW : HARD_DEADLINE;
+  if (earlyCount() < MIN_EARLY_ITEMS || earlyExactHits() < 3 || missingKey) {
+    await waitUpTo(hardNow);
+  }
+  if (missingKey && earlyExactHits() === 0) {
+    await waitUpTo(Math.max(hardNow, HARD_DEADLINE_LAST));
+  }
   // 到点还没回来的那几路直接放弃（它们的结果对这次返回已经没用了）
   for (let i = 0; i < SLOTS.length; i++) {
     if (SLOTS[i] && SLOTS[i].length) settled.push(SLOTS[i]);
+  }
+  if (missingKey) {
+    const still = KEY_SLOTS.filter(function (i) { return i >= 0 && SLOTS[i] === undefined; });
+    if (still.length) console.log("[粽子] 关键平台到点仍未返回，先交已有结果（" + still.length + " 路）");
   }
 
   // ---- 交错合并，避免一个平台刷屏 ----
@@ -14854,6 +15003,28 @@ function mediaCachePut(item, url) {
   }
   MEDIA_URL_CACHE[k] = { at: Date.now(), url: url };
 }
+/** 丢掉一条直链缓存（用于「缓存里是过期/不可播的地址」） */
+function mediaCacheForget(item) {
+  delete MEDIA_URL_CACHE[mediaCacheKey(item)];
+}
+
+/** 这条地址是不是「B 站 upos 系」—— 那种会按 User-Agent 做防盗链。
+ *
+ *  实测（2026-10-21，同一批地址逐个换 UA 打 Range）：
+ *    mcdn.bilivideo.cn:8082（B 站 PCDN）  任何 UA 都 206
+ *    upos-*.bilivideo.com                 桌面UA 206，stagefright/ijkplayer/Lavf 403
+ *    *.edge.mountaintoys.cn               同上，403
+ *
+ *  播放器带什么 UA 插件管不了（有些客户端会用自带 UA 覆盖我们给的 headers），
+ *  所以这类地址**不能**走「缓存直接复用」的快速通道 —— 必须每次重新过一遍
+ *  取流，让 biliFetchUrl 有机会挑 mcdn 或者内联。 */
+function isUaGatedUrl(url) {
+  const u = String(url || "");
+  if (!u || u.indexOf("data:") === 0) return false;
+  return /(^|\.)upos-[a-z0-9-]*\.bilivideo\.(com|cn)/i.test(u) ||
+         /\.edge\.mountaintoys\.cn/i.test(u) ||
+         /(^|\.)bilivideo\.com\/upgcxcode\//i.test(u);
+}
 
 /* ------------------------------------------------------------
  * 内联音频缓存：只放已经转成 data: URI 的 YouTube 曲目。
@@ -15033,12 +15204,30 @@ async function getMediaSource(musicItem, quality) {
 
   // 2) 30 分钟内的直链缓存（跟音质无关），不再重走取流链路
   const cached = mediaCacheGet(musicItem);
-  if (cached) {
+  if (cached && !isUaGatedUrl(cached)) {
     /* ⚠️ 缓存命中也要过 decorateSource。缓存里存的是裸 URL，
        请求头不在里面 —— 直接返回 { url: cached } 的话，
        B站/酷狗那批「必须带 Referer」的歌第一次能播、第二次 403，
        是最难查的那种间歇性故障。 */
     return decorateSource({ url: cached }, providerForPlay);
+  }
+  if (cached) {
+    /* ⚠️⚠️ 2026-10-21：命中了一条「会校验 UA 的 B 站地址」→ **丢弃缓存，重新取**。
+     *
+     *   背景见 biliFetchUrl 里 isUaFree 那段：upos 节点按 UA 防盗链，
+     *   而播放器带什么 UA 插件管不了（有的会用自带 UA 盖掉我们给的头）。
+     *
+     *   就是这条缓存路径让修复失效的：预取（_prefetchMode）走的是裸
+     *   resolveMediaSource，虽然那时已经会优先挑 mcdn，但只要当时没有 mcdn
+     *   可用（实测约 7/8 的条目只有 upos），写进缓存的就是一条 upos 裸地址。
+     *   之后用户点播 → 缓存命中 → 直接把这条 upos 扔给播放器 → 403。
+     *   表现是「插件里测能播、App 里点开没声音」，而且**时好时坏**，
+     *   取决于预取当时挑到了哪条 —— 最难查的那种。
+     *
+     *   正确做法：这类地址不进快速通道，走一遍完整取流（会内联或挑 mcdn）。 */
+    console.log("[粽子] 缓存里是 B站 upos 地址（校验 UA），丢弃重取: "
+      + String(musicItem.title || "").slice(0, 20));
+    mediaCacheForget(musicItem);
   }
 
   // 3) 同一首歌已经有作业在跑 → 等它，别再下第二遍
@@ -15991,7 +16180,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.48",
+  version: "4.10.49",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
