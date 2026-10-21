@@ -38,6 +38,132 @@ const KUWO_CONVERT = "http://antiserver.kuwo.cn/anti.s?type=convert_url&format={
 const FALLBACK_ORDER = ["netease", "qq", "migu", "kugou", "kuwo", "joox", "youtube", "bilibili", "miguapi"];
 
 /* ============================================================
+ * YouTube 熔断器（2026-10-21，修「赵薇歌手页点什么都卡死」）
+ *
+ * 事故现象：搜「赵薇」→ 歌手页 → 点专辑、点歌，全都要等 40~80 秒才动，
+ *           期间界面完全没反应，用户以为是卡死。
+ *
+ * 根因不是某一次请求慢，是**YouTube 在部分网络下根本连不通**（大陆直连、
+ * 机场挂掉、DNS 被污染），而 YouTube 是「逐首」用的：
+ *   - 歌手条目要问 iTunes + MusicBrainz + YouTube 三方拿作品数
+ *   - MB 专辑页要**每一首**去 ytSearchRaw 找官方音源（10 首 = 10 次请求）
+ *   - 目录补全一次并发 8 路
+ * 每个请求的超时是 15~20 秒，一次失败算不上什么；可 10 首同时挂 =
+ * 10 × 20s / 8 并发 = 至少 20 秒纯等待，而且 ytPubKey/ytBootstrap
+ * 自己也要先抓一次网页（15~20s），等于每首歌前面再垫一段。
+ *
+ * 修法：连续失败 N 次就整体熔断 YouTube M 分钟，期间所有 YouTube 入口
+ * **立刻**抛错（各调用点本来就是 .catch(() => []) / 回 null），
+ * 于是 MB 专辑页在无 YouTube 网络下 0.5 秒内就返回全部 MB 曲目 ——
+ * 点播放时再由跨平台兜底（B 站/网易/酷我）去找音源。
+ * 半开：过了冷却期放**一个**请求去试，成功就恢复，失败就再关一轮。
+ * ============================================================ */
+const YT_BREAKER = {
+  fails: 0,          // 连续失败次数
+  openUntil: 0,      // 熔断到期时间戳
+  probing: false,    // 半开状态：已放了一个探针出去
+  lastErr: "",
+  probeAt: 0,
+};
+/* ⚠️ 阈值 2 而不是 3。第一个请求就超时，基本已经能判定「这条网络到不了
+   YouTube」，再等第二、第三次只是多花 8 秒；而且并发场景下同一批
+   6 路会一起失败，阈值 2 实际上就是「第一批失败就断」。 */
+const YT_BREAK_THRESHOLD = 2;          // 连续 2 次网络失败就断
+const YT_BREAK_MS = 3 * 60 * 1000;     // 断 3 分钟（别太久，网络恢复要及时能用）
+const YT_PROBE_GAP_MS = 20 * 1000;     // 半开时两次探针最小间隔
+/* ⚠️ YouTube 单请求超时单独收紧到 8 秒（原来 15~20 秒）。
+   健康的 YouTube 一般 0.3~1.2 秒就回来，20 秒只会在连不通的网络下白等 ——
+   而连不通时我们真正想要的是「快点失败、快点熔断」，不是「耐心等它」。
+   最坏情况：3 次 × 8 秒 → 24 秒内必定熔断，之后一整轮零等待。 */
+const YT_NET_TIMEOUT = 8000;
+
+/** YouTube 现在还能用吗（不能就立刻抛错，不发任何请求） */
+function ytGate() {
+  const now = Date.now();
+  if (!YT_BREAKER.openUntil) return;
+  if (now < YT_BREAKER.openUntil) {
+    throw new Error("yt: 已熔断（连续 " + YT_BREAKER.fails + " 次失败，"
+      + Math.ceil((YT_BREAKER.openUntil - now) / 1000) + "s 后重试）");
+  }
+  /* 冷却期满：半开。只放一个探针，其余并发请求继续快速失败，
+     免得恢复瞬间又来一波 20 秒洪峰。 */
+  if (YT_BREAKER.probing && now - YT_BREAKER.probeAt < YT_PROBE_GAP_MS) {
+    throw new Error("yt: 熔断冷却中（探针未回）");
+  }
+  YT_BREAKER.probing = true;
+  YT_BREAKER.probeAt = now;
+}
+/** 一次 YouTube 请求成功 */
+function ytOk() {
+  if (YT_BREAKER.fails || YT_BREAKER.openUntil) {
+    console.log("[粽子] YouTube 恢复（此前连续失败 " + YT_BREAKER.fails + " 次）");
+  }
+  YT_BREAKER.fails = 0;
+  YT_BREAKER.openUntil = 0;
+  YT_BREAKER.probing = false;
+}
+/** 一次 YouTube 请求失败 —— 只有「网络层」失败才算，业务层（无结果/无音源）不算 */
+function ytFail(e) {
+  const msg = String((e && e.message) || e || "");
+  /* 业务性失败不该触发熔断：视频下架、无音频流、404 这类说明**网络是通的**。 */
+  if (/无音频流|playabilityStatus|yt visionos:|no audio|not found|404/i.test(msg)) {
+    YT_BREAKER.probing = false;
+    return;
+  }
+  YT_BREAKER.fails++;
+  YT_BREAKER.lastErr = msg.slice(0, 80);
+  /* 半开时那个探针失败 → 立刻再关一轮，别等凑满阈值。
+     ⚠️ 这里不能只看 `!openUntil`：冷却期满后 openUntil 是「过去的某个时刻」
+        但值仍然非 0，只看非 0 就永远不再关，探针一失败就整条链全放开。 */
+  const cooling = YT_BREAKER.openUntil && Date.now() < YT_BREAKER.openUntil;
+  if (!cooling && (YT_BREAKER.fails >= YT_BREAK_THRESHOLD || YT_BREAKER.probing)) {
+    YT_BREAKER.openUntil = Date.now() + YT_BREAK_MS;
+    YT_BREAKER.probing = false;
+    console.log("[粽子] YouTube 连续失败 " + YT_BREAKER.fails + " 次（"
+      + YT_BREAKER.lastErr + "）→ 熔断 " + (YT_BREAK_MS / 1000) + "s，"
+      + "期间本轮直接用其它平台");
+  }
+}
+
+/** 熔断是否正在生效（无副作用，给循环里做「这一批还值不值得发」的判断） */
+function ytIsOpen() {
+  return !!YT_BREAKER.openUntil && Date.now() < YT_BREAKER.openUntil;
+}
+
+/** 给「YouTube 只是锦上添花」的路径加软时限。
+ *
+ *  搜索歌手时 YouTube 只是六个数据源之一（酷我/咪咕/网易/酷狗/QQ 才是主角），
+ *  可 Promise.all 会老老实实等最慢的那个 —— YouTube 连不通时就是
+ *  整整 8 秒白等，用户搜「赵薇」10 秒才出结果。
+ *  超过时限就先交卷，YouTube 迟到的结果直接丢掉；它下一次会用熔断后的
+ *  快速失败，不会再拖第二轮。 */
+function ytSoft(promise, ms, fallback) {
+  return new Promise(function (res) {
+    let done = false;
+    const t = setTimeout(function () {
+      if (!done) { done = true; res(fallback); }
+    }, ms);
+    promise.then(function (v) {
+      if (!done) { done = true; clearTimeout(t); res(v); }
+    }, function () {
+      if (!done) { done = true; clearTimeout(t); res(fallback); }
+    });
+  });
+}
+/** 把一次 YouTube 网络调用包起来：熔断检查 + 成败记账 */
+async function ytGuard(fn) {
+  ytGate();
+  try {
+    const r = await fn();
+    ytOk();
+    return r;
+  } catch (e) {
+    ytFail(e);
+    throw e;
+  }
+}
+
+/* ============================================================
  * Bilibili —— 免费、音质最高（可到 319kbps m4a）
  * 关键：
  *   1. 必须先访问首页拿 buvid3 cookie，否则搜索 -352 风控
@@ -47,6 +173,57 @@ const FALLBACK_ORDER = ["netease", "qq", "migu", "kugou", "kuwo", "joox", "youtu
 const BILI_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 let biliCookie = "";
 let biliCookieAt = 0;
+
+/* B 站熔断器（2026-10-21，同 YouTube 那套）。
+ *
+ * 为什么必须有：赵薇这类内地下架歌手，兜底时**只剩 B 站和 YouTube 两路**。
+ * 一旦 B 站被风控（-412 / -352），每首曲子都要重新走一遍
+ * 「取 cookie → 取 wbi key → 4 个搜索端点轮着试」，每首白烧 2~4 秒，
+ * 77 首就是几分钟的连续失败 —— 用户看到的是「每一首点开都卡」。
+ * 熔断之后：第一次失败立刻记账，后面 2 分钟内直接用其它平台，
+ * 和 ytGate 完全同构（半开放一个探针，成功就恢复）。 */
+const BILI_BREAKER = { fails: 0, openUntil: 0, probing: false, probeAt: 0, lastErr: "" };
+const BILI_BREAK_THRESHOLD = 3;
+const BILI_BREAK_MS = 2 * 60 * 1000;
+const BILI_PROBE_GAP_MS = 20 * 1000;
+
+function biliGate() {
+  const now = Date.now();
+  if (!BILI_BREAKER.openUntil) return;
+  if (now < BILI_BREAKER.openUntil) {
+    throw new Error("bili: 已熔断（连续 " + BILI_BREAKER.fails + " 次风控，"
+      + Math.ceil((BILI_BREAKER.openUntil - now) / 1000) + "s 后重试）");
+  }
+  if (BILI_BREAKER.probing && now - BILI_BREAKER.probeAt < BILI_PROBE_GAP_MS) {
+    throw new Error("bili: 熔断冷却中（探针未回）");
+  }
+  BILI_BREAKER.probing = true;
+  BILI_BREAKER.probeAt = now;
+}
+function biliOk() {
+  if (BILI_BREAKER.fails || BILI_BREAKER.openUntil) {
+    console.log("[粽子] Bilibili 恢复（此前连续失败 " + BILI_BREAKER.fails + " 次）");
+  }
+  BILI_BREAKER.fails = 0;
+  BILI_BREAKER.openUntil = 0;
+  BILI_BREAKER.probing = false;
+}
+/** 只有风控/网络类失败才记账：搜不到结果不算失败 */
+function biliFail(e) {
+  const msg = String((e && e.message) || e || "");
+  if (!/-412|-352|-403|banned|rate|timeout|ECONN|ENOTFOUND/i.test(msg)) {
+    BILI_BREAKER.probing = false;
+    return;
+  }
+  BILI_BREAKER.fails++;
+  BILI_BREAKER.lastErr = msg.slice(0, 80);
+  if (BILI_BREAKER.fails >= BILI_BREAK_THRESHOLD) {
+    BILI_BREAKER.openUntil = Date.now() + BILI_BREAK_MS;
+    BILI_BREAKER.probing = false;
+    console.log("[粽子] Bilibili 连续风控 " + BILI_BREAKER.fails + " 次（"
+      + BILI_BREAKER.lastErr + "）→ 熔断 " + (BILI_BREAK_MS / 1000) + "s");
+  }
+}
 
 /* ============================================================
  * 咪咕官方直出（旧接口）—— 直接返回 MP3 字节流，不经第三方
@@ -102,30 +279,40 @@ let ytVisitorAt = 0;
 let ytApiKey = "";
 
 /** 从 watch 页抓 INNERTUBE_API_KEY + VISITOR_DATA */
+let ytBootInflight = null;
 async function ytBootstrap(videoId) {
   if (ytVisitorData && ytApiKey && Date.now() - ytVisitorAt < 10 * 60 * 1000) {
     return { key: ytApiKey, visitor: ytVisitorData };
   }
-  const r = await axios_1.get("https://www.youtube.com/watch?v=" + encodeURIComponent(videoId), {
-    timeout: 20000,
-    headers: { "User-Agent": YT_VISIONOS.ua },
-    validateStatus: () => true,
-    responseType: "text",
-    transformResponse: [(x) => x],
-  });
-  const html = String(r.data || "");
-  const km = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
-  const vm = html.match(/"VISITOR_DATA":"([^"]+)"/);
-  if (!km || !vm) throw new Error("yt: 无法从网页获取 API key / visitorData");
-  ytApiKey = km[1];
-  ytVisitorData = vm[1];
-  ytVisitorAt = Date.now();
-  return { key: ytApiKey, visitor: ytVisitorData };
+  if (ytBootInflight) return ytBootInflight;
+  ytBootInflight = (async () => {
+    const r = await axios_1.get("https://www.youtube.com/watch?v=" + encodeURIComponent(videoId), {
+      timeout: YT_NET_TIMEOUT,
+      headers: { "User-Agent": YT_VISIONOS.ua },
+      validateStatus: () => true,
+      responseType: "text",
+      transformResponse: [(x) => x],
+    });
+    const html = String(r.data || "");
+    const km = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
+    const vm = html.match(/"VISITOR_DATA":"([^"]+)"/);
+    if (!km || !vm) throw new Error("yt: 无法从网页获取 API key / visitorData");
+    ytApiKey = km[1];
+    ytVisitorData = vm[1];
+    ytVisitorAt = Date.now();
+    return { key: ytApiKey, visitor: ytVisitorData };
+  })();
+  try {
+    return await ytBootInflight;
+  } finally {
+    ytBootInflight = null;
+  }
 }
 
 /** 用 VISIONOS client 取 player 响应 */
 async function ytPlayerVisionos(videoId) {
-  const boot = await ytBootstrap(videoId);
+  /* bootstrap（抓 watch 页）本身也是网络请求，同样要过熔断 */
+  const boot = await ytGuard(() => ytBootstrap(videoId));
   const body = {
     context: {
       client: {
@@ -147,11 +334,11 @@ async function ytPlayerVisionos(videoId) {
     contentCheckOk: true,
     racyCheckOk: true,
   };
-  const r = await axios_1.post(
+  const r = await ytGuard(() => axios_1.post(
     "https://www.youtube.com/youtubei/v1/player?key=" + boot.key + "&prettyPrint=false",
     JSON.stringify(body),
     {
-      timeout: 20000,
+      timeout: YT_NET_TIMEOUT,
       headers: {
         "Content-Type": "application/json",
         "User-Agent": YT_VISIONOS.ua,
@@ -161,7 +348,7 @@ async function ytPlayerVisionos(videoId) {
       },
       validateStatus: () => true,
     }
-  );
+  ));
   const d = r.data || {};
   const ps = d.playabilityStatus || {};
   if (ps.status !== "OK") throw new Error("yt visionos: " + (ps.status || "?") + " " + String(ps.reason || "").slice(0, 40));
@@ -200,32 +387,44 @@ const YT_IOS = {
  * ============================================================ */
 let ytPubKeyCache = "";
 let ytPubKeyAt = 0;
+/* ⚠️ 同一个 key 常常被一串并发请求同时要（MB 专辑页一次并发 6~8 路）。
+   原来这里没有「飞行中」合并，每个调用都自己发一次首页请求 ——
+   YouTube 连不通时就是 8 个 20 秒超时叠着等，比串行还糟。
+   现在只允许一个在飞，其余全部等它的结果。 */
+let ytPubKeyInflight = null;
 async function ytPubKey() {
   if (ytPubKeyCache && Date.now() - ytPubKeyAt < 60 * 60 * 1000) return ytPubKeyCache;
-  const urls = [
-    "https://www.youtube.com/",
-    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-  ];
-  for (const u of urls) {
-    try {
-      const r = await axios_1.get(u, {
-        timeout: 15000,
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        },
-        validateStatus: () => true,
-        responseType: "text",
-        transformResponse: [(x) => x],
-      });
+  if (ytPubKeyInflight) return ytPubKeyInflight;
+  ytPubKeyInflight = (async () => {
+    /* 两个 url 并发发，谁先给出 key 用谁 —— 不串行等第一个超时再来第二个。 */
+    const urls = [
+      "https://www.youtube.com/",
+      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    ];
+    const tries = urls.map((u) => axios_1.get(u, {
+      timeout: YT_NET_TIMEOUT,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      },
+      validateStatus: () => true,
+      responseType: "text",
+      transformResponse: [(x) => x],
+    }).then((r) => {
       const m = String(r.data || "").match(/"INNERTUBE_API_KEY":"([^"]+)"/);
-      if (m && m[1]) {
-        ytPubKeyCache = m[1];
-        ytPubKeyAt = Date.now();
-        return ytPubKeyCache;
-      }
-    } catch (e) {}
+      return (m && m[1]) || "";
+    }).catch(() => ""));
+    const results = await Promise.all(tries);
+    const key = results.find(Boolean);
+    if (!key) throw new Error("yt: 无法从网页获取 innertube API key");
+    ytPubKeyCache = key;
+    ytPubKeyAt = Date.now();
+    return ytPubKeyCache;
+  })();
+  try {
+    return await ytPubKeyInflight;
+  } finally {
+    ytPubKeyInflight = null;
   }
-  throw new Error("yt: 无法从网页获取 innertube API key");
 }
 
 /* ============================================================
@@ -3711,7 +3910,7 @@ let ytmKey = "", ytmVisitor = "", ytmVer = "", ytmName = "67", ytmAt = 0;
 async function ytmBootstrap() {
   if (ytmKey && ytmVer && Date.now() - ytmAt < 30 * 60 * 1000) return;
   const r = await axios_1.get("https://music.youtube.com/", {
-    timeout: 20000, responseType: "text", transformResponse: [(x) => x],
+    timeout: YT_NET_TIMEOUT, responseType: "text", transformResponse: [(x) => x],
     headers: { "User-Agent": YTM_UA }, validateStatus: () => true,
   });
   const d = String(r.data || "");
@@ -3737,6 +3936,9 @@ function ytmCtx() {
 }
 
 async function ytmCall(path, body) {
+  /* YouTube Music 是另一套域名（music.youtube.com），但在「连不通 YouTube」的
+     网络下它同样连不通 —— 所以复用同一个熔断器，别让它绕过熔断再吃 20 秒。 */
+  ytGate();
   await ytmBootstrap();
   /* ⚠️ 调用方写的是 ytmCall("search", { context: ytmCtx(), ... })，
      而 ytmCtx() 在**传参前**就求值了 —— 首次运行时 bootstrap 还没跑，
@@ -3750,7 +3952,7 @@ async function ytmCall(path, body) {
     "https://music.youtube.com/youtubei/v1/" + path + "?prettyPrint=false&key=" + ytmKey,
     JSON.stringify(body),
     {
-      timeout: 20000, validateStatus: () => true,
+      timeout: YT_NET_TIMEOUT, validateStatus: () => true,
       headers: {
         "Content-Type": "application/json",
         "User-Agent": YTM_UA,
@@ -3762,14 +3964,22 @@ async function ytmCall(path, body) {
       },
     }
   );
-  let r = await send();
-  /* ⚠️ 冷启动陷阱：刚抓到的 visitorData 第一次请求**稳定**返回
-     404 "Requested entity was not found"（实测连打三次都是这个规律：
-     第一次 404、第二次 200）。这不是参数错，是这个 visitor 还没被激活。
-     所以 404 时原样重发一次，不要重建 bootstrap（重建会换新 visitor，又 404）。 */
-  if (r && r.status === 404) {
-    await new Promise((res) => setTimeout(res, 150));
+  let r;
+  try {
     r = await send();
+    /* ⚠️ 冷启动陷阱：刚抓到的 visitorData 第一次请求**稳定**返回
+       404 "Requested entity was not found"（实测连打三次都是这个规律：
+       第一次 404、第二次 200）。这不是参数错，是这个 visitor 还没被激活。
+       所以 404 时原样重发一次，不要重建 bootstrap（重建会换新 visitor，又 404）。 */
+    if (r && r.status === 404) {
+      await new Promise((res) => setTimeout(res, 150));
+      r = await send();
+    }
+    /* 拿到响应就算网络通了（哪怕 4xx/5xx 是业务问题，也说明连得上） */
+    ytOk();
+  } catch (e) {
+    ytFail(e);
+    throw e;
   }
   return r.data;
 }
@@ -3841,8 +4051,38 @@ function ytmRowToTrack(v, artistFallback, albumFallback) {
 
 /** 搜歌手 → 拿艺人 channelId（只认 MUSIC_PAGE_TYPE_ARTIST 的那条） */
 async function ytmFindArtist(name) {
+  const cands = await ytmFindCandidates(name).catch(function () { return []; });
+  return cands.length ? cands[0] : null;
+}
+
+/** 同上的完整版：返回排好序的候选列表（YTM 常把本地化名/同名号的
+    真身排在后面，上游要能拿第 2、第 3 个再复核一次）。 */
+/* 后台预取目录：搜索结果里先把活派下去，不等结果。
+   用户在结果列表里停一下、或直接点进歌手页时，目录基本已经拉好了。
+   同一个名字不重复派（用 in-flight 表挡住）。 */
+const YTM_PREFETCHING = {};
+function ytmPrefetch(name, onDone) {
   const q = String(name || "").trim();
-  if (!q) return null;
+  if (!q) return;
+  const ck = "ytm:" + singerNorm(q);
+  if (YTM_CAT_CACHE[ck] || YTM_PREFETCHING[ck]) return;
+  YTM_PREFETCHING[ck] = true;
+  Promise.resolve()
+    .then(function () { return ytmArtistCatalog(q); })
+    .then(function (v) {
+      /* 把官方名/作品数写回那个歌手条目 —— 用户点进去时就能直接命中目录，
+         不必再拿频道名去猜（YTM 的命名本地化对不上，得走慢路）。 */
+      if (v && typeof onDone === "function") {
+        try { onDone(v); } catch (e) { /* 忽略 */ }
+      }
+    })
+    .catch(function () { /* 失败就算了，真点进去时再取 */ })
+    .then(function () { delete YTM_PREFETCHING[ck]; });
+}
+
+async function ytmFindCandidates(name) {
+  const q = String(name || "").trim();
+  if (!q) return [];
   /* ⚠️ params 是「只看艺人」的过滤位，实测 EgWKAQIgAWoKEAkQBRAKEAMQBA%3D%3D
      能稳定只回艺人。不过过滤失效时下面还会再按 pageType 兜一遍。 */
   const d = await ytmCall("search", {
@@ -3864,12 +4104,24 @@ async function ytmFindArtist(name) {
       v.flexColumns[0].musicResponsiveListItemFlexColumnRenderer &&
       v.flexColumns[0].musicResponsiveListItemFlexColumnRenderer.text) ||
       (v.title && ytmRuns(v.title)) || "";
-    /* ⚠️ 名字必须真正相等 —— 搜「李志」YouTube 也会回「李志多」，
-       那是另一个人（1 个订阅者）。跟别处同一道闸。 */
-    if (singerNorm(nm) !== want) continue;
+    /* ⚠️ 名字校验（2026-10-21 重写，这是「歌手列表卡死」的深层原因）：
+       原来要求 singerNorm(nm) === want 全等，但 YTM 会把艺人名**本地化**：
+         宇多田ヒカル →「宇多田光」   前 3 字重合，后面假名和中文对不上
+         L'Arc-en-Ciel →「彩虹樂團」  一个字都不重合
+       全等一律拒绝 → ytmArtistCatalog 返回 null → 退回「逐首搜 YouTube」，
+       109 首要 28 秒。而 YTM 目录的曲目**自带 videoId**，拿到就直接能播。
+       所以这里只做粗筛：全等、跟查询有 2 字公共前缀、或者排在前三位
+       （YTM 的 artist 搜索本来就按相关度排）都收进来；
+       真正挡住「李志多」的是最后那段「全等优先」挑选。 */
+    const __exact = singerNorm(nm) === want;
+    const __q = flatTitle(q);
+    const __n = flatTitle(nm);
+    let __share = 0;
+    while (__share < __q.length && __share < __n.length && __q[__share] === __n[__share]) __share++;
+    if (!__exact && __share < 2 && i > 2) continue;
     const s = JSON.stringify(v);
     const subs = (s.match(/\"text\":\"([\d.,]+[KMB]? subscribers?)\"/) || [])[1] || "";
-    cands.push({ id: id, name: nm, subs: subs });
+    cands.push({ id: id, name: nm, subs: subs, exact: __exact });
   }
   if (!cands.length) return null;
   /* 同名多个频道时取订阅数最大的 —— 真身 39.4K，山寨 1 个。 */
@@ -3880,8 +4132,26 @@ async function ytmFindArtist(name) {
     const u = (m[2] || "").toUpperCase();
     return u === "K" ? n * 1e3 : u === "M" ? n * 1e6 : u === "B" ? n * 1e9 : n;
   };
-  cands.sort((a, b) => num(b.subs) - num(a.subs));
-  return cands[0];
+  /* 挑选规则（2026-10-21）：
+     ① 有全等的 → 只在全等里挑订阅数最大的（真身 39.4K，山寨 1 个）
+     ② 没有全等的（YTM 给的是本地化名）→ 按「前缀重合字数」排序，
+        重合多的在前，同分再看订阅数。
+        ⚠️ 不能只看「排第一位」：实测搜 L'Arc-en-Ciel，第一条是
+           「Georges Aubanel, Ensemble vocal "L'arc en ciel"」——
+           一个唱诗班，只有 6 首，而真身「彩虹樂團」有 73 张专辑。
+           所以按 shared 排完还要让上游按目录规模复核一遍。 */
+  const __q2 = flatTitle(q);
+  cands.sort(function (a, b) {
+    if (b.exact !== a.exact) return (b.exact ? 1 : 0) - (a.exact ? 1 : 0);
+    const an = flatTitle(a.name), bn = flatTitle(b.name);
+    let as = 0, bs = 0;
+    while (as < __q2.length && as < an.length && __q2[as] === an[as]) as++;
+    while (bs < __q2.length && bs < bn.length && __q2[bs] === bn[bs]) bs++;
+    if (bs !== as) return bs - as;
+    return num(b.subs) - num(a.subs);
+  });
+  /* 前 3 个交给上游复核（按目录规模挑），全等的若在第一名就直接定。 */
+  return cands.slice(0, 3);
 }
 
 /**
@@ -3968,12 +4238,92 @@ const YTM_CAT_TTL = 60 * 60 * 1000;
 
 /* getArtistWorks 的结果缓存（2026-10-21 修「歌手列表卡死」）。
    起因：YouTube 频道路径要**逐首**去 YouTube 搜「歌名 + 频道名」配音源，
-   宇多田ヒカル这种 86 首目录实测 17~22 秒，而 MusicFree 进歌手页
+   实测「宇多田ヒカル」109 首 = 28 秒，而 MusicFree 进歌手页
    会把歌曲页和专辑页各调一次、每次挂载再来一遍 —— 以前零缓存，
-   等于每切一个标签就重跑 20 秒，用户看到的就是整页卡死。
+   等于每切一个标签就重跑 28 秒，用户看到的就是整页卡死。
    按「频道名 + 类型」缓存 30 分钟，第二次起 0 秒。 */
 const ARTIST_WORKS_CACHE = {};
 const ARTIST_WORKS_TTL = 30 * 60 * 1000;
+
+/* 逐首匹配 YouTube 音源的时间预算与并发。
+   ⚠️ 光有缓存不够 —— 首屏那一次仍要等满 28 秒，用户在那就是干等。
+     所以改成「预算内先给一页，剩下的后台继续」：
+       · 预算 8 秒：够匹配大约 30~40 首，首屏能立刻看到东西
+       · 并发 12：实测 16 路并发 2.5 秒返回，8 路要 1.7 秒才 4 条，12 路是最稳的折中
+       · 后台继续跑完后覆盖缓存（full=true），下次进来就是完整的
+   这个数组是「哪些频道的后台补齐还在跑」，避免重复开任务。 */
+const YT_MATCH_BUDGET_MS = 6000;
+const YT_MATCH_CONC = 12;
+const YT_BG_RUNNING = {};
+
+/** 目录里的一首 → 去 YouTube 搜到官方音源并落库。命中不了就安静放弃。 */
+async function ytMatchOneTrack(t, chName, chNorm, pushTrack) {
+  const wantN = normTextZ(t.title);
+  if (!wantN) return;
+  /* YouTube 标题里的标点跟 Apple 经常对不上 ——
+     Apple「沒有的, 啊!?」/ YouTube「沒有的 啊」，
+     逗号问号感叹号都得去掉才比得上。 */
+  const wantBare = wantN.replace(/[.,!?;:'"·、。，！？；：…—–\-]/g, "");
+  let list = [];
+  try { list = await ytSearchRaw(t.title + " " + chName); } catch (e) { return; }
+  let best = null, bestSc = -Infinity;
+  for (let j = 0; j < (list || []).length; j++) {
+    const y = list[j];
+    const yn = normTextZ(y.title || "");
+    if (!yn) continue;
+    const yBare = yn.replace(/[.,!?;:'"·、。，！？；：…—–\-]/g, "");
+    // 子串匹配放宽到「去标点后互相包含」
+    const hitTitle = yn.indexOf(wantN) >= 0 || wantN.indexOf(yn) >= 0 ||
+                     (wantBare && yBare.indexOf(wantBare) >= 0) ||
+                     (wantBare && wantBare.indexOf(yBare) >= 0 && yBare.length >= 2);
+    if (!hitTitle) continue;
+    let sc = 0;
+    /* 「xxx - Topic」是 YouTube 给唱片公司自动生成的官方音频频道，
+       这是最硬的信号 —— 单这一项就够把翻唱/歌词版全甩开。 */
+    if (/[-–—]\s*Topic\s*$/i.test(String(y.artist || ""))) sc += 100;
+    const ch = String(y.artist || "").replace(/\s*[-–—]\s*Topic\s*$/i, "").trim();
+    if (flatTitle(ch) === chNorm) sc += 40;
+    if (yn === wantN) sc += 30;
+    else if (yBare === wantBare) sc += 25;      // 只是标点不同，算同一首
+    else sc -= Math.max(0, yn.length - wantN.length);
+    if (/歌词|歌詞|lyrics|cover|翻唱|remix|dj|伴奏|纯享|純享|live|現場|现场/i.test(y.title || "")) sc -= 60;
+    const sec = ytDurSec(y.durationText);
+    if (sec > 0 && t.dur > 0) {
+      const d = Math.abs(sec - Math.round(t.dur / 1000));
+      sc += d <= 12 ? 40 : (d <= 40 ? 5 : -100);
+    }
+    if (sc > bestSc) { bestSc = sc; best = y; }
+  }
+  // 分数 <= 0 说明只是标题撞字（没有 Topic、没有频道名对得上），宁可不要
+  if (!best || bestSc <= 0) return;
+  /* 时长优先用 Apple 的官方值 —— YouTube 搜索结果的 lengthText
+     经常是空的（界面会显示 00:00），有官方值就别去逐首探 player 了，
+     省掉每首一次请求。 */
+  pushTrack(best, t.album, t.dur || (ytDurSec(best.durationText) * 1000));
+}
+
+/** 按并发批量匹配，到 deadline 就停。返回「已经处理到第几首」。 */
+async function ytMatchTracksBudgeted(tracks, chName, chNorm, pushTrack, deadline) {
+  for (let i = 0; i < tracks.length; i += YT_MATCH_CONC) {
+    if (Date.now() > deadline) return i;
+    const batch = tracks.slice(i, i + YT_MATCH_CONC);
+    await Promise.all(batch.map((t) => ytMatchOneTrack(t, chName, chNorm, pushTrack)));
+  }
+  return tracks.length;
+}
+
+/** 预算烧完了，剩下的在后台接着匹配，跑完把缓存标记成完整。 */
+function ytMatchContinueInBackground(rest, chName, chNorm, pushTrack, chKey) {
+  if (!rest.length || YT_BG_RUNNING[chKey]) return;
+  YT_BG_RUNNING[chKey] = true;
+  ytMatchTracksBudgeted(rest, chName, chNorm, pushTrack, Date.now() + 180000)
+    .catch(function () { /* 后台失败就算了，首屏那份数据还在 */ })
+    .then(function () {
+      delete YT_BG_RUNNING[chKey];
+      const e = ARTIST_WORKS_CACHE[chKey];
+      if (e && e.data) { e.full = true; e.at = Date.now(); }
+    });
+}
 
 async function ytmArtistCatalog(name) {
   const q = String(name || "").trim();
@@ -3981,9 +4331,33 @@ async function ytmArtistCatalog(name) {
   const ck = "ytm:" + singerNorm(q);
   const hit = YTM_CAT_CACHE[ck];
   if (hit && Date.now() - hit.at < YTM_CAT_TTL) return hit.v;
-  try {
-    const art = await ytmFindArtist(q);
-    if (!art) return null;
+
+  /* ---- 候选复核（2026-10-21）----
+     YTM 对拉丁名会返回一堆同名的东西，而它自己的排序不靠谱：
+     搜 L'Arc-en-Ciel，第一条是「Georges Aubanel, Ensemble vocal
+     "L'arc en ciel"」（一个唱诗班，1 张 6 首），真身「彩虹樂團」
+     73 张专辑排在后面。只看第一条就会把真身当成 6 首的小号。
+     所以：拿到候选后，如果这份目录薄得可疑（<15 首），换下一个候选再试，
+     最多试 3 个，取曲目最多的那份。目录厚的（李志 114 首）第一次就定，
+     不会多花请求。 */
+  const cands = await ytmFindCandidates(q).catch(function () { return []; });
+  if (!cands.length) return null;
+  let bestV = null;
+  for (let ci = 0; ci < Math.min(cands.length, 3); ci++) {
+    const v = await buildYtmCatalog(cands[ci]).catch(function () { return null; });
+    if (!v) continue;
+    if (!bestV || v.tracks.length > bestV.tracks.length) bestV = v;
+    if (bestV.tracks.length >= 15) break;   // 够厚了，不再试
+  }
+  if (!bestV) return null;
+  YTM_CAT_CACHE[ck] = { at: Date.now(), v: bestV };
+  return bestV;
+}
+
+/** 一个候选 → 完整目录（专辑 + 曲目 + 热门）。原来 ytmArtistCatalog 的正文。 */
+async function buildYtmCatalog(art) {
+  if (!art) return null;
+  {
     const al = await ytmArtistAlbums(art.id);
     if (!al.albums.length) return null;
     /* 热门歌曲跟专辑列表并发拉 —— 但 ytmArtistAlbums 已经用了同一个 browse，
@@ -4072,10 +4446,7 @@ async function ytmArtistCatalog(name) {
       _src: "ytm",
       full: true, complete: tracks.length >= 15,
     };
-    YTM_CAT_CACHE[ck] = { at: Date.now(), v: v };
     return v;
-  } catch (e) {
-    return null;
   }
 }
 
@@ -4511,11 +4882,14 @@ function mergeMbAlbums(cat, list) {
 
 async function ytSearchRaw(query) {
   const c = YT_ANDROID;
-  const r = await axios_1.post(
-    "https://www.youtube.com/youtubei/v1/search?key=" + (await ytPubKey()) + "&prettyPrint=false",
-    JSON.stringify({ context: ytCtx(c), query: query }),
-    { timeout: 20000, headers: ytHeaders(c), validateStatus: () => true }
-  );
+  const r = await ytGuard(async () => {
+    const key = await ytPubKey();
+    return axios_1.post(
+      "https://www.youtube.com/youtubei/v1/search?key=" + key + "&prettyPrint=false",
+      JSON.stringify({ context: ytCtx(c), query: query }),
+      { timeout: YT_NET_TIMEOUT, headers: ytHeaders(c), validateStatus: () => true }
+    );
+  });
   const out = [];
   // 递归遍历响应树，捞出所有 videoRenderer
   (function walk(o, d) {
@@ -4608,11 +4982,16 @@ function ytRank(list, want) {
 
 async function ytPlayer(videoId, client) {
   const c = client || YT_ANDROID;
-  const r = await axios_1.post(
-    "https://www.youtube.com/youtubei/v1/player?key=" + (await ytPubKey()) + "&prettyPrint=false",
-    JSON.stringify({ context: ytCtx(c), videoId: videoId, contentCheckOk: true, racyCheckOk: true }),
-    { timeout: 20000, headers: ytHeaders(c), validateStatus: () => true }
-  );
+  /* ⚠️ 熔断只包**网络那一层**：下面的 playabilityStatus 判失败是业务结论
+     （视频下架/地区限制），说明网络是通的，不能让它们把熔断器点亮。 */
+  const r = await ytGuard(async () => {
+    const key = await ytPubKey();
+    return axios_1.post(
+      "https://www.youtube.com/youtubei/v1/player?key=" + key + "&prettyPrint=false",
+      JSON.stringify({ context: ytCtx(c), videoId: videoId, contentCheckOk: true, racyCheckOk: true }),
+      { timeout: YT_NET_TIMEOUT, headers: ytHeaders(c), validateStatus: () => true }
+    );
+  });
   const d = r.data || {};
   const ps = d.playabilityStatus || {};
   if (ps.status !== "OK") throw new Error("yt: " + (ps.status || "?") + " " + String(ps.reason || "").slice(0, 40));
@@ -5287,6 +5666,18 @@ function biliHeaders() {
 }
 
 async function biliSearch(keyword, page, zone) {
+  biliGate();
+  try {
+    const out = await biliSearchInner(keyword, page, zone);
+    biliOk();                 // 能走到这里说明没被风控（搜不到结果是正常的）
+    return out;
+  } catch (e) {
+    biliFail(e);
+    throw e;
+  }
+}
+
+async function biliSearchInner(keyword, page, zone) {
   await biliEnsureCookie();
   await biliEnsureWbi();
   /* 主路径：签名后的 search/type。
@@ -5300,7 +5691,17 @@ async function biliSearch(keyword, page, zone) {
       search_type: "video", keyword: keyword, page: String(page || 1),
       page_size: "50", order: "totalrank", web_location: "1430654",
     }, extra || {});
-    const url = "https://api.bilibili.com/x/web-interface/search/type?" + biliSign(params);
+    /* ⚠️ 必须打 `/wbi/` 版端点。
+       2026-10-21 复查：`/x/web-interface/search/type` 即使带上正确的 w_rid
+       也一律 -412，实测对照（同一个 buvid3、同一套请求头、同一秒）：
+         /x/web-interface/search/type      → -412 request was banned
+         /x/web-interface/wbi/search/type  → code 0，50 条
+         /x/web-interface/wbi/search/all/v2→ code 0，12 条
+       也就是说 B 站把搜索整体迁到了带 /wbi/ 前缀的新路径上，
+       老路径只剩一个永远拒绝的壳。以前没发现是因为当时老路径还能用，
+       现在它彻底废了 —— B 站搜索全挂，等于赵薇这类只有 B 站有音源的
+       歌手每一首都要走一遍注定失败的兜底，点播放就卡在转圈上。 */
+    const url = "https://api.bilibili.com/x/web-interface/wbi/search/type?" + biliSign(params);
     const r = await axios_1.get(url, {
       timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
     });
@@ -5316,7 +5717,8 @@ async function biliSearch(keyword, page, zone) {
       keyword: keyword, page: String(page || 1),
       order: "totalrank", web_location: "1430654",
     }, extra || {});
-    const url = "https://api.bilibili.com/x/web-interface/search/all/v2?" + biliSign(params);
+    /* 同 call()：all/v2 也只有 /wbi/ 版能用，老路径 -412。 */
+    const url = "https://api.bilibili.com/x/web-interface/wbi/search/all/v2?" + biliSign(params);
     const r = await axios_1.get(url, {
       timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
     });
@@ -7328,8 +7730,11 @@ async function searchArtist(query, page) {
   const baseP = Promise.all([
     kuwoSearchTyped(query, "artist", page, KUWO_PAGE_SIZE).catch(() => ({ total: 0, list: [] })),
     miguSearchTyped(query, "singer", page, 10).catch(() => ({ total: 0, list: [] })),
-    // 冷门独立乐团在酷我/咪咕根本没有条目，只有 YouTube 的官方 Topic 频道路过
-    page === 1 ? ytSearchRaw(query).catch(() => []) : Promise.resolve([]),
+    /* 冷门独立乐团在酷我/咪咕根本没有条目，只有 YouTube 的官方 Topic 频道路过。
+       ⚠️ 但 YouTube 只是六路之一，不能让它独占整次搜索的完成时间：
+         连不通时这条要等 8 秒，用户就是「搜个名字 10 秒才出结果」。
+         给它 2.5 秒软时限 —— 迟到就丢，其它五路先交卷。 */
+    page === 1 ? ytSoft(ytSearchRaw(query).catch(() => []), 2500, []) : Promise.resolve([]),
     /* 网易云 / 酷狗 / QQ 三路补进来（2026-10-20）。
        原来只有酷我+咪咕，搜「周杰伦」只回一条、搜「五月天」还冒出山寨号。
        ⚠️ 三路都带超时：QQ 实测 1.4~1.5 秒，跟酷我同批并发不会拖慢整次搜索
@@ -7360,7 +7765,7 @@ async function searchArtist(query, page) {
     const [kw2, mg2, yt2, ne2, kgs2, qqs2] = await Promise.all([
       kuwoSearchTyped(eq, "artist", page, KUWO_PAGE_SIZE).catch(() => ({ total: 0, list: [] })),
       miguSearchTyped(eq, "singer", page, 10).catch(() => ({ total: 0, list: [] })),
-      page === 1 ? ytSearchRaw(eq).catch(() => []) : Promise.resolve([]),
+      page === 1 ? ytSoft(ytSearchRaw(eq).catch(() => []), 2500, []) : Promise.resolve([]),
       neteaseSearchArtist(eq, page, 10).catch(() => []),
       kugouSearchSinger(eq, page, 10).catch(() => []),
       qqSearchArtist(eq, page, 10).catch(() => []),
@@ -7564,11 +7969,41 @@ async function searchArtist(query, page) {
          界面上会写「6 首」，可这团实际有 31 首。有 Apple 目录就用它的曲目数。
          （catalog 有 1 小时缓存，getArtistWorks 里再取是命中缓存，不会再打请求） */
       let worksNum = a.n;
-      try {
-        const c = await appleArtistCatalog(a.name);
-        if (c && c.tracks && c.tracks.length > worksNum) worksNum = c.tracks.length;
-      } catch (e) { /* 拿不到就按搜到的条数 */ }
-      out.push({
+      /* ⚠️ 顺手把 YTM 目录也拿一次（有 1 小时缓存，点进歌手页时就是命中缓存）：
+           ① 作品数用目录里的真实曲目数，别显示「6 首」
+           ② 把目录认出来的**官方艺人名**记在 _ytmName 上 ——
+              YTM 会把名字本地化（宇多田ヒカル → 宇多田光、
+              L'Arc-en-Ciel → 彩虹樂團），点进歌手页时如果拿 YouTube
+              频道名去反查，对不上还得再走一次搜索 + 逐首匹配（7 秒）。
+              带上官方名 + channelId，进页面直接命中目录，0 秒。 */
+      let ytmName = "";
+      let ytmCh = "";
+      /* ⚠️ 这里**不能**等 YTM 目录（2026-10-21 踩过）：拉一次目录要 3~4 秒
+         （它要逐张专辑翻曲目），放在搜索结果里同步跑，搜「彩虹乐队」
+         直接从 5 秒涨到 16 秒 —— 卡死只是从歌手页挪到了搜索框，没解决问题。
+         改成「有缓存就用（点过一次的那位），没有就后台预取，
+         本次先用 Apple 目录顶上」。等用户真点进去时缓存已经在了。 */
+      const catCk = "ytm:" + singerNorm(a.name);
+      const catHit = YTM_CAT_CACHE[catCk];
+      if (catHit && catHit.v) {
+        if (catHit.v.tracks.length > worksNum) worksNum = catHit.v.tracks.length;
+        ytmName = catHit.v.name || "";
+        ytmCh = catHit.v.id || "";
+      } else {
+        /* 目录还没好，但**艺人搜索只要 0.5 秒**，而且能立刻给出官方名
+           （宇多田ヒカル → 宇多田光）。拿到名字就够了 —— 后面的曲目表
+           交给后台预取，用户点进去时通常已经拼好。 */
+        try {
+          const cs = await Promise.race([
+            ytmFindCandidates(a.name),
+            new Promise(function (res) { setTimeout(function () { res(null); }, 1200); }),
+          ]);
+          if (cs && cs.length) { ytmName = cs[0].name || ""; ytmCh = cs[0].id || ""; }
+        } catch (e) { /* 拿不到就算了 */ }
+      }
+      /* 条目先建出来，后台拿到目录后再补字段 —— 这样搜索结果能立刻返回，
+         而用户点到这个条目时，_ytmName 一般已经就位了。 */
+      const entry = {
         id: id,
         platform: "YouTube",
         name: a.name,
@@ -7576,6 +8011,21 @@ async function searchArtist(query, page) {
         worksNum: worksNum,
         description: "",
         _provider: "youtube",
+        _ytmName: ytmName || undefined,
+        /* ⚠️ _ytmCh 是「走目录切片」那条快路的开关（getArtistWorks 第一分支），
+           必须跟 _ytmName 一起给。只给名字不给 ch → 掉到 ytch 那条
+           「按频道名搜 + 逐首匹配」的慢路，还是 3~5 秒。 */
+        _ytmCh: ytmCh || ytmName || undefined,
+      };
+      out.push(entry);
+      /* 无论有没有名字都派一次预取：目录才是真正的数据源（曲目自带 videoId），
+         用户点进去时它应该已经就绪。已经有缓存/在跑时这个调用是空转。 */
+      ytmPrefetch(a.name, function (v) {
+        entry._ytmName = v.name || undefined;
+        entry._ytmCh = v.id || undefined;
+        if (v.tracks && v.tracks.length > Number(entry.worksNum || 0)) {
+          entry.worksNum = v.tracks.length;
+        }
       });
     }
   }
@@ -10353,10 +10803,11 @@ function ytWebCtx() {
 }
 
 async function ytNext(continuation) {
+  ytGate();
   const r = await axios_1.post(
     "https://www.youtube.com/youtubei/v1/next?prettyPrint=false",
     JSON.stringify({ context: ytWebCtx(), continuation: continuation }),
-    { timeout: 25000, headers: { "User-Agent": YT_WEB_UA, "Content-Type": "application/json" }, validateStatus: () => true }
+    { timeout: YT_NET_TIMEOUT, headers: { "User-Agent": YT_WEB_UA, "Content-Type": "application/json" }, validateStatus: () => true }
   );
   return r.data || {};
 }
@@ -10433,7 +10884,7 @@ async function youtubeComments(videoId, page) {
        这个坑踩过，别改成纯 API 调用。 */
     const r = await axios_1.get(
       "https://www.youtube.com/watch?v=" + encodeURIComponent(videoId) + "&hl=zh-CN",
-      { timeout: 30000, headers: { "User-Agent": YT_WEB_UA }, validateStatus: () => true }
+      { timeout: YT_NET_TIMEOUT, headers: { "User-Agent": YT_WEB_UA }, validateStatus: () => true }
     );
     const html = String(r.data || "");
     const m = html.match(/ytInitialData\s*=\s*(\{.+?\});/s);
@@ -11127,6 +11578,24 @@ async function getAlbumDetail(albumItem, page) {
     const CONC = 6;
     for (let i = 0; i < tracks.length; i += CONC) {
       const batch = tracks.slice(i, i + CONC);
+      /* ⚠️ YouTube 已熔断（这条网络到不了它）→ 这一批不再发请求，
+         直接按「没匹配到」处理。
+         ⚠️ 不能 break：break 会把剩余曲目整段丢掉，列表就少一大截
+            （正是《双》只剩 4 首那类事故）。这里要的是「曲目全在、
+            只是没有 YouTube 音源 id」，播放时走跨平台兜底。 */
+      if (ytIsOpen()) {
+        for (let j = 0; j < batch.length; j++) musicList.push({
+          id: mbTrackId(artistName, batch[j].title),
+          platform: "MusicBrainz",
+          title: batch[j].title,
+          artist: artistName,
+          album: albumTitle,
+          artwork: albumItem.artwork || "",
+          duration: Number(batch[j].duration || 0),
+          _provider: "mb",
+        });
+        continue;
+      }
       const parts = await Promise.all(batch.map(async function (t) {
         const tn = normTextZ(t.title);
         const tBare = tn.replace(/[.,!?;:'"·、。，！？；：…—–\-]/g, "");
@@ -11632,20 +12101,26 @@ async function getArtistWorksOf(artistItem, page, type) {
      直接在目录缓存上切片，不再去打任何平台接口。 */
   if (artistItem._ytmCh) {
     try {
-      const cat = await ytmArtistCatalog(artistItem.name || "");
-      if (cat && (cat.albums.length || cat.tracks.length)) {
+      /* ⚠️ 查目录要用**官方艺人名**（_ytmName），不能用条目的显示名：
+         显示名常常是 YouTube 频道名（Hikaru Utada / L'Arc-en-Ciel），
+         而 YTM 目录里存的是本地化名（宇多田光 / 彩虹樂團），
+         拿显示名去查每次都对不上 → 每次调用都重走一遍完整搜索（5~7 秒）。
+         这就是「切个标签又转半天」的最后一个来源。 */
+      const catNames = [];
+      if (artistItem._ytmName) catNames.push(artistItem._ytmName);
+      if (artistItem.name && artistItem.name !== artistItem._ytmName) catNames.push(artistItem.name);
+      let cat = null;
+      for (let i = 0; i < catNames.length; i++) {
+        cat = await ytmArtistCatalog(catNames[i]).catch(function () { return null; });
+        if (cat && (cat.albums.length || cat.tracks.length)) break;
+        cat = null;
+      }
+      if (cat) {
         const rn0 = 30;
         const begin0 = ((page || 1) - 1) * rn0;
-        if (type === "album") {
-          return {
-            isEnd: begin0 + rn0 >= cat.albums.length,
-            data: cat.albums.slice(begin0, begin0 + rn0),
-          };
-        }
-        return {
-          isEnd: begin0 + rn0 >= cat.tracks.length,
-          data: cat.tracks.slice(begin0, begin0 + rn0),
-        };
+        const arr = type === "album" ? cat.albums : cat.tracks;
+        /* 目录里的曲目自带 videoId，直接就是可播条目 —— 不用再走逐首匹配。 */
+        return { isEnd: begin0 + rn0 >= arr.length, data: arr.slice(begin0, begin0 + rn0) };
       }
     } catch (e) { /* 落到下面的通用链路 */ }
   }
@@ -11876,13 +12351,47 @@ async function getArtistWorksOf(artistItem, page, type) {
           Apple 只给 19 首，YTM 有 73 张 109 首 —— 而且两边都是「歌名 → YouTube
           搜官方音源」的同一条路子，YTM 的曲目表本来就从 YouTube 上抓的，
           命中率只会更高。这条要花 15 秒左右，但那种目录量级的歌手本来就这样。 */
+    /* ⚠️ 查目录用**官方艺人名**，不是 YouTube 频道名（2026-10-21）：
+       YTM 会把名字本地化 —— 频道叫「Hikaru Utada」，YTM 目录里叫「宇多田光」；
+       频道叫「L'Arc-en-Ciel」，目录里叫「彩虹樂團」。
+       拿频道名去查，对不上就得走「按相关度猜 + 差目录复核」那条慢路（多花 4 秒），
+       还会把目录弄错人。搜索时已经把官方名和 channelId 记在条目上了，直接用。 */
+    /* ⚠️ 搜索时派出去的后台预取可能还没跑完（拉一份目录要 4~6 秒）。
+       用户搜完立刻点进来就会撞上这个窗口 —— 这里最多等 2.5 秒，
+       等到了就是全量目录（145 首，曲目自带 videoId，之后再无任何请求）；
+       等不到就按原来的路走。用户能感知的等待仍只有这一次，
+       而不再是「每次切标签都重跑」。 */
+    let catName = String(artistItem._ytmName || "");
+    if (!catName) {
+      const pc = "ytm:" + singerNorm(chName);
+      if (YTM_PREFETCHING[pc]) {
+        for (let w = 0; w < 5; w++) {
+          await new Promise(function (res) { setTimeout(res, 500); });
+          const e = YTM_CAT_CACHE[pc];
+          if (e && e.v) { catName = e.v.name || ""; break; }
+          if (!YTM_PREFETCHING[pc]) break;
+        }
+      }
+      if (!catName) {
+        const e = YTM_CAT_CACHE[pc];
+        if (e && e.v) catName = e.v.name || "";
+      }
+    }
+    if (!catName) catName = chName;
     let cat = await appleArtistCatalog(chName);
     if (!cat || cat.tracks.length < 30) {
       try {
-        const ycat = await Promise.race([
-          ytmArtistCatalog(chName).catch(function () { return null; }),
-          new Promise(function (res) { setTimeout(function () { res(null); }, 9000); }),
-        ]);
+        /* 两个名字都试：条目上带着官方名时只用它；没带（搜索结果里目录
+           还没拉好）就先试频道名，再试原查询。已经有缓存的那次是 0 毫秒。 */
+        const names = catName !== chName ? [catName, chName] : [chName];
+        let ycat = null;
+        for (let ni = 0; ni < names.length; ni++) {
+          ycat = await Promise.race([
+            ytmArtistCatalog(names[ni]).catch(function () { return null; }),
+            new Promise(function (res) { setTimeout(function () { res(null); }, 9000); }),
+          ]);
+          if (ycat && ycat.tracks && ycat.tracks.length) break;
+        }
         if (ycat && ycat.tracks.length > (!cat ? 0 : cat.tracks.length)) {
           console.log("[粽子] Apple 目录「" + chName + "」"
             + (!cat ? "无" : cat.tracks.length + " 首") + " → 改用 YouTube Music "
@@ -11938,60 +12447,20 @@ async function getArtistWorksOf(artistItem, page, type) {
     }
 
     if (cat && cat.tracks && cat.tracks.length) {
-      const CONC = 8;   // YouTube 这边并发开大会被限流
-      for (let i = 0; i < cat.tracks.length; i += CONC) {
-        const batch = cat.tracks.slice(i, i + CONC);
-        await Promise.all(batch.map(async (t) => {
-          const wantN = normTextZ(t.title);
-          if (!wantN) return;
-          /* 目录条目自带 YouTube videoId（YTM 那条路）→ 直接落库，
-             不必再搜一次去找它自己的视频。这是 20 秒 → 1 秒的关键。 */
-          if (t.vid) {
-            pushTrack({ id: t.vid, title: t.title, artwork: t.artwork || "" },
-              t.album, t.dur || 0);
-            return;
-          }
-          /* YouTube 标题里的标点跟 Apple 经常对不上 ——
-             Apple「沒有的, 啊!?」/ YouTube「沒有的 啊」，
-             逗号问号感叹号都得去掉才比得上。 */
-          const wantBare = wantN.replace(/[.,!?;:'"·、。，！？；：…—–\-]/g, "");
-          let list = [];
-          try { list = await ytSearchRaw(t.title + " " + chName); } catch (e) { return; }
-          let best = null, bestSc = -Infinity;
-          for (let j = 0; j < (list || []).length; j++) {
-            const y = list[j];
-            const yn = normTextZ(y.title || "");
-            if (!yn) continue;
-            const yBare = yn.replace(/[.,!?;:'"·、。，！？；：…—–\-]/g, "");
-            // 子串匹配放宽到「去标点后互相包含」
-            const hitTitle = yn.indexOf(wantN) >= 0 || wantN.indexOf(yn) >= 0 ||
-                             (wantBare && yBare.indexOf(wantBare) >= 0) ||
-                             (wantBare && wantBare.indexOf(yBare) >= 0 && yBare.length >= 2);
-            if (!hitTitle) continue;
-            let sc = 0;
-            /* 「xxx - Topic」是 YouTube 给唱片公司自动生成的官方音频频道，
-               这是最硬的信号 —— 单这一项就够把翻唱/歌词版全甩开。 */
-            if (/[-–—]\s*Topic\s*$/i.test(String(y.artist || ""))) sc += 100;
-            const ch = String(y.artist || "").replace(/\s*[-–—]\s*Topic\s*$/i, "").trim();
-            if (flatTitle(ch) === chNorm) sc += 40;
-            if (yn === wantN) sc += 30;
-            else if (yBare === wantBare) sc += 25;      // 只是标点不同，算同一首
-            else sc -= Math.max(0, yn.length - wantN.length);
-            if (/歌词|歌詞|lyrics|cover|翻唱|remix|dj|伴奏|纯享|純享|live|現場|现场/i.test(y.title || "")) sc -= 60;
-            const sec = ytDurSec(y.durationText);
-            if (sec > 0 && t.dur > 0) {
-              const d = Math.abs(sec - Math.round(t.dur / 1000));
-              sc += d <= 12 ? 40 : (d <= 40 ? 5 : -100);
-            }
-            if (sc > bestSc) { bestSc = sc; best = y; }
-          }
-          // 分数 <= 0 说明只是标题撞字（没有 Topic、没有频道名对得上），宁可不要
-          if (!best || bestSc <= 0) return;
-          /* 时长优先用 Apple 的官方值 —— YouTube 搜索结果的 lengthText
-             经常是空的（界面会显示 00:00），有官方值就别去逐首探 player 了，
-             省掉每首一次请求。 */
-          pushTrack(best, t.album, t.dur || (ytDurSec(best.durationText) * 1000));
-        }));
+      /* 自带 videoId 的（YTM 目录）直接落库，占比越高越省时间。 */
+      const need = [];
+      for (let i = 0; i < cat.tracks.length; i++) {
+        const t = cat.tracks[i];
+        if (t.vid) pushTrack({ id: t.vid, title: t.title, artwork: t.artwork || "" },
+          t.album, t.dur || 0);
+        else need.push(t);
+      }
+      /* ⚠️ 别一口气等完（2026-10-21）：109 首要 28 秒，用户早在转圈里点返回了。
+         预算内先给一页能立刻用的，剩下的后台补，补完写回缓存。 */
+      const deadline = Date.now() + YT_MATCH_BUDGET_MS;
+      const done = await ytMatchTracksBudgeted(need, chName, chNorm, pushTrack, deadline);
+      if (done < need.length) {
+        ytMatchContinueInBackground(need.slice(done), chName, chNorm, pushTrack, chKey);
       }
     }
 
@@ -13497,6 +13966,12 @@ async function searchMusicAll(query, page) {
           }
           break;
         }
+        /* YouTube 已熔断 → 这一路（逐首去 YouTube 搜官方音源）整个作废，
+           直接收手。缺的曲目交给其它平台兜底，不要每批再空转一次。 */
+        if (ytIsOpen()) {
+          console.log("[粽子] YouTube 已熔断，跳过 Apple 目录逐首补全 " + missing.length + " 首");
+          break;
+        }
         const batch = missing.slice(i, i + CONC);
         /* 批内并发不变，但**整批套一个剩余预算的时限**：
            到点就收手，已经 push 进 conn 的照样用 —— 结果是一条一条
@@ -14216,13 +14691,31 @@ async function resolveMediaSource(musicItem, quality) {
     );
   }
   /* 兜底总闸：再慢也不能让用户干等。20 秒内一条都过不了验收就放弃，
-     下面照旧走「只给片段 / 全平台失败」两条收尾路径。 */
-  const FB_DEADLINE = 20000;
+     下面照旧走「只给片段 / 全平台失败」两条收尾路径。
+
+     ⚠️ 2026-10-21 修：这个 deadline 以前根本没生效。
+        旧写法是 `while (… && Date.now() - fbStart < FB_DEADLINE)`，
+        闸门只在**两次 await 之间**检查一次；而 `Promise.race` 本身没有超时 ——
+        只要所有 runner 都慢慢失败，race 就一直挂着，一挂就是最慢那个平台的全程。
+        实测（把 YouTube 打成不可达）：赵薇 77 首**每一首**都等满 90 秒才报错，
+        播放器那边早就放弃并跳下一首了，用户看到的正是「点进去每首歌都卡死」。
+        现在 race 自己带一个「到 deadline 就结束」的竞争项，闸门才真的管用。 */
+  /* 20s → 12s。实测兜底命中几乎都在 0.5~3 秒内（B 站 500~900ms、
+     YouTube 1~2s），只有「所有平台一起挂」才会走满。而 20 秒这个量级
+     用户感受就是「点了没反应」，播放器那边也早跳下一首了。
+     12 秒仍然给慢网留了 4 倍于典型耗时的余量。 */
+  const FB_DEADLINE = 12000;
   const fbStart = Date.now();
   const waiting = runners.slice();
+  let deadlineHit;
+  const deadlineGate = new Promise((resolve) => {
+    const t = setTimeout(() => resolve(null), FB_DEADLINE);
+    deadlineHit = () => clearTimeout(t);
+  });
   while (waiting.length && Date.now() - fbStart < FB_DEADLINE) {
     let r;
-    try { r = await Promise.race(waiting); } catch (e) { break; }
+    try { r = await Promise.race(waiting.concat([deadlineGate])); } catch (e) { break; }
+    if (r === null) break;                    // 到点，别再等了
     // 把已经回来的这个从候选里摘掉（按数组身份，不按平台名 ——
     // 同一个平台可能出现在多个槽位）
     for (let k = 0; k < waiting.length; k++) {
@@ -14231,11 +14724,13 @@ async function resolveMediaSource(musicItem, quality) {
     if (r.err) { errors.push("兜底" + r.p + ": " + r.err.message); continue; }
     const okUrl = await accept(r.u, "兜底" + r.p);
     if (okUrl) {
+      deadlineHit();
       console.log("[粽子] 兜底命中: " + provider + " → " + r.p + " 《" + want.name + "》"
         + "（" + (Date.now() - fbStart) + "ms）");
       return { url: okUrl };
     }
   }
+  deadlineHit();
 
   // 3) 全平台都只给片段 → 退回片段，别让用户点了报错
   if (previewOnly) {
@@ -14802,7 +15297,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.38",
+  version: "4.10.39",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
