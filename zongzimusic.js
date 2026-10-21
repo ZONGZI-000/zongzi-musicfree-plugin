@@ -5430,16 +5430,21 @@ async function fetchRange(url, start, end, extraHeaders, timeoutMs) {
  *
  * ⚠️ 必须分块并发下载：整文件单请求会被 YouTube 卡死 70 秒后 abort。
  */
-async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes) {
+async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, deadlineMs) {
   const size = Number(sizeHint || 0);
   const cap = Number(maxBytes) || YT_INLINE_MAX_BYTES;
   if (!size || size > cap) return null;
 
   /* 整首的硬 deadline（见 INLINE_TOTAL_DEADLINE 的说明）。
      到点就整体放弃内联、让调用方把流式地址直给播放器 ——
-     用户点下去要的是「一秒内出声」，不是「等十秒然后一首完美的内存音频」。 */
+     用户点下去要的是「一秒内出声」，不是「等十秒然后一首完美的内存音频」。
+
+     deadlineMs 可选：B 站「无 mcdn → 必须内联」那条路要传更长的值。
+     默认 6 秒是按「1~2MB 的歌」定的，4MB 的歌在慢网下 6 秒并不够；
+     而那条路没有流式备选，放弃内联就等于这首歌播不了。 */
+  const deadline = Number(deadlineMs) > 0 ? Number(deadlineMs) : INLINE_TOTAL_DEADLINE;
   const t0 = Date.now();
-  const remain = () => INLINE_TOTAL_DEADLINE - (Date.now() - t0);
+  const remain = () => deadline - (Date.now() - t0);
 
   // 先拉第一块确认能下、并验魔数（省得白下整首才发现是错误页）
   const tFirst = Date.now();
@@ -5468,7 +5473,7 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes) {
      门槛定太紧就会把「内联 8 秒能下完」误判成没戏，全都推去流式，
      结果就是能一次播干净的歌反而开始每 2 秒卡。
      这里只拦真正没救的（预估 20 秒以上），其余交给下面的硬 deadline。 */
-  if (firstMs > 800 && estTotalMs > INLINE_TOTAL_DEADLINE * 2.5) return null;
+  if (firstMs > 800 && estTotalMs > deadline * 2.5) return null;
   {
     const x = (i) => first[i] || 0;
     const okHead =
@@ -6120,16 +6125,19 @@ const BILI_INLINE_MAX_BYTES = 400 * 1024;
  *   实测 4MB 音频（内联后 5.3MB 字符串）用户反馈就是「整个 App 无响应、
  *   无法切歌」；1.5MB（2MB 字符串）是能感觉到顿挫但还能用。
  *
- *   2.5MB（≈3.3MB 字符串）是这两者之间的折中：
- *   B 站音频体积中位数 ~4MB，1.5MB 只能覆盖不到三分之一，
- *   剩下的会整条判失败（实测「周杰伦-晴天」这类热门曲目 2.2~3.1MB，
- *   全被 1.5MB 卡掉，表现就是「点了没反应、最后没播放」）。
+ *   实测 B 站音频体积：中位数 ~4MB，热门曲目普遍 2~3MB，
+ *   冷门/短片段 1MB 以下。所以上限取 4MB（≈5.3MB 字符串）：
+ *   少于这个数的大部分条目都覆盖得到。
  *
- *   ⚠️ 这是**只在没有 mcdn 节点时**才走的路 —— 有 mcdn 就直接流式，
- *   根本不内联。所以正常热门视频不会付这个代价。
+ *   ⚠️ 4MB 恰好就是「整个 App 无响应」那个量级 —— 但那是**当时所有条目
+ *   都无条件内联**造成的（包括能流式的）。现在只在「没有 mcdn 节点、
+ *   流式必 403」时才走到这里，等于用「一次 2~3 秒的等待」
+ *   换「本来根本播不了」。两害相权，播不了更糟。
+ *
+ *   ⚠️ 预取（_prefetchMode）不走这里：见 shouldInlineBili。
  *
  *   mcdn 条目**不**走这个上限：它们能流式，没必要内联。 */
-const BILI_INLINE_FALLBACK_MAX = 2500 * 1024;
+const BILI_INLINE_FALLBACK_MAX = 4000 * 1024;
 
 function shouldInlineBili() {
   /* 预取阶段一律不内联：那时候用户还没点播放，
@@ -6228,7 +6236,10 @@ async function biliFetchUrl(bvid, quality) {
           宁可让这一首走跨平台兜底，也不能把主线程拖死。 */
     if (shouldInlineBili() && pr.total && pr.total <= BILI_INLINE_FALLBACK_MAX) {
       try {
-        const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(), BILI_INLINE_FALLBACK_MAX);
+        /* deadline 给 15 秒：这条路没有流式备选（upos 对播放器 UA 必 403），
+           内联失败就等于这首歌播不了。而 4MB 在 5G 限速下确实要好一会儿。 */
+        const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(),
+          BILI_INLINE_FALLBACK_MAX, 15000);
         if (dataUri) {
           console.log("[粽子] B站无 mcdn 节点，已内联 " + (pr.total / 1024).toFixed(0) + "KB");
           return dataUri;
@@ -6246,9 +6257,13 @@ async function biliFetchUrl(bvid, quality) {
       errors.push("无mcdn且" + (pr.total / 1024 / 1024).toFixed(1) + "MB过大");
       break;
     }
-    /* 内联也失败（慢网/超时）→ 把流式地址交出去赌一次，
-       反正它至少比「直接报错」有机会播。 */
-    return u;
+    /* ⚠️ 内联失败（慢网/超时）—— **不能**把这条 upos 地址交出去。
+       实测过：upos 对 stagefright/ijkplayer 一律 403，交给播放器就是
+       「点了没声音 / 播两秒跳下一首」，比起直接报错更让用户困惑。
+       抛错退出，让 resolveBilibili 去搜别的条目（通常有 mcdn 或更短的版本），
+       实在没有就走跨平台兜底 —— 至少别把一条明知会 403 的地址塞给播放器。 */
+    errors.push("无mcdn且内联失败");
+    continue;
   }
   throw new Error("bili: 没有可播的音频节点（试过 " + errors.join("/") + "）");
 }
@@ -15021,9 +15036,15 @@ function mediaCacheForget(item) {
 function isUaGatedUrl(url) {
   const u = String(url || "");
   if (!u || u.indexOf("data:") === 0) return false;
-  return /(^|\.)upos-[a-z0-9-]*\.bilivideo\.(com|cn)/i.test(u) ||
-         /\.edge\.mountaintoys\.cn/i.test(u) ||
-         /(^|\.)bilivideo\.com\/upgcxcode\//i.test(u);
+  /* ⚠️ 必须对 **host** 做匹配，不能对整条 URL 做。
+     踩过：正则写成 `(^|\.)upos-…`，而完整 URL 里 host 前面是 `/`
+     （`https://upos-sz-mirrorhw.bilivideo.com/…`），`^` 和 `\.` 都对不上，
+     于是这个判断永远返回 false —— 修复看起来加了，实际一条也没拦住。 */
+  let host = "";
+  try { host = String(new URL(u).host || ""); } catch (e) { return false; }
+  return /^upos-[a-z0-9-]*\.bilivideo\.(com|cn)$/i.test(host) ||
+         /(^|\.)edge\.mountaintoys\.cn$/i.test(host) ||
+         /^upos-[a-z0-9-]*\.akamaized\.net$/i.test(host);
 }
 
 /* ------------------------------------------------------------
@@ -16180,7 +16201,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.49",
+  version: "4.10.50",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
