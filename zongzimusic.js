@@ -945,7 +945,13 @@ async function probeAudio(url, extraHeaders, timeoutMs) {
   if (String(url).indexOf("data:") === 0) return { ok: true, total: 0 };
   /* B 站 CDN 必须带 Referer，否则 403。这里统一补，省得每个调用点都记着传。 */
   if (!extraHeaders && /bilivideo/.test(String(url))) extraHeaders = { Referer: "https://www.bilibili.com/" };
-  const hit = _audioProbeCache[url];
+  /* ⚠️ 2026-10-21：缓存键必须带上探活用的 UA。
+     B 站 upos 系 CDN 按 User-Agent 做防盗链：同一条地址桌面 UA
+     206、手机播放器 UA 403。只用 URL 当键，就会出现「桌面探过、
+     手机直接命中缓存」—— 又一次变成「我这边测没问题」。 */
+  const probeUa = String((extraHeaders && extraHeaders["User-Agent"]) || UA);
+  const probeKey = url + "|" + probeUa;
+  const hit = _audioProbeCache[probeKey];
   if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.v;
   const out = { ok: false, total: 0 };
   try {
@@ -978,7 +984,7 @@ async function probeAudio(url, extraHeaders, timeoutMs) {
       if (m) out.total = parseInt(m[1], 10) || 0;
     }
   } catch (e) { /* 探不到就当不可播 */ }
-  _audioProbeCache[url] = { at: Date.now(), v: out };
+  _audioProbeCache[probeKey] = { at: Date.now(), v: out };
   return out;
 }
 
@@ -6200,6 +6206,9 @@ function biliGuichuEntries() {
 /* bvid → cid 只查一次：dash 和 html5 直出两条路都要用，
    各查一遍纯属白等一个请求（慢网下 1~3 秒）。 */
 const BILI_CID_CACHE = {};
+/* 顺手存一下总时长：判「hts�oml5 这条路能不能实时播」就靠它算带宽需求
+   （体积 ÷ 时长）。已经拿到的响应里就有 duration，不多打一次请求。 */
+const BILI_DUR_CACHE = {};
 async function biliCid(bvid) {
   if (BILI_CID_CACHE[bvid]) return BILI_CID_CACHE[bvid];
   await biliEnsureCookie();
@@ -6209,6 +6218,7 @@ async function biliCid(bvid) {
   const vd = vr.data || {};
   if (vd.code !== 0) throw new Error("bili view: " + vd.code);
   BILI_CID_CACHE[bvid] = vd.data.cid;
+  BILI_DUR_CACHE[bvid] = Number(vd.data.duration || 0);
   return vd.data.cid;
 }
 
@@ -6362,7 +6372,10 @@ async function biliHtml5Direct(bvid, wantHigh) {
   if (!du || !du.url) throw new Error("html5: 无 durl（code=" + (r.data && r.data.code) + "）");
   const pr = await probeAudio(du.url, BILI_CDN_HEADERS());
   if (!pr.ok) throw new Error("html5: 直链探活失败");
-  return du.url;
+  /* ⚠️ 返回体积（不只是 URL）：durl 是带视频轨的渐进 mp4，
+     同一首能从 2.4MB 涨到 47MB。调用方必须先算「实时需要多少带宽」
+     才能决定要不要直接交给播放器。 */
+  return { url: du.url, size: Number(du.size || pr.total || 0) };
 }
 
 async function biliFetchUrl(bvid, quality) {
@@ -6404,6 +6417,29 @@ async function biliFetchUrl(bvid, quality) {
    *   冷门视频走 PCDN 可能慢一点，但它不会 403。
    */
   const isUaFree = (u) => /\.mcdn\.bilivideo\.(cn|com)/i.test(String(u || ""));
+
+  /* ⚠️⚠️ 2026-10-21 九改 —— 「我这边测没问题」的根源：**探活用的 UA 不是播放器的 UA**。
+   *
+   *   B 站 upos 集群按 User-Agent 做防盗链，实测同一条地址：
+   *     Mozilla/微软 / okhttp / ExoPlayerLib/2.18.1 / 空 UA      → 206
+   *     stagefright / ijkplayer / Lavf / Dalvik / 安卓 Chrome        → 403
+   *   插件自己探活用的是桌面 Mozilla UA，所以**永远验得通**；
+   *   而手机上的播放器带的恰好是停止那几条 → 403 → 无声。
+   *
+   *   注意：堆起来看 / 实测数据显示，html5 durl 另一条链路对 UA 的要求和 dash 不一样
+   *   （它拒 ijkplayer/Lavf，但放行 stagefright/ExoPlayer/Dalvik/AppleCoreMedia）。
+   *   所以正确做法是：**用一条「像手机播放器的 UA」去体检每一条地址**，
+   *   通不过的就算桌面 UA 能拉也不能交给播放器。
+   *
+   *   选这条（ExoPlayer + Android）当反向指标：它在 dash 上 5/5 全 403，
+   *   在 html5 durl 上 5/5 全 206 —— 恰好能把两条链路区分开。 */
+  const PLAYER_UA = "ExoPlayerLib/2.18.1 (Linux; Android 13)";
+  const biliHeadersFor = (ua) => ({ Referer: "https://www.bilibili.com/", "User-Agent": ua || PLAYER_UA });
+  /* 用「播放器 UA」探一次：这条地址交给手机能不能拉得动。 */
+  const probeAsPlayer = async (u) => {
+    if (!u) return { ok: false, total: 0 };
+    return await probeAudio(u, biliHeadersFor(PLAYER_UA));
+  };
   /* ⚠️ 候选要**跨所有码率档**收集。B 站每档（64k/132k/192k…）各带 3 个 CDN，
      但不是每档都有 mcdn —— 实测同一条视频 132k 档全是 upos，
      192k 档里才有 mcdn。只在选中的那一档里找，就会出现
@@ -6441,73 +6477,125 @@ async function biliFetchUrl(bvid, quality) {
    *   所以顺序改成：mcdn 优先（不变）→ dash 能取到字节就直接交出去 →
    *   dash 全部不可用才走 html5（体积大，只当救命稻草）。
    *   upos 的 UA 风险改由「先按小体积内联」兜住，见下面 ②。 */
-  let dashBest = null;
+  /* ──── 主选择器（v4.10.59 重写）────
+   *
+   * 旧版本的核心错误：它用**桌面 UA** 探活，探通就直接把地址交给播放器。
+   * 而 B 站 upos 是按 UA 拦的：桌面 206、手机播放器 403。
+   * 于是插件永远「测着没问题」，用户永远「点了没声音」。
+   *
+   * 现在按「可不可能被播放器拉走」从强到弱排序：
+   *   ① mcdn 节点         不验 UA，直接流式，最快也最稳
+   *   ② upos 小体积         整首内联成 data: URI，零网络请求，UA 再坏也不影响
+   *   ③ html5 durl 流式  它对 UA 的要求和 dash 完全不同（放行 stagefright/ExoPlayer/Dalvik）
+   *   ④ upos 大体积流式  最后手段：播放器若能保留我们给的桌面 UA 就能播
+   *
+   * 带宽预算一律用「体积 ÷ 时长」（实时需求）去比实测链路吞吐。
+   */
+  const durSec = Number(BILI_DUR_CACHE[bvid] || 0) || 0;
+  const bpsNow = linkBps();                       // 0 = 尚未知
+  /* 这条地址实时播放需要多少带宽（字节/秒） */
+  const needBps = (size) => (durSec > 0 ? Number(size || 0) / durSec : 0);
+  /* 带宽是否够用：未知就放行（宁可先给播放器试），
+     已知时要求至少 1.3 倍余量。 */
+  const fitsBandwidth = (size) => {
+    const need = needBps(size);
+    if (!need || !bpsNow) return true;
+    return bpsNow >= need * 1.3;
+  };
+
+  const inlineTried = [];
+  /* ① mcdn（不验 UA）—— 和旧行为一致 */
   for (let k = 0; k < candidates.length; k++) {
     const u = candidates[k].u;
-    const uaFree = isUaFree(u);
-    // B 站 CDN 必须带 Referer，否则 403
+    if (!isUaFree(u)) continue;
+    const pr = await probeAudio(u, BILI_CDN_HEADERS());
+    if (!pr.ok) { errors.push("mcdn#" + candidates[k].idx); continue; }
+    if (shouldInlineBili() && pr.total && pr.total <= BILI_INLINE_MAX_BYTES) {
+      try {
+        const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(), BILI_INLINE_MAX_BYTES);
+        if (dataUri) return dataUri;
+      } catch (e) { /* 失败就退回流式 */ }
+    }
+    console.log("[粽子] B站 mcdn 直出（不验 UA）");
+    return u;
+  }
+
+  /* ② upos 小体积 → 整首内联。
+        这是唯一不受 UA 影响的方式，而且 BILI_INLINE_MAX_BYTES 已经
+        把主线程假死的风险算进去了（2.5MB 封顶）。 */
+  let uposStreamBest = null;
+  for (let k = 0; k < candidates.length; k++) {
+    const u = candidates[k].u;
+    if (isUaFree(u)) continue;
     const pr = await probeAudio(u, BILI_CDN_HEADERS());
     if (!pr.ok) { errors.push(Math.round(candidates[k].bw / 1000) + "k#" + candidates[k].idx); continue; }
+    if (!uposStreamBest) uposStreamBest = { url: u, bw: candidates[k].bw, total: pr.total || 0 };
 
-    /* ① 不校验 UA 的节点 → 直接流式交给播放器，最省事也最稳。
-          （小文件照旧内联，省掉开头的缓冲） */
-    if (uaFree) {
-      if (shouldInlineBili() && pr.total && pr.total <= BILI_INLINE_MAX_BYTES) {
-        try {
-          const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(), BILI_INLINE_MAX_BYTES);
-          if (dataUri) return dataUri;
-        } catch (e) { /* 失败就退回流式 */ }
+    if (!shouldInlineBili()) continue;
+    if (!pr.total || pr.total > BILI_INLINE_MAX_BYTES) continue;
+    /* 慢网下内联一首 2MB 要半分钟，不值得 —— 交给 ③/④ */
+    if (linkHopeless(pr.total, INLINE_TOTAL_DEADLINE_NO_STREAM)) continue;
+    try {
+      const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(),
+        BILI_INLINE_MAX_BYTES, INLINE_TOTAL_DEADLINE_NO_STREAM);
+      if (dataUri) {
+        console.log("[粽子] B站 upos 已内联 " + (pr.total / 1024).toFixed(0) + "KB（免 UA 风险）");
+        return dataUri;
       }
-      return u;
-    }
+      inlineTried.push(pr.total);
+    } catch (e) { inlineTried.push(pr.total); }
+  }
 
-    /* ② upos 节点 → 记下来，扫完再决定。**绝不在这里内联**：
-          实测这一档也有 2.7MB，内联成 3.7MB 的 data: 串就是「一点就假死」
-          （BILI_INLINE_MAX_BYTES 上方记的那次事故）。转圈和假死只能选一个，
-          所以选小的那个 —— 流式，体积是 html5 的 1/3~1/8。 */
-    if (!dashBest) dashBest = { url: u, bw: candidates[k].bw, total: pr.total || 0 };
-  }
-  /* dash 只要有一条真能取到字节，就直接流式交出去。
-     ⚠️ 关于「upos 会按 UA 403」：逐个换 UA 实测过一整批 CDN，
-        只有 Lavf 和空 UA 是 403，ExoPlayer / AppleCoreMedia / okhttp /
-        Dalvik / 桌面 UA 全部 206 —— 而手机端播放器带的正是前几种。
-        当初整条绕去 html5 的那次判断，代价是体积涨 4~14 倍，
-        在 57KB/s 的网下等于永远缓冲不够。这里改回走 dash。 */
-  if (dashBest) {
-    console.log("[粽子] B站走 dash 流式（" + Math.round(dashBest.bw / 1000) + "k / "
-      + (dashBest.total / 1048576).toFixed(2) + "MB），跳过 html5");
-    return dashBest.url;
-  }
-  /* dash 一个都探不通（真 403 / 真过期）→ 才换 html5 直出。
-     ⚠️ 这一步不受 BILI_INLINE_FALLBACK_MAX 限制：durl 是流式的，
-        体积再大也不需要插件下载、不需要 base64，播放器边下边播。
-        旧代码在这里因为「4MB 太大」直接判死，赵薇《天使旅行箱》
-        半张专辑就是这么变成「所有平台均失败」的。 */
+  /* ③ html5 durl 流式。
+        它和 dash 的 UA 黑名单**不一样**：实测 stagefright / ExoPlayerLib /
+        Dalvik / AppleCoreMedia 全都 206，只拒 ijkplayer 和 Lavf。
+        交给手机播放器的命中率远高于 dash。
+        代价是带着一条低画质视频轨：实测 2.4MB ~ 47MB 不等，
+        所以必须先算实时带宽需求 —— 不够就不能硬上。 */
   try {
-    const u5 = await biliHtml5Direct(bvid, false);
-    console.log("[粽子] B站 dash 全不可用，改走 html5 直出（qn16）");
-    return u5;
+    const h5 = await biliHtml5Direct(bvid, false);
+    const h5ok = await probeAsPlayer(h5.url);
+    if (h5ok.ok && fitsBandwidth(h5.size)) {
+      console.log("[粽子] B站 dash 被 UA 拦截，改走 html5 直出（"
+        + (h5.size / 1048576).toFixed(2) + "MB / 实时需 "
+        + Math.round(needBps(h5.size) / 1024) + "KB/s）");
+      return h5.url;
+    }
+    if (h5ok.ok) {
+      errors.push("html5带宽不够(" + Math.round(needBps(h5.size) / 1024) + "KB/s)");
+    } else {
+      errors.push("html5对UA也拒");
+    }
   } catch (e) {
     errors.push("html5直出: " + (e && e.message));
   }
 
-  /* ③ 兜底老路：整首下载内联。html5 也拿不到时才走到这，
-        而且只在体积可控时做 —— 几 MB 的 base64 会拖死主线程。 */
+  /* ④ 次优：大体积但真正可播的 dash 流式。
+        uposStreamBest 是用**桌面 UA** 探通的，而我们已经知道这类链接
+        对手机播放器的 UA 大多会 403。所以它不能当首选 ——
+        必须先用「播放器 UA」验一遍，验过了才敢交出去。 */
+  if (uposStreamBest) {
+    const playerOK = await probeAsPlayer(uposStreamBest.url);
+    if (playerOK.ok) {
+      console.log("[粽子] B站 dash 流式通过播放器 UA 检验（"
+        + Math.round(uposStreamBest.bw / 1000) + "k）");
+      return uposStreamBest.url;
+    }
+    console.log("[粽子] B站 dash 对播放器 UA 报 403，继续找能播的");
+  }
+
+  /* ④b 内联路也试过不行 → 最后用小体积内联硬保底 */
   for (let k = 0; k < candidates.length; k++) {
     const u = candidates[k].u;
     const pr = await probeAudio(u, BILI_CDN_HEADERS());
     if (!pr.ok || !pr.total || pr.total > BILI_INLINE_FALLBACK_MAX) continue;
     if (!shouldInlineBili()) break;
-    /* ⚠️ 慢网下这里同样不该硬等 15 秒。html5 直出已经失败才走到这，
-       说明没有流式备选 —— 但已知链路连 4MB 都下不完时，
-       与其让用户干等 15 秒再报「所有平台均失败」，
-       不如早点换下一个候选（大小更小的档）。 */
     if (linkHopeless(pr.total, 15000)) continue;
     try {
       const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(),
         BILI_INLINE_FALLBACK_MAX, 15000);
       if (dataUri) {
-        console.log("[粽子] B站无 mcdn 节点，已内联 " + (pr.total / 1024).toFixed(0) + "KB");
+        console.log("[粽子] B站兜底内联 " + (pr.total / 1024).toFixed(0) + "KB");
         return dataUri;
       }
     } catch (e) { /* 继续找下一档 */ }
@@ -16723,7 +16811,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.58",
+  version: "4.10.59",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
