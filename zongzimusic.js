@@ -373,6 +373,114 @@ const COVER_RE = /翻唱|翻自|改编自|改編自|重唱|cover|カバー|커�
 
 
 /* ============================================================
+ * 内地已下架歌手 —— 直达海外通道
+ *
+ * 实测（2026-10-21，找赵薇 2004 年那张《飘》）：
+ *   QQ 搜「赵薇 飘」返回的 10 条全是孙露、杨胖雨、赵乃吉的翻唱；
+ *   网易按歌手搜只剩「赵薇薇」这个同名空壳；咪咕返回一堆无关的歌；
+ *   酷狗 0 条；JOOX 0 条；Apple 台湾/香港/日本/美国四个区
+ *   都只有 2007 年那张《天使旅行箱》，没有《飘》。
+ *   真正有原版音源的只有 B 站和 YouTube。
+ *
+ * 对这些歌手，内地五家平台**直接不发请求**：
+ *   ① 省掉一路同名翻唱噪声 —— 搜「赵薇」时前十条全是别人翻的
+ *      「赵薇女版」，真原唱被挤到后面，用户还以为搜错了；
+ *   ② 兜底时少五路必然超时的平台，点播放从 20 秒闸门降到 2 秒级。
+ *
+ * ⚠️ 名单只放「在内地平台整体搜不到本人」的，不是「我不喜欢」的。
+ *    判据是歌手名命中，不是歌名 —— 《飘》这种同名歌在别的歌手那里还有效。
+ * ============================================================ */
+const DELISTED_ARTISTS_BUILTIN = [
+  "赵薇",        // 2021 年起内地全平台下架
+  "李志",        // 2019 年起内地全平台下架
+  "陈升",
+  "黄耀明",
+  "何韵诗",
+  "达明一派",
+];
+
+/** 下架歌手要跳过的平台（内地五家）。搜和兜底共用这一份，
+ *  免得以后改漏一处。 */
+const DELISTED_SKIP_PLATFORMS = ["netease", "qq", "kugou", "migu", "kuwo", "miguapi"];
+
+/** 是否启用「下架歌手直达海外」（默认开，可用 delistedDirect=0 关掉） */
+function shouldDelistedDirect() {
+  try {
+    const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
+    const v = vars.delistedDirect;
+    if (v === undefined || v === null || v === "") return true;
+    return !(v === "0" || v === "false" || v === "off");
+  } catch (e) { return true; }
+}
+
+/** 名单：内置 + 用户自己填的（delistedArtists，逗号/顿号/空格分隔） */
+function delistedArtists() {
+  let out = DELISTED_ARTISTS_BUILTIN.slice();
+  try {
+    const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
+    const extra = String(vars.delistedArtists || "").split(/[,，、\s]+/);
+    for (let i = 0; i < extra.length; i++) {
+      const raw = extra[i].trim();
+      if (!raw) continue;
+      /* 前面加 ! = 从名单里去掉（内置名单猜错了的时候用）。
+         「!李志」→ 李志不再跳过内地五家。 */
+      if (raw.charAt(0) === "!") {
+        const kill = normTextZ(raw.slice(1));
+        if (kill) out = out.filter((x) => normTextZ(x) !== kill);
+        continue;
+      }
+      const n = normTextZ(raw);
+      if (n && n.length >= 2) out.push(raw);
+    }
+  } catch (e) { /* 读不到变量就当只有内置名单 */ }
+  return out;
+}
+
+/** 这段文字里出现了哪位下架歌手（原文写法），没有就返回空串。
+ *
+ *  两种命中方式，缺一不可：
+ *   ① **整段等于人名**：「赵薇」「李志」这类纯歌手名查询，以及
+ *      「赵薇《一直下雨的星期天》」把标点摊成空格之后的那个「赵薇」
+ *   ② 右边界校验过的包含：标题里写「李志 - 天空之城」时靠它
+ *
+ *  ⚠️ 只做 ② 是不够的（2026-10-21 实测踩到）：搜「赵薇 飘」时，
+ *     归一化之后整串是「赵薇飘」，cjkTailOk 会把它读成「查询词 + 一个字」，
+ *     判成「赵薇飘」这个三字人名，于是下架歌手规则整条不生效 ——
+ *     内地五家照样被问，返回一堆翻唱。所以查询词必须先按分隔符拆开看。 */
+function delistedArtistOf(text) {
+  const raw = toSimplified(String(text || ""));
+  if (!raw) return "";
+  /* 只留汉字/字母/数字，其余（空格、书名号、破折号、括号…）一律当分隔符。
+     这样「赵薇《一直下雨的星期天》」「赵薇-飘」「赵薇 feat. 某某」
+     都会拆出独立的「赵薇」。 */
+  const tokens = raw.split(/[^\u4e00-\u9fffA-Za-z0-9]+/).filter(Boolean);
+  const list = delistedArtists();
+  for (let i = 0; i < list.length; i++) {
+    const name = list[i];
+    const n = normTextZ(name);
+    if (!n || n.length < 2) continue;
+    // ① 有哪一段正好就是这个人名
+    for (let k = 0; k < tokens.length; k++) {
+      if (normTextZ(tokens[k]) === n) return name;
+    }
+    // ② 包含且右边界合法（「李志 - 天空之城」「李志的天空之城」）
+    const t = normTextZ(raw);
+    let from = 0;
+    while (true) {
+      const at = t.indexOf(n, from);
+      if (at < 0) break;
+      /* ⚠️ 必须做右边界校验，否则搜「赵薇薇」也会被当成赵薇，
+         然后内地五家全被跳过 —— 那首歌在内地其实好好地能听。
+         这里直接用排序层那套 cjkTailOk：多一个汉字就是另一个人。 */
+      if (cjkTailOk(t, at, n.length)) return name;
+      from = at + 1;
+    }
+  }
+  return "";
+}
+
+
+/* ============================================================
  * 听书 / 有声书 / 广播剧 过滤
  *
  * 实测污染源（2026-10-17，逐平台量化）：
@@ -7300,7 +7408,9 @@ async function searchArtist(query, page) {
       name: nm,
       avatar: pic,
       worksNum: Number(a.SONGNUM || a.ALBUMNUM || 0),
-      fans: Number(a.SHOW || 0),
+      // 粉丝数只在有真实数据时才给 —— 平台没有这个字段时宁可空着，
+      // 否则界面会显示一个假的「0 位粉丝」，看着像坏数据。
+      ...(Number(a.SHOW || 0) > 0 ? { fans: Number(a.SHOW) } : {}),
       description: String(a.desc || "").replace(/&nbsp;/g, " "),
       _provider: "kuwo",
     });
@@ -7332,7 +7442,6 @@ async function searchArtist(query, page) {
       name: nm,
       avatar: (imgs[0] && imgs[0].img) || "",
       worksNum: 0,
-      fans: 0,
       description: "",
       _provider: "miguapi",
     });
@@ -7369,7 +7478,6 @@ async function searchArtist(query, page) {
       avatar: a.avatar,
       worksNum: a.worksNum,
       albumNum: a.albumNum,
-      fans: 0,
       description: "",
       _provider: "netease",
     });
@@ -7387,7 +7495,6 @@ async function searchArtist(query, page) {
       avatar: a.avatar,
       worksNum: 0,
       albumNum: 0,
-      fans: 0,
       description: "",
       _provider: "kugou",
     });
@@ -7405,7 +7512,6 @@ async function searchArtist(query, page) {
       avatar: a.avatar,
       worksNum: a.worksNum,
       albumNum: a.albumNum,
-      fans: 0,
       description: "",
       _provider: "qq",
     });
@@ -7459,7 +7565,6 @@ async function searchArtist(query, page) {
         name: a.name,
         avatar: a.avatar,
         worksNum: worksNum,
-        fans: 0,
         description: "",
         _provider: "youtube",
       });
@@ -7509,7 +7614,6 @@ async function searchArtist(query, page) {
           name: cat.name || eq,
           avatar: (cat.albums[0] && cat.albums[0].artwork) || "",
           worksNum: worksNum,
-          fans: 0,
           description: "",
           _provider: "apple",
         });
@@ -7533,7 +7637,6 @@ async function searchArtist(query, page) {
             avatar: (cat.albums[0] && cat.albums[0].artwork) || "",
             worksNum: cat.tracks.length || cat.albums.length,
             albumNum: cat.albums.length,
-            fans: 0,
             description: "",
             _provider: "youtube",
             _ytmCh: cat.id,
@@ -12285,16 +12388,29 @@ async function searchMusicAll(query, page) {
    * 分两批的本意是躲酷狗的随机限流，但那个问题已经用重试解决了，
    * 没必要再牺牲速度。
    * ============================================================ */
-  const jobs = [
-    mk("netease", () => cocoSearch("netease", query)),
-    mk("qq", () => cocoSearch("qq", query)),
-    mk("kugou", () => cocoSearch("kugou", query)),
-    mk("migu", () => cocoSearch("migu", query)),
-    mk("kuwo", () => kuwoOfficialSearch(query, 10)),
-  ];
+  /* 这次搜的是不是「内地已下架」的歌手（赵薇、李志…）。是的话内地五家
+     直接不发请求：它们对内地的这类歌手只剩同名翻唱和空壳歌手库，
+     发过去只会拿噪声把真原唱挤下去，还多等几秒超时。
+     判据只看歌手名字，不看歌名 —— 见 delistedArtistOf 的注释。 */
+  const delisted = shouldDelistedDirect() ? delistedArtistOf(query) : "";
+  if (delisted) {
+    console.log("[粽子] 「" + query + "」命中下架歌手「" + delisted
+      + "」→ 跳过内地五家，直连 B 站 / YouTube");
+  }
+
+  const jobs = [];
+  if (!delisted) {
+    jobs.push(
+      mk("netease", () => cocoSearch("netease", query)),
+      mk("qq", () => cocoSearch("qq", query)),
+      mk("kugou", () => cocoSearch("kugou", query)),
+      mk("migu", () => cocoSearch("migu", query)),
+      mk("kuwo", () => kuwoOfficialSearch(query, 10))
+    );
+  }
 
   // JOOX 只在配了 Cookie 时参与
-  if (getJooxCookie()) {
+  if (getJooxCookie() && !delisted) {
     jobs.push(
       withRetry("JOOX", () => jooxSearch(query, 20)).then((list) => {
         let l = list || [];
@@ -12511,8 +12627,8 @@ async function searchMusicAll(query, page) {
     );
   }
 
-  // 咪咕官方直出
-  if (shouldUseMiguApi()) {
+  // 咪咕官方直出（下架歌手同样跳过：它也是内地域，赵薇在里面只有同名翻唱）
+  if (shouldUseMiguApi() && !delisted) {
     jobs.push(
       withRetry("咪咕直出", () => miguApiSearch(query, 10)).then((l) =>
         (l || []).map((x) => ({
@@ -13659,7 +13775,13 @@ const search = async function (query, page, type) {
     const r = await searchMusicAll(query, page);
 
     // 结果太少 → 减弱查询重搜，合并结果池
-    if (page === 1 && (r.data || []).length < WEAK_RESULT_THRESHOLD) {
+    /* ⚠️ 下架歌手**不走这一步**（2026-10-21）。
+       「减弱查询」是把歌手名剥掉（「赵薇 飘」→「飘」），可剥掉之后
+       就认不出这是那位下架歌手了，内地五家又会被问一遍 ——
+       实测「赵薇 飘」本来 57 条里 36 条是内地平台的同名翻唱/无关条目，
+       全是从这一步漏进来的。宁可少几条，也不要这些噪声。 */
+    if (page === 1 && (r.data || []).length < WEAK_RESULT_THRESHOLD
+        && !(shouldDelistedDirect() && delistedArtistOf(query))) {
       const mainAuth = r._auth || null;   // 主查询查到的权威目录，补搜的条目要用它重打分
       const variants = stripArtistVariants(query);
       for (let i = 0; i < variants.length; i++) {
@@ -14025,10 +14147,22 @@ async function resolveMediaSource(musicItem, quality) {
   //       现在全部同时发，谁先给出「完整且是同一首」的流就用谁 ——
   //       同一批歌实测从 10506ms 降到 2600ms。
   //       各平台 resolver 内部本来就有严格匹配，竞速不会降低准确性。
+  /* 下架歌手的兜底同样跳过内地五家。
+     ⚠️ 这一步不只是省时间：赵薇这类条目在内地平台上**有同名的别人的歌**
+        （《飘》有孙露版、《一直下雨的星期天》有 521号音乐街 的搬运），
+        resolver 里那套「同名同歌手」校验在个别脏数据上会放行，
+        点开就是别人的声音。直接不发请求，比事后校验可靠。 */
+  const fallbackSkip = shouldDelistedDirect()
+    ? (delistedArtistOf(want.singer + " " + want.name) ? DELISTED_SKIP_PLATFORMS : null)
+    : null;
+  if (fallbackSkip) {
+    console.log("[粽子] 兜底跳过内地平台（下架歌手）: 《" + want.name + "》");
+  }
   const runners = [];
   for (let i = 0; i < FALLBACK_ORDER.length; i++) {
     const p = FALLBACK_ORDER[i];
     if (p === provider) continue;
+    if (fallbackSkip && fallbackSkip.indexOf(p) >= 0) continue;
     const fn = RESOLVERS[p];
     if (!fn) continue;
     // 传 null 作为 id：各 resolver 内部会走「搜索 → 严格匹配」路径，
@@ -14628,7 +14762,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.36",
+  version: "4.10.37",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -14727,6 +14861,16 @@ module.exports = {
       key: "filterVip",
       name: "过滤会员/无版权曲目（默认开）",
       hint: "填 1 开启、0 关闭。开启后搜索结果里会隐藏标记 VIP / 无版权的条目。实测 JOOX：vip=0 的 19/19 能播，vip=1 的只有 5/24 能播；过滤后点开能播的比例从 56% 提到 100%。",
+    },
+    {
+      key: "delistedDirect",
+      name: "下架歌手直达海外（默认开）",
+      hint: "填 1 开启、0 关闭。开启后，搜「赵薇」「李志」这类在内地整体下架的歌手的名字时，跳过网易/QQ/酷狗/咪咕/酷我，只问 B 站和 YouTube。\n\n为什么：这几家的内地库里对这些歌手只剩同名翻唱（搜「赵薇」前十全是别人翻的「赵薇女版」）和一个空壳歌手页，真原唱一条都没有；问过去不但拿不到东西，还会用噪声把 B 站的真原唱挤下去，播放兜底也要多等五六路必然超时。实测赵薇《飘》：跳过之后搜到的是 B 站的官方 MV，点播从 20 秒降到 2 秒级。\n\n注意：判据是**歌手名**，不是歌名。搜别的歌手的《飘》不会受影响。",
+    },
+    {
+      key: "delistedArtists",
+      name: "额外的下架歌手（可选）",
+      hint: "内置名单：赵薇、李志、陈升、黄耀明、何韵诗、达明一派。你发现还有谁在内地平台整体搜不到本人（搜出来全是同名翻唱或空壳歌手页），把名字填进来，逗号或顿号分隔。也可以在前面加 ! 表示从内置名单里去掉，例如：!李志，某某某。",
     },
     {
       key: "filterCover",
