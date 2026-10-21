@@ -1367,6 +1367,8 @@ const VARIANT_CHARS = {
   "濱": "滨",
   "喆": "哲",   // 陶喆 的 喆 是 哲 的异体（只在比对时归一，不改发出去的词）
   "啟": "启",
+  "妳": "你",   // 這一刻我相信你說我愛妳 = 这一刻我相信你说爱你
+  "祂": "他",
 };
 
 function t2sMap() {
@@ -2992,7 +2994,13 @@ function s2tMap() {
   const arr = T2S_PAIRS.split(",");
   for (let i = 0; i < arr.length; i++) {
     const p = arr[i].split(":");
-    if (p.length === 2 && p[0] && p[1]) m[p[0]] = p[1];
+    /* ⚠️ T2S_PAIRS 里是「繁:简」。以前这里直接 m[繁]=简 建表，
+       也就是建出来的是**繁→简**，跟函数名 s2t（简→繁）正好反着。
+       后果：toTraditional("游园会") 原样返回「游园会」，
+       zhVariants 永远只给一份简体，繁体关键词一个都没发出去过 ——
+       实测《這壹刻我相信你說我愛妳》《覺醒》《遊園會》在 YouTube 上
+       全要用繁体写法才搜得到，于是兜底整体全灭。方向必须反过来。 */
+    if (p.length === 2 && p[0] && p[1] && !m[p[1]]) m[p[1]] = p[0];
   }
   _s2tMap = m;
   return m;
@@ -4902,8 +4910,14 @@ async function resolveYoutube(id, want, quality) {
       const ranked = ytRank(list, want);
       /* ⚠️ 以前只试前 2 条。加上严格校验后，前两条经常都被拒
          （越南语合集、十七周年展播合集），真正的「趙薇 - 不要告别」
-         排在第 3、4 条，永远轮不到。校验已经够严，多试几条不会串歌。 */
-      for (let i = 0; i < Math.min(6, ranked.length); i++) {
+         排在第 3、4 条，永远轮不到。校验已经够严，多试几条不会串歌。
+         ⚠️ 2026-10-21：6 条还是不够 —— 实测《覺醒》的正确版本
+         「趙薇 Zhao Wei 【覺醒】」在 ytRank 里排第 10（分数只有 20，
+         因为频道是个人号不是 Topic，拿不到那 50 分），前 6 名全是
+         赵薇的新闻八卦视频。校验本身已经够严，所以直接扫全榜，
+         让「过校验」而不是「排名靠前」决定用哪一条。 */
+      let usable = 0;
+      for (let i = 0; i < ranked.length; i++) {
         const cand = ranked[i];
         if (cand.score < 0) continue;
         // 兜底场景下必须是同一首歌，别拿同名/近似名的顶替
@@ -4913,10 +4927,16 @@ async function resolveYoutube(id, want, quality) {
               不要告别 | 2zhaowei.net***爱赵薇」—— 歌名在标题里、频道名里也有
               「爱赵薇」，但那是越南语合集，不是她这一版。 */
         if (id === null && !ytIsThisArtist(cand.v, want)) continue;
+        usable++;
         try { return await ytFetchUrl(cand.v.id, quality); }
         catch (e) { errors.push("搜索取流: " + e.message); }
       }
-      if (ranked.length) break;
+      /* ⚠️ 这里原来写的是 if (ranked.length) break ——
+         只要这次搜索「有结果」就再也不试后面的关键词，哪怕一条都没过校验。
+         实测《遊園會》：第一个关键词「游园会 赵薇」回 20 条，全是八卦视频，
+         一条不合格；后面那个「遊園會 趙薇」本来能命中，却因为 break 永远发不出去。
+         改成「真的取到过合格候选」才停。 */
+      if (usable) break;
     }
   } catch (e) { errors.push("搜索: " + e.message); }
   throw new Error(errors.join(" | "));
@@ -14270,7 +14290,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.32",
+  version: "4.10.33",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -14694,6 +14714,55 @@ module.exports = {
  * 兜底时**必须**比正常搜索严格得多，因为用户已经认定了这首歌，
  * 给错一首比给不出来更糟。
  * ============================================================ */
+/** 标题切段后有没有一段「就是这首歌」。
+ *
+ *  段 = 按 【】《》「」()[]|/- 这些装饰符切开的部分（跟 shortTitleOk 同一组符号）。
+ *  每一段先 coreTitle 归一，然后按下面四条之一认：
+ *    a) 全等
+ *    b) 双向包含（且长度别差太远 —— 由 lengthOk 统一卡）
+ *    c) **字符多集相等**：字全一样只是顺序不同。
+ *       实测《游园会》：大陆写「游园会」，台湾写「園遊會」，
+ *       归一后是「游园会」和「园游会」—— 这是同一个词的两种语序写法，
+ *       双向 indexOf 永远对不上。判据收到最紧（多集完全相等，不是相似度），
+ *       所以《爱》和《愛之玄》这种长度不同的永远进不来。
+ *    d) 相似度 ≥0.88 且查询词 ≥5 字。
+ *       MB 写《这一刻我相信你说爱你》，YouTube 写《這一刻我相信你說我愛妳》
+ *       （多一个「我」、你写作妳），严格比对永远不中，但确实是同一首。
+ *       短标题不放行（会把整片都放进来）。 */
+const TITLE_SEG_RE = /[\/|｜·•\-–—_]+|【|】|《|》|「|」|\(|\)|（|）|\[|\]|,|，/;
+function titleSegHit(rawTitle, q) {
+  if (!q) return false;
+  const segs = String(rawTitle || "").split(TITLE_SEG_RE);
+  for (let i = 0; i < segs.length; i++) {
+    let v = coreTitle(toSimplified(segs[i]));
+    if (!v) continue;
+    /* 段尾常挂英文译名：「這一刻我相信你說我愛妳 This Moment I Believe You Love Me」。
+       coreTitle 把空格去掉了，于是英文和中文连成一串，长度闸门会把整段判死。
+       截掉纯拉丁尾巴再比 —— 英文译名对中文歌名没有信息量。 */
+    const vi = v.replace(/[a-z0-9'"!?.]+$/, "");
+    if (vi && vi.length >= 2) v = vi;
+    if (!v) continue;
+
+    if (v === q) return true;
+    /* 一两字的短歌名必须**整段对上**（或后面只跟英文译名）。
+       放宽成包含的话，《愛之玄》《愛情大魔咒》全会顶到赵薇《爱》头上 ——
+       长标题那边有长度闸门兜着，两字的短名字什么都兜不住。 */
+    if (q.length <= 2) {
+      if (v.indexOf(q) === 0 && /^[a-z0-9'"!?.]*$/.test(v.slice(q.length))) return true;
+      continue;
+    }
+    /* 长度闸门跟整串比对时保持一致：不能短太多（「了」vs「怎麼都沒有了」），
+       也不能长太多（听书标题动辄几十字）。 */
+    if (v.length < Math.max(2, Math.floor(q.length * 0.6))) continue;
+    if (v.length > q.length * 3 + 8) continue;
+    if (v.indexOf(q) >= 0 || q.indexOf(v) >= 0) return true;
+    if (v.length === q.length &&
+        v.split("").sort().join("") === q.split("").sort().join("")) return true;
+    if (q.length >= 5 && titleSimZ(v, q) >= 0.88) return true;
+  }
+  return false;
+}
+
 function isDefinitelySameSong(it, want) {
   const rawTitle = it.title || it.name || it.SONGNAME || "";
   const rawArtist = it.artist || it.singer || it.ARTIST || "";
@@ -14710,14 +14779,14 @@ function isDefinitelySameSong(it, want) {
 
   // 3) 标题必须「就是这首歌」，不能只是包含几个字。
   //    规则：去掉括号内容后，两者的核心字符集重合度要高。
-  const same = t === q || t.indexOf(q) >= 0 || q.indexOf(t) >= 0;
-  if (!same) return false;
-
-  // 4) 长度差异不能太大（「了」vs「怎麼都沒有了」这种要挡掉）
-  //    允许标题比查询多出一些（正版会带演唱者等后缀），但不能短太多
-  if (t.length < Math.max(2, Math.floor(q.length * 0.6))) return false;
-  //    也不能长出太多（听书标题动辄几十字）
-  if (t.length > q.length * 3 + 8) return false;
+  /* 3+4) 标题必须「就是这首歌」，而且长度不能差太多。
+     ⚠️ 只在**整条标题**上比是不够的：YouTube / B 站的标题普遍是
+     「趙薇 Zhao Wei 【園遊會】」这种带前缀和后缀的写法，
+     coreTitle 之后整串是「赵薇zhaowei园游会」，跟「游园会」双向 indexOf 全不中，
+     于是正确版本被当成别的歌丢掉（实测《遊園會》整张专辑死在这）。
+     所以按装饰符切段，任何**一段**能对上就算 —— 跟 shortTitleOk 同一套思路，
+     只是这里允许的判据更全（见 titleSegOk）。 */
+  if (!titleSegHit(rawTitle, q)) return false;
 
   // 5) 歌手：必须是**这个人**唱的
   //
