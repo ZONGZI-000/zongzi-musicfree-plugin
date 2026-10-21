@@ -879,7 +879,7 @@ const _audioProbeCache = {};
 /** 探一次音频地址：{ ok, total }
  *  ok    = 魔数是真音频（ID3/MP3/Ogg/FLAC/ftyp/WebM）
  *  total = 音频总字节数；拿不到（服务端不给 Content-Range）= 0 */
-async function probeAudio(url, extraHeaders) {
+async function probeAudio(url, extraHeaders, timeoutMs) {
   /* data: URI 直接判活，绝不发请求。
      整首内联（YouTube / B站）返回的就是几 MB 的 base64 字符串，
      交给 axios 会被当成 URL 去解析，既慢又可能卡死整个取流。 */
@@ -892,8 +892,9 @@ async function probeAudio(url, extraHeaders) {
   try {
     const r = await axios_1.get(url, {
       /* 只取 2KB 验魔数，6 秒足够；原来是 12 秒 ——
-         慢网下这一个探测就能白占 12 秒，用户看到的就是转圈。 */
-      timeout: 6000,
+         慢网下这一个探测就能白占 12 秒，用户看到的就是转圈。
+         调用方可以再压短：取流主链只给 1.5 秒（见 accept）。 */
+      timeout: Number(timeoutMs) || 6000,
       responseType: "arraybuffer",
       headers: Object.assign({ "User-Agent": UA, Range: "bytes=0-2047" }, extraHeaders || {}),
       validateStatus: () => true,
@@ -947,10 +948,10 @@ const MIN_BYTES_PER_SEC = 4.5 * 1024; // ≈36kbps
    拿它兜住「平台不给时长 → 免检通行」这个洞。 */
 const MIN_FULL_BYTES = 400 * 1024;
 
-async function isPreviewOnly(url, durationMs, fallbackMs) {
+async function isPreviewOnly(url, durationMs, fallbackMs, timeoutMs) {
   const ms = Number(durationMs) || 0;
   const fb = Number(fallbackMs) || 0;
-  const p = await probeAudio(url);
+  const p = await probeAudio(url, null, timeoutMs);
   /* 时长未知时，能拿到实际字节数就按「一首歌至少该有多少字节」判：
      完整版 mp3 128k 也至少 1.5MB，低于 400KB 的绝不可能是整首。
      之前这里直接 return false 放行，等于把「时长 0」变成了免检通行证 ——
@@ -9687,6 +9688,72 @@ function fbArt(item) {
   return COVER_CDN + FB_ART_COVERS[fbHash(seed) % FB_ART_COVERS.length];
 }
 
+/* ============================================================
+ * 列表缩略图（2026-10-21 修「列表出来了但很久点不动」）
+ *
+ * 事故现场：榜单页首屏 149 张卡，封面全是后端原图，合计 **22MB**。
+ * 其中网易那 30 张分类精选封面每张 226KB（后端给的是 800×800 甚至更大）。
+ * 表现就非常反直觉：文字列表 0.9 秒就出来了（接口本身是快的），
+ * 但接下来十几秒 UI 线程一直在下载+解码大图、图片请求把连接池占满，
+ * 手指点卡片完全没反应 —— 用户看到的是「列表出来了，但要等很久才能点」。
+ *
+ * 修法：只换 URL，不动结构。各平台都有官方缩略参数（都是实测体积）：
+ *   网易   ?param=300y300        226KB → 22KB
+ *   B站    @300w_300h_1c.webp    163KB → 7KB
+ *   QQ     T002R300x300M 已 300，不动
+ *   酷狗   /stdmusic/400/ → /300/ 71KB → 36KB
+ * 300px 铺满手机列表绰绰有余，播放页放大也不糊。
+ *
+ * ⚠️ 顺手把认得出来的图片域名从 http 升成 https。
+ *    实测飙升榜详情 100 条封面**全是 http://**，分类精选 64 条也全是。
+ *    Android 9+ 默认禁明文流量，这些图要么加载不出来、要么先失败再降级重试，
+ *    白等一轮。这些域名 https 全部可用（实测 200），升级零风险。
+ * ⚠️ 纯字符串改写，不发请求、不解析，零成本。
+ * ============================================================ */
+const THUMB_PX = 300;
+
+const THUMB_HOSTS = [
+  "music.126.net", "hdslb.com", "y.gtimg.cn", "qpic.cn",
+  "qpic.y.qq.com", "imge.kugou.com", "musicapp.migu.cn",
+];
+
+function thumbArt(url) {
+  let u = String(url || "");
+  if (!u || u.indexOf("data:") === 0) return u;
+  try {
+    /* 先统一成 https（只对认得的域名，别把别人的站弄坏） */
+    let known = false;
+    for (let i = 0; i < THUMB_HOSTS.length; i++) {
+      if (u.indexOf(THUMB_HOSTS[i]) > 0) { known = true; break; }
+    }
+    if (known && u.indexOf("http://") === 0) u = "https://" + u.slice(7);
+
+    /* 网易云：?param=NyN 是官方缩略参数。已经有 param 的不重复加。 */
+    if (u.indexOf("music.126.net/") > 0) {
+      if (/[?&]param=/.test(u)) return u;
+      return u + (u.indexOf("?") >= 0 ? "&" : "?") + "param=" + THUMB_PX + "y" + THUMB_PX;
+    }
+    /* B站：OSS 图片处理后缀，接在原图地址后面 */
+    if (/\/\/i[0-9]\.hdslb\.com\//.test(u)) {
+      if (u.indexOf("@") > u.lastIndexOf("/")) return u;   // 已带处理后缀
+      return u + "@" + THUMB_PX + "w_" + THUMB_PX + "h_1c.webp";
+    }
+    /* QQ 单曲封面：T002R300x300M000… 里的 R300x300 就是尺寸 */
+    if (u.indexOf("y.gtimg.cn/") > 0) {
+      return u.replace(/T002R\d+x\d+M/, "T002R" + THUMB_PX + "x" + THUMB_PX + "M");
+    }
+    /* 酷狗：路径里的 /stdmusic/<尺寸>/ */
+    if (u.indexOf("imge.kugou.com/") > 0) {
+      return u.replace(/\/(?:stdmusic|data\/upload)\/(\d+)\//, "/stdmusic/" + THUMB_PX + "/");
+    }
+    /* QQ 歌单/专辑封面：https://p.qpic.cn/music_cover/<hash>/<尺寸>?n=1 */
+    if (u.indexOf("qpic.cn/") > 0 || u.indexOf("qpic.y.qq.com/") > 0) {
+      return u.replace(/\/music_cover\/([^\/]+)\/(\d+)/, "/music_cover/$1/" + THUMB_PX);
+    }
+  } catch (e) { /* 认不出来就原样返回 */ }
+  return u;
+}
+
 /** 递归补齐列表里缺封面的条目（只往下走已知的几个容器字段，不乱翻整棵树） */
 function deepFillArt(o, depth) {
   if (!o || typeof o !== "object" || depth > 3) return o;
@@ -9699,7 +9766,11 @@ function deepFillArt(o, depth) {
     (o.id || o.songmid || o.mid) &&
     (o.title || o.name) &&
     !o.musicList && !o.sheetItem && !o.data;
-  if (isCard && !String(o.artwork || "").trim()) o.artwork = fbArt(o);
+  if (isCard) {
+    const art = String(o.artwork || "").trim();
+    if (!art) o.artwork = fbArt(o);
+    else o.artwork = thumbArt(art);
+  }
   const kids = ["data", "musicList", "tracks", "list", "sheetItem"];
   for (const k of kids) if (o[k]) deepFillArt(o[k], depth + 1);
   return o;
@@ -12915,6 +12986,11 @@ async function resolveKuwo(id, want, quality) {
   throw new Error(errors.join(" | "));
 }
 
+/* 「疑似只给试听片段」的计数：一次不算数，连续两次才真正拉黑。
+   取流主链现在对慢探测是「先放行、后判定」，判定结果只能弱化使用，
+   否则一次网络抖动就会误杀一个好好的源。 */
+const PREVIEW_SUSPECT = {};
+
 /* 已经确认拿不到流的平台+id，避免同一次会话里重复撞墙 */
 const deadIds = {};
 function markDead(provider, id) {
@@ -14735,6 +14811,26 @@ function decorateSource(result, provider) {
     }
   }
 
+  /* ⚠️ 2026-10-21 事故：YouTube 曲目「点了就无限转圈，最后没声音」。
+     根因不是取流失败 —— 直链 1.2 秒就拿到了，是**这条直链本身被限速**：
+     googlevideo 对「不带 range 的整文件 GET」把它当匿名下载，
+     实测压到 20~30KB/s（一首 2.2MB 的歌要下 100 多秒）；
+     同一条地址只要在 URL 上补一个 range=0-，立刻恢复满速（实测 2.3MB/s，
+     差了 100 倍），而且播放器后续发 Range 头 seek 时服务端照样正确回 206。
+     播放器拉流时不发 Range 头，所以只能由插件在 URL 上补。
+
+     ⚠️ 补在 URL 上而不是塞请求头：头部形式的开放 Range 会被 googlevideo 判 403
+        （跟 ytQuotaOk 里踩过的是同一个坑）。
+     ⚠️ 必须幂等：直链缓存命中时 decorateSource 会再跑一次。 */
+  (function () {
+    let host = "";
+    try { host = String(new URL(out).host || ""); } catch (e) { return; }
+    if (!/(^|\.)googlevideo\.com$/i.test(host)) return;
+    if (/[?&]range=/.test(out)) return;
+    /* Google 不认带 &range= 的签名，位置不敏感，接在尾巴上即可 */
+    out += "&range=0-";
+  })();
+
   /* 按流地址域名判平台 —— 兜底来的 B 站流也必须带上 Referer */
   const h = PLAY_HEADERS[providerForUrl(out, provider)];
   if (h) {
@@ -14857,9 +14953,46 @@ async function resolveMediaSource(musicItem, quality) {
 
   /* 本平台和兜底都要过同一道关：能不能播、是不是完整。
      抽成闭包是为了让两条路径完全同构 —— 之前只在兜底里做校验，
-     结果本平台「能播但是 60 秒试听」就一路过关了。 */
+     结果本平台「能播但是 60 秒试听」就一路过关了。
+
+     ⚠️ 2026-10-21 三改：探活不再「等死」。
+     用户反馈「刷新很久 → 界面卡住 → 最后没声音 → 直接中断」。
+     根因就在这一句 await：每条候选地址都要先跑一次 probeAudio（超时 6 秒），
+     而 accept 是串在取流主链上的 —— 8 秒总闸到了也没用，闸门后面还压着探测；
+     几条候选挨个探下来就是十几秒纯等待，播放器早判失败并中断了。
+     现在探测最多等 PROBE_RACE_MS：超了就把这条地址先放行（先有声音最重要），
+     判定交给后台跑完，只用来学习（连续两次判片段才记账），不影响本次播放。 */
+  const PROBE_RACE_MS = 1500;
+  let optimistic = null;
+  /* 任何一条「拿到了但没验完」的候选都留一份，最后兜底用 ——
+     与其抛错让播放器中断，不如把这条扔给播放器试一次。 */
+  let lastCandidate = null;
   const accept = async (u, who, altDurMs) => {
-    if (await isPreviewOnly(u, durMs, altDurMs)) {
+    if (!u) return null;
+    lastCandidate = lastCandidate || u;
+    const probeP = isPreviewOnly(u, durMs, altDurMs, 5000).then(
+      (v) => v,
+      () => false            // 探测自己炸了，不算「是片段」
+    );
+    const verdict = await Promise.race([
+      probeP,
+      new Promise(function (res) { setTimeout(function () { res("__slow"); }, PROBE_RACE_MS); }),
+    ]);
+    if (verdict === "__slow") {
+      if (!optimistic) optimistic = u;
+      probeP.then(function (bad) {
+        if (!bad) return;
+        const who2 = String(who).replace(/^兜底/, "");
+        const k2 = who2 + "|" + musicItem.id;
+        PREVIEW_SUSPECT[k2] = (PREVIEW_SUSPECT[k2] || 0) + 1;
+        if (PREVIEW_SUSPECT[k2] >= 2) {
+          markDead(who2, musicItem.id);
+          console.log("[粽子] 连续两次判为试听片段，暂时跳过: " + who2 + " 《" + want.name + "》");
+        }
+      }).catch(function () {});
+      return u;
+    }
+    if (verdict) {
       previewOnly = previewOnly || u;
       errors.push(who + ": 只给试听片段");
       return null;
@@ -15011,7 +15144,12 @@ async function resolveMediaSource(musicItem, quality) {
      YouTube 1~2s），只有「所有平台一起挂」才会走满。而 20 秒这个量级
      用户感受就是「点了没反应」，播放器那边也早跳下一首了。
      12 秒仍然给慢网留了 4 倍于典型耗时的余量。 */
-  const FB_DEADLINE = 12000;
+  /* 12s → 8s → 5s（2026-10-21 三压）。播放器那边的耐心就在 8~10 秒这个量级，
+     过了这个点它直接判失败并「中断」—— 我们再等下去也没有听众了。
+     实测正常网络兜底命中在 0.3~2.5 秒，5 秒已经是 2 倍余量；
+     真到点了就把手上最好的那条地址交出去（下面 lastCandidate 那条路），
+     总之：宁可早交一条「没验完」的地址，也不要晚交一个错误。 */
+  const FB_DEADLINE = 5000;
   const fbStart = Date.now();
   let ownRaced = false;
   let deadlineHit;
@@ -15060,6 +15198,17 @@ async function resolveMediaSource(musicItem, quality) {
        waiting 现在是每轮的快照，splice 它不会影响 runners）。 */
     if (runners[r.slot]) runners[r.slot].__done = true;
     if (r.err) { errors.push("兜底" + r.p + ": " + r.err.message); continue; }
+    /* ⚠️ 别让「验活」把已经到点的总闸又拖长一截。
+       剩余时间不够一次探测时，先把这条地址当成结果用，判定丢后台跑 ——
+       否则 8 秒总闸后面还能再挂 1.5 秒，播放器那边已经中断了。 */
+    const remainMs = FB_DEADLINE - (Date.now() - fbStart);
+    if (remainMs < PROBE_RACE_MS + 300) {
+      deadlineHit();
+      console.log("[粽子] 到点，直接采用未验完的兜底流: " + provider + " → " + r.p
+        + " 《" + want.name + "》（" + (Date.now() - fbStart) + "ms）");
+      accept(r.u, "兜底" + r.p).catch(function () {});
+      return { url: r.u };
+    }
     const okUrl = await accept(r.u, "兜底" + r.p);
     if (okUrl) {
       /* 兜底已经能播了，但本平台更准 —— 还没到 GRACE 就先等它一下。
@@ -15094,6 +15243,16 @@ async function resolveMediaSource(musicItem, quality) {
   if (previewOnly) {
     console.log("[粽子] 全平台仅试听: 《" + want.name + "》");
     return { url: previewOnly };
+  }
+
+  /* 4) 一条都没验完，但确实抓到过地址 → 直接交给播放器赌一次。
+     用户的原话是「我看不到原因，只会中断」—— 中断比
+     「播十几秒然后跳下一首」难受得多。而且探测失败 ≠ 地址不能播：
+     探测本身也要等 1.5 秒才出结果，慢网下往往是探测先超时，
+     而播放器流式拉取反而能成功。 */
+  if (lastCandidate) {
+    console.log("[粽子] 无完全可信结果，先给候选地址: 《" + want.name + "》");
+    return { url: lastCandidate };
   }
 
   // 全平台都没拿到 → 把这首歌记进黑名单，下次搜索直接不显示它
@@ -15667,7 +15826,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.45",
+  version: "4.10.47",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
