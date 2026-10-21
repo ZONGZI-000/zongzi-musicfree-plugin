@@ -5324,7 +5324,19 @@ function ytPickAudio(list, quality) {
  *   600KB 的音频内联后约 800KB，写盘和解码都在「察觉不到」的量级。
  *   整首歌不内联也不会播不了：B站/YouTube 的流式地址现在都能带对头
  *   正常拉（见 HOST_HEADER_RULES 的说明），播放器边下边播即可。 */
-const YT_INLINE_MAX_BYTES = 600 * 1024;
+/* ⚠️⚠️ 2026-10-21 回滚上限：600KB → 2.5MB。
+ *
+ *   上面那套「压到 600KB、让大文件走流式」在实机上是错的：
+ *   用户实测反馈「现在都没法播放了」——全卡在流式那条路上。
+ *   YouTube 直链在手机上要 2~4 秒才吐第一块，
+ *   播放器的等待窗口比这更短，还没缓冲起来就判失败中断。
+ *   也就是说：流式在这条网络上基本拿不到声音，
+ *   而「先下完再给播放器」虽然慢一点，却是唯一能出声的路。
+ *
+ *   所以策略改回「下载完再放」：2.5MB 以内一律内联（盖住整首 128k）。
+ *   而「App 假死」那个老问题根在 b64FromU8 的一次性巨型拼接，
+ *   已经成 3KB 分批拼，不再是这里的上限能决定的。 */
+const YT_INLINE_MAX_BYTES = 2560 * 1024;
 
 /* ⚠️ 内联必须有**总超时**（2026-10-21 事故：「一直转」）。
    原来只有每块的 20 秒超时，整首是 4 路并发分块下载，
@@ -5337,6 +5349,13 @@ const YT_INLINE_MAX_BYTES = 600 * 1024;
    但那比「转 20 秒然后失败」好得多 —— 点下去最好 1~2 秒就能出声。
    内联真正划算的是快网（实测本机 1~3 秒下完），慢网就让它走流式。 */
 const INLINE_TOTAL_DEADLINE = 6000;
+
+/* ⚠️ 2026-10-21：**流式不可用**时的上限。
+   上面那 6 秒是「内联只是为了更流畅、流式随时能兵底」的前提下定的。
+   现在实机上流式拿不到声音（见 YT_INLINE_MAX_BYTES 上方），
+   内联就是唯一的出声路径 —— 宁可多等几秒把整首下完，
+   也不要为了「快」超时退回一条播不动的流式地址。 */
+const INLINE_TOTAL_DEADLINE_NO_STREAM = 12000;
 
 const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 /* 字符码表，惰性建一次（见 b64FromU8 里的说明） */
@@ -5596,7 +5615,10 @@ async function ytFetchUrl(videoId, quality) {
      ⚠️ 这一步必须在所有 early-return 之后 —— 否则 VISIONOS 路径会绕过它。 */
   if (shouldInlineYoutube()) {
     try {
-      const dataUri = await inlineAudio(ok.url, ok.size, ok.mime);
+      /* ⚠️ 20 秒而不是 6 秒：流式在实机上拿不到声音，
+         这里超时退回流式就等于「点了不响」。 */
+      const dataUri = await inlineAudio(ok.url, ok.size, ok.mime, null,
+        YT_INLINE_MAX_BYTES, INLINE_TOTAL_DEADLINE_NO_STREAM);
       if (dataUri) return dataUri;
     } catch (e) { /* 失败就回退流式 */ }
     /* 内联没成（超时 / 分块失败 / 太大）→ 现在这条流式地址还没验过
@@ -6112,7 +6134,7 @@ async function biliStreams(bvid) {
    落盘到 MMKV —— 一条 1.3MB 的 data: URI 就是每次切歌多写 1.3MB 的字符串。
    400KB 内联后约 540KB，还在「写下也不疼」的范围里。
    完整的歌走流式，B站 CDN 现在能带对 Referer（见 HOST_HEADER_RULES）。 */
-const BILI_INLINE_MAX_BYTES = 400 * 1024;
+const BILI_INLINE_MAX_BYTES = 2560 * 1024;
 
 /* ⚠️ 2026-10-21：**没有 mcdn 节点时**才使用的另一档内联上限。
  *
@@ -14759,7 +14781,7 @@ let _prefetching = false;
 /* 900KB 字符 ≈ 675KB 音频。内联上限是 400KB(B站)/600KB(YouTube)，
    转成 base64 最多约 800KB 字符，所以正常内联的结果一定在闸门之内。
    这条闸门只拦「历史上塞进来的几 MB 巨串」和老缓存。 */
-const INLINE_MAX_CHARS = 900 * 1024;
+const INLINE_MAX_CHARS = 4096 * 1024;
 /* 持久化在模块作用域：resolveMediaSource 里 read，prefetchTop 里 write */
 var _prefetchMode = false;
 
