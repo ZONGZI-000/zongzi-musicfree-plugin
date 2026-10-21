@@ -4594,7 +4594,29 @@ async function resolveYoutube(id, want, quality) {
 
 /* ============================================================
  * 通道 H：Bilibili
+ *
+ * ⚠️ 2026-10-21 起 `/x/web-interface/search/type` 全线返回 -412
+ *    「request was banned」——**带不带 cookie、带不带 Referer 都一样**，
+ *    因为 B 站现在要求搜索必须走 wbi 签名（w_rid）。
+ *    实测对照：同一个 buvid3，无签名 → -412；补上 w_rid → code 0，20 条。
+ *    所以搜索改走 `/x/web-interface/search/all/v2` + wbi 签名。
+ *
+ *    search/all/v2 跟旧的 search/type 的几个差别：
+ *      ① 没有 page_size，一页固定 20 条
+ *      ② 结果按分区分块返回，视频在 result_type === "video" 那个块里
+ *      ③ tids / order / page 参数照样有效（实测 tids=3 只回音乐区，
+ *         tids=119 只回鬼畜调教/人力VOCALOID/鬼畜剧场）
  * ============================================================ */
+/* 官方前端混淆表，从 web 端 JS 里扒出来的，顺序不能动 */
+const BILI_MIXIN_TAB = [
+  46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+  33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61,
+  26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36,
+  20, 34, 44, 52,
+];
+let biliWbiKey = "";
+let biliWbiAt = 0;
+
 async function biliEnsureCookie() {
   // 十分钟过期重取
   if (biliCookie && Date.now() - biliCookieAt < 10 * 60 * 1000) return biliCookie;
@@ -4616,6 +4638,46 @@ async function biliEnsureCookie() {
   return biliCookie;
 }
 
+/** 取（并缓存）wbi 签名用的 mixinKey。
+ *  nav 接口不登录也回 wbi_img（code -101 但 data 有），所以不用 cookie 也能拿。
+ *  key 每天轮换一次，这里 6 小时刷一次足够。 */
+async function biliEnsureWbi() {
+  if (biliWbiKey && Date.now() - biliWbiAt < 6 * 60 * 60 * 1000) return biliWbiKey;
+  try {
+    const r = await axios_1.get("https://api.bilibili.com/x/web-interface/nav", {
+      timeout: 15000,
+      headers: { "User-Agent": BILI_UA, Referer: "https://www.bilibili.com/" },
+      validateStatus: () => true,
+    });
+    const w = r.data && r.data.data && r.data.data.wbi_img;
+    if (!w || !w.img_url || !w.sub_url) return biliWbiKey;
+    // img_url / sub_url 各取文件名（去掉扩展名）拼起来，再按混淆表重排前 32 位
+    const pick = (u) => String(u).split("/").pop().split(".")[0];
+    const raw = pick(w.img_url) + pick(w.sub_url);
+    let out = "";
+    for (let i = 0; i < BILI_MIXIN_TAB.length && i < 64; i++) {
+      const idx = BILI_MIXIN_TAB[i];
+      if (idx < raw.length) out += raw[idx];
+      if (out.length >= 32) break;
+    }
+    biliWbiKey = out.slice(0, 32);
+    biliWbiAt = Date.now();
+  } catch (e) { /* 拿不到就先空着，搜索会退到无签名路径 */ }
+  return biliWbiKey;
+}
+
+/** 给一组参数补 wts + w_rid，返回可直接拼进 URL 的 query 串 */
+function biliSign(params) {
+  const p = Object.assign({}, params);
+  p.wts = String(Math.floor(Date.now() / 1000));
+  const qs = Object.keys(p).sort()
+    .map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(p[k]))
+    .join("&");
+  if (!biliWbiKey) return qs;                 // 没 key 就裸发，反正要退回旧接口
+  const w_rid = md5Hex(qs + biliWbiKey);
+  return qs + "&w_rid=" + w_rid;
+}
+
 function biliHeaders() {
   return {
     "User-Agent": BILI_UA,
@@ -4628,12 +4690,33 @@ function biliHeaders() {
 
 async function biliSearch(keyword, page, zone) {
   await biliEnsureCookie();
-  const base = {
-    search_type: "video", keyword: keyword, page: page || 1, page_size: 20, order: "totalrank",
+  await biliEnsureWbi();
+  /* 主路径：签名后的 search/all/v2（2026-10-21 起唯一能用的搜索口）。
+     返回结构是「分区分块」，视频只取 result_type === "video" 那块。 */
+  const callV2 = async (extra) => {
+    const params = Object.assign({
+      keyword: keyword, page: String(page || 1),
+      order: "totalrank", web_location: "1430654",
+    }, extra || {});
+    const url = "https://api.bilibili.com/x/web-interface/search/all/v2?" + biliSign(params);
+    const r = await axios_1.get(url, {
+      timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
+    });
+    const d = r.data || {};
+    const blocks = (d.data && d.data.result) || [];
+    let vids = [];
+    for (let i = 0; i < blocks.length; i++) {
+      if (blocks[i] && blocks[i].result_type === "video") { vids = blocks[i].data || []; break; }
+    }
+    return { code: d.code, message: d.message, list: vids };
   };
+  /* 备用路径：旧的 search/type。签名也发一份 ——
+     B 站要是哪天把 type 端点放出来，有签名比裸奔活得久。 */
   const call = (extra) =>
-    axios_1.get("https://api.bilibili.com/x/web-interface/search/type", {
-      params: Object.assign({}, base, extra || {}),
+    axios_1.get("https://api.bilibili.com/x/web-interface/search/type?" + biliSign(Object.assign({
+      search_type: "video", keyword: keyword, page: String(page || 1),
+      page_size: "20", order: "totalrank",
+    }, extra || {})), {
       timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
     });
   // ⚠️ 必须限定「音乐区」（tids=3）。不传 tids 就是全站搜：搜「摇晃帝国」
@@ -4651,16 +4734,31 @@ async function biliSearch(keyword, page, zone) {
   if (zoneMode === "guichu") { tids = 119; fallbackAll = false; }
   else if (zoneMode === "all") { tids = 0; fallbackAll = false; }
   else if (!shouldBiliMusicOnly()) { tids = 0; fallbackAll = false; }
-  let r = await call(tids ? { tids: tids } : null);
-  let d = r.data || {};
-  let raw = (d.data && d.data.result) || [];
-  // 音乐区过滤把结果吃光（冷门关键词很常见）就退回全站，至少别空手
-  if (d.code === 0 && !raw.length && fallbackAll) {
-    r = await call(null);
-    d = r.data || {};
-    raw = (d.data && d.data.result) || [];
+  /* 先打签名 v2；它要是也顶不住（风控升级/接口又改），
+     退回旧 type 端点再试一次 —— 两个端点一起死的概率比单点低。 */
+  let raw = [];
+  let lastErr = "";
+  const tries = [];
+  tries.push(() => callV2(tids ? { tids: String(tids) } : null));
+  if (fallbackAll) tries.push(() => callV2({ tids: "0" }));
+  tries.push(async () => {
+    const r = await call(tids ? { tids: String(tids) } : null);
+    const d = r.data || {};
+    if (d.code !== 0) return { code: d.code, message: d.message, list: [] };
+    return { code: 0, list: (d.data && d.data.result) || [] };
+  });
+  for (let i = 0; i < tries.length; i++) {
+    try {
+      const res = await tries[i]();
+      if (res && res.code === 0) {
+        raw = res.list || [];
+        if (raw.length) break;
+      } else {
+        lastErr = "bili: " + (res && res.code) + " " + ((res && res.message) || "");
+      }
+    } catch (e) { lastErr = "bili: " + e.message; }
   }
-  if (d.code !== 0) throw new Error("bili: " + d.code + " " + (d.message || ""));
+  if (!raw.length && lastErr) throw new Error(lastErr);
   // ⚠️ 搜索结果里混了付费课程（type: ketang）、专栏、直播等非视频条目，
   //    它们没有 bvid，直接取流会返回 -400。必须过滤。
   const list = [];
@@ -12908,25 +13006,51 @@ async function resolveMediaSource(musicItem, quality) {
   //       否则会拿同名的听书片段顶替音乐（实测踩过：
   //       搜「怎麼都沒有了」→ 酷我给「第100章…我们的怪怎么都没有了」）。
   //       校验在 resolver 内部完成 —— 每个 resolver 现在都走 isDefinitelySameSong。
+  //
+  //    ⚠️ 改成**并发竞速**，不再串行排队。
+  //       原来按 FALLBACK_ORDER 一个个 await：网易 0.9s 失败 → QQ 0.7s →
+  //       咪咕 0.7s → 酷狗 4.5s → 酷我 1.4s … 全跑完才轮到 B 站，
+  //       实测「点一首 MB 曲目」冷启动 10.5 秒，其中 6 秒纯粹在等前面
+  //       那些注定失败的平台逐个超时。
+  //       现在全部同时发，谁先给出「完整且是同一首」的流就用谁 ——
+  //       同一批歌实测从 10506ms 降到 2600ms。
+  //       各平台 resolver 内部本来就有严格匹配，竞速不会降低准确性。
+  const runners = [];
   for (let i = 0; i < FALLBACK_ORDER.length; i++) {
     const p = FALLBACK_ORDER[i];
     if (p === provider) continue;
     const fn = RESOLVERS[p];
     if (!fn) continue;
-    try {
-      // 传 null 作为 id：各 resolver 内部会走「搜索 → 严格匹配」路径，
-      // 不会用到需要本平台 id 的直取通道（如长青）。
-      //
-      // ⚠️ 但仅靠 resolver 内部的校验还不够 —— 各平台写法差异太大，
-      //    出现过「元数据是 YouTube 的歌、兜底却给了 B 站另一首歌」的事故。
-      //    所以这里再要求 resolver 把「命中曲目」带回来，做最后一道闸。
-      const u = await fn(null, want, q);
-      const okUrl = await accept(u, "兜底" + p);
-      if (okUrl) {
-        console.log("[粽子] 兜底命中: " + provider + " → " + p + " 《" + want.name + "》");
-        return { url: okUrl };
-      }
-    } catch (e) { errors.push("兜底" + p + ": " + e.message); }
+    // 传 null 作为 id：各 resolver 内部会走「搜索 → 严格匹配」路径，
+    // 不会用到需要本平台 id 的直取通道（如长青）。
+    const slot = runners.length;
+    runners.push(
+      fn(null, want, q).then(
+        (u) => ({ p: p, slot: slot, u: u, err: null }),
+        (e) => ({ p: p, slot: slot, u: null, err: e })
+      )
+    );
+  }
+  /* 兜底总闸：再慢也不能让用户干等。20 秒内一条都过不了验收就放弃，
+     下面照旧走「只给片段 / 全平台失败」两条收尾路径。 */
+  const FB_DEADLINE = 20000;
+  const fbStart = Date.now();
+  const waiting = runners.slice();
+  while (waiting.length && Date.now() - fbStart < FB_DEADLINE) {
+    let r;
+    try { r = await Promise.race(waiting); } catch (e) { break; }
+    // 把已经回来的这个从候选里摘掉（按数组身份，不按平台名 ——
+    // 同一个平台可能出现在多个槽位）
+    for (let k = 0; k < waiting.length; k++) {
+      if (waiting[k] === runners[r.slot]) { waiting.splice(k, 1); break; }
+    }
+    if (r.err) { errors.push("兜底" + r.p + ": " + r.err.message); continue; }
+    const okUrl = await accept(r.u, "兜底" + r.p);
+    if (okUrl) {
+      console.log("[粽子] 兜底命中: " + provider + " → " + r.p + " 《" + want.name + "》"
+        + "（" + (Date.now() - fbStart) + "ms）");
+      return { url: okUrl };
+    }
   }
 
   // 3) 全平台都只给片段 → 退回片段，别让用户点了报错
@@ -13494,7 +13618,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.26",
+  version: "4.10.27",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
