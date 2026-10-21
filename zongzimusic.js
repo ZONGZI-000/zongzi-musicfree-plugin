@@ -35,7 +35,9 @@ const NETEASE_SONG_DETAIL = "https://music.163.com/api/song/detail";
 const NETEASE_HEADERS = { "User-Agent": UA, Referer: "https://music.163.com/" };
 const KUWO_CONVERT = "http://antiserver.kuwo.cn/anti.s?type=convert_url&format={fmt}&response=url&rid=MUSIC_{rid}";
 
-const FALLBACK_ORDER = ["netease", "qq", "migu", "kugou", "kuwo", "joox", "youtube", "bilibili", "miguapi"];
+/* v4.10.62：bilibili 已从兜底链摘除（链路不稳，见 shouldUseBilibili 注释）。
+   想恢复就把它加回原位（youtube 之后、miguapi 之前）。 */
+const FALLBACK_ORDER = ["netease", "qq", "migu", "kugou", "kuwo", "joox", "youtube", "miguapi"];
 
 /* ============================================================
  * YouTube 熔断器（2026-10-21，修「赵薇歌手页点什么都卡死」）
@@ -526,14 +528,22 @@ const LABEL_TO_PROVIDER = {
 /* ============================================================
  * 飞书推送
  * ============================================================ */
-/** Bilibili 是否参与搜索（默认开：免费且音质最高） */
+/** Bilibili 是否参与搜索（v4.10.62 起默认关：链路不稳，先下线）
+ *  ⚠️ 为什么下线：B 站这条链路三段都不由我们控制 ——
+ *     ① 搜索走 wbi 签名，风控一升级就 -412；
+ *     ② 取流必须带 Referer + 正确的 User-Agent，播放器不照做就 403，
+ *        而请求头发不出去这件事在插件侧无解；
+ *     ③ 没有 mcdn 节点、只剩 upos 时用的是「视频+音频混流 mp4」，
+ *        音轨只占四分之一，慢网下缓冲一两分钟，表现就是转圈到 00:00。
+ *  三条叠加，再高的音质权重也抵不过「点十首有七首放不出来」。
+ *  代码全部保留（搜索/取流/鬼畜/评论都在），要恢复只需把 useBilibili 填 1。 */
 function shouldUseBilibili() {
   try {
     const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
     const v = vars.useBilibili;
-    if (v === undefined || v === null || v === "") return true;
+    if (v === undefined || v === null || v === "") return false;
     return !(v === "0" || v === "false" || v === "off");
-  } catch (e) { return true; }
+  } catch (e) { return false; }
 }
 
 /** Bilibili 是否只搜音乐区（默认开） */
@@ -554,9 +564,9 @@ function shouldBiliGuichu() {
   try {
     const vars = (typeof env !== 'undefined' && env && env.userVariables) || {};
     const v = vars.biliGuichu;
-    if (v === undefined || v === null || v === '') return true;
+    if (v === undefined || v === null || v === '') return false;
     return !(v === '0' || v === 'false' || v === 'off');
-  } catch (e) { return true; }
+  } catch (e) { return false; }
 }
 
 /** 咪咕官方直出是否参与（默认开） */
@@ -16875,10 +16885,10 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.61",
+  version: "4.10.62",
   author: "粽子 & Alma",
   description:
-    "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
+    "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
   supportedSearchType: ["music", "album", "artist", "sheet"],
   // 音频缓存策略：no-cache = 每次播放都重新取地址（直链带时效签名，缓存必然过期）
   cacheControl: "no-cache",
@@ -16912,8 +16922,8 @@ module.exports = {
     },
     {
       key: "useBilibili",
-      name: "Bilibili 参与（默认开）",
-      hint: "填 1 开启、0 关闭。Bilibili 完全免费且音质最高——实测《稻香》能取到 319kbps m4a，《起风了》263kbps。冷门歌、Live 版、翻唱的资源量在所有平台里最大。不需要登录。",
+      name: "Bilibili 参与（默认关）",
+      hint: "v4.10.62 起默认关闭。\n\n原因：这条链路的三段都不由插件控制 —— 搜索走 wbi 签名，风控一升级就 -412；取流必须带 Referer + 正确的 User-Agent，播放器不照做就是 403；没有 mcdn 节点时只能给「视频+音频混流 mp4」，音轨只占四分之一，慢网下要缓冲一两分钟，表现就是转圈到 00:00。叠加起来播放成功率撑不住，所以先整条下线。\n\n代码是完整保留的（搜索 / 取流 / 鬼畜区 / 评论都在）。想在某个网络环境下重新试，把这里填 1 即可，兜底顺序也会自动把它加回去（需要重启 App 生效）。",
     },
     {
       key: "biliMusicOnly",
