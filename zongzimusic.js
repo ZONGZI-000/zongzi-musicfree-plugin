@@ -5680,7 +5680,23 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
      （整首内联存在的唯一理由就是这个），所以「提前放弃内联、交给流式」
      = 「这首歌直接打不开」。用户看到的就是「海外音源一个也打不开」。
      调用方传 streamFallback:false 时不再按测速预判，老实下到 deadline。 */
-  if (firstMs > 500 && estTotalMs > deadline * 0.8) return null;
+  /* ⚠️⚠️ 2026-10-21 晚（v4.10.63）：`opts.streamFallback` 之前**根本没被读**。
+   *
+   *   上一版（4.10.62）在这里写了「调用方传 streamFallback:false 时
+   *   不再按测速预判，老实下到 deadline」，注释写得很对 ——
+   *   但代码只把 opts 接进签名，一次都没用。于是对 YouTube 依然会
+   *   在 16KB 探测块看起来「慢」时直接 return null，
+   *   而调用方拿到 null 就交出一条流式地址 ——
+   *   实机上 YouTube 的流式地址不出声。表现正是
+   *   「YouTube 一首也打不开 / 海外音源全军覆没」。
+   *
+   *   现在真的按参数走：
+   *     streamFallback === false（YouTube 内联，没有能出声的退路）
+   *        → 不按测速预判，老老实实下到 deadline 或下完为止；
+   *     streamFallback !== false（B 站等，流式本来就能播）
+   *        → 保留「明显下不完就立刻放弃」，省掉十几秒白等。 */
+  const streamFallback = !opts || opts.streamFallback !== false;
+  if (streamFallback && firstMs > 500 && estTotalMs > deadline * 0.8) return null;
   {
     const x = (i) => first[i] || 0;
     const okHead =
@@ -5831,7 +5847,11 @@ async function ytFetchUrl(videoId, quality) {
   if (shouldInlineYoutube()) {
     try {
       const dataUri = await inlineAudio(ok.url, ok.size, ok.mime, null,
-        YT_INLINE_MAX_BYTES, YT_INLINE_BUDGET, { streamFallback: true });
+        /* ⚠️ streamFallback 必须是 false（2026-10-21 晚）：
+           实机上 YouTube 的流式地址**不出声** —— 整首内联存在的唯一理由
+           就是这个。所以「提前放弃内联、交流式地址」在这里不是优化，
+           是「这首歌直接打不开」。让 inlineAudio 老实下到预算上限。 */
+        YT_INLINE_MAX_BYTES, YT_INLINE_BUDGET, { streamFallback: false });
       if (dataUri) return dataUri;
     } catch (e) { /* 失败就回退流式 */ }
     /* 内联没成（超预算 / 分块失败 / 太大）→ 交流式地址。
@@ -16134,23 +16154,78 @@ async function resolveMediaSource(musicItem, quality) {
      改成每轮最多 4 路：命中率高的先上，谁先回来就补下一个，总覆盖不变。
      ⚠️ 顺序就是 FALLBACK_ORDER，它本身就是按「命中率 + 音质」排的。 */
   const FB_CONCURRENCY = 4;
+  /* ⚠️⚠️ 2026-10-21 晚（v4.10.63）：「槽位被内地平台焊死」——
+     专辑源 / 榜单曲目一首都不出声音。
+
+     根因：槽位只按「请求结束」释放。
+     FALLBACK_ORDER 里 youtube / bilibili 排在第 7、8 位，而并发只有 4。
+     开轮时前 4 个槽被 netease / qq / migu / kugou 占满 —— 这四个全是
+     **内地服务**。挂 VPN 或在海外网络下，它们往往不是「快速失败」，
+     而是「连着不回」：TCP 建得起来、HTTP 一直不响应，axios 要 15~20 秒
+     才超时，而兜底总闸只有 7 秒。于是：
+
+         t=0      前 4 个内地平台占满槽位，全都挂着不返回
+         t=7.0s   总闸到点，一条都没回来 → 判「所有平台均失败」
+         t=7.0s   youtube / bilibili **一个请求都还没发出去**
+
+     实测复现（把内地域名做成永不返回）：单曲取流全程
+     `YouTube 请求数: 0 | B站: 0 | 内地: 6` —— 两条唯一能用的链路
+     一次都没启动过。这就是「一直转、转完了还是打不开」的完整解释。
+
+     为什么单曲搜索里反而正常：单曲条目多半带本平台 id（网易/QQ/酷狗），
+     走的是「本平台直取」，压根不进这条兜底队列。
+
+     修法：槽位改「软释放」—— 一个请求最多占槽 FB_SOFT_SLOT_MS，
+     到点就把槽让给队列里的下一个**（请求本身不取消，还在跑；
+     它要是后面回来了，结果照样算数）**。这样内地平台挂住时，
+     youtube / bilibili 会在 1.5 秒内被发出去，赶得上 7 秒总闸。
+     正常网络下前 4 个 0.x 秒就返回并直接命中，队列根本轮不到后面 ——
+     所以这个改动对快网**零额外请求**，只对慢网/挂网生效。
+     同时在途总数封顶 FB_MAX_INFLIGHT，防止软释放变成「9 家一起轰」。 */
+  const FB_SOFT_SLOT_MS = 1500;
+  const FB_MAX_INFLIGHT = 9;
   const fbQueue = [];
-  let fbActive = 0;
+  let fbActive = 0;        // 占着「软槽位」的数量
+  let fbInflight = 0;      // 真实在跑的请求数（含已被软释放的）
+  let wakeSlot = null;
+  /* ⚠️ resolve 出来的必须是**带标记的值**，不能是 undefined：
+     主循环拿 r 跟 null / r.own 逐个判，undefined 会掉进「空快照」那条
+     分支里当成「全跑完了」，反而提前收工。 */
+  const WAKE = { __wake: true };
   function pumpFallback() {
-    while (fbActive < FB_CONCURRENCY && fbQueue.length) {
+    while (fbActive < FB_CONCURRENCY && fbInflight < FB_MAX_INFLIGHT && fbQueue.length) {
       const job = fbQueue.shift();
       fbActive++;
+      fbInflight++;
       const slot = runners.length;
+      /* 幂等释放：正常返回、软超时、收尾三条路都可能走到，
+         不幂等的话计数会飘，最后变成永远只发 1 路。 */
+      const ticket = { released: false };
+      const release = function () {
+        if (ticket.released) return;
+        ticket.released = true;
+        fbActive--;
+        pumpFallback();               // 空出一个槽位就补下一个
+      };
+      const softTimer = setTimeout(release, FB_SOFT_SLOT_MS);
       runners.push(
         job.fn(null, want, q).then(
           (u) => ({ p: job.p, slot: slot, u: u, err: null }),
           (e) => ({ p: job.p, slot: slot, u: null, err: e })
         ).then(function (r) {
-          fbActive--;
-          pumpFallback();               // 空出一个位置就补下一个
+          clearTimeout(softTimer);
+          fbInflight--;
+          release();
           return r;
         })
       );
+      /* ⚠️ 2026-10-21 晚：「软释放派出去的新一路没被主循环等着」。
+         主循环每轮只拿**当时那一刻**的 runners 快照去 Promise.race。
+         软释放是在软超时回调里同步 push 的，主循环早就把老的 waiting
+         挂上了 —— 新派出去的 youtube / bilibili 根本不在那个 race 里。
+         结果就是：youtube 第 2 秒就把整首内联好了，主循环却还要
+         干等到 7 秒总闸到点才回头收结果。这就是「一直转」的最后一环。 */
+      if (wakeSlot) { const w = wakeSlot; wakeSlot = null; w(); }
     }
   }
   function startRunners() {
@@ -16191,12 +16266,27 @@ async function resolveMediaSource(musicItem, quality) {
      总之：宁可早交一条「没验完」的地址，也不要晚交一个错误。 */
   const FB_DEADLINE = 7000;
   const fbStart = Date.now();
+  /* ⚠️ 2026-10-21 晚：总闸要「可重新计时」。
+     槽位改软释放之后，youtube / bilibili 是在 1.5 秒才被发出去的，
+     它们的正常耗时正好压在 7 秒这条线上（实测冷启 2~4 秒，内联再加 1~2 秒）。
+     一到点就判「所有平台均失败」是把还在路上的那条唯一能用的链路
+     直接掐死 —— 用户看到的正是「转完了还是打不开」。
+     现在到点时如果还有请求在跑，延长一次（只一次），让它有机会落地。 */
+  const FB_EXTRA_MS = 4000;
   let ownRaced = false;
   let deadlineHit;
-  const deadlineGate = new Promise((resolve) => {
-    const t = setTimeout(() => resolve(null), FB_DEADLINE);
-    deadlineHit = () => clearTimeout(t);
-  });
+  let deadlineGate;
+  let fbDeadlineAt = fbStart + FB_DEADLINE;
+  let fbExtended = false;
+  function armDeadline(ms) {
+    let t = null;
+    fbDeadlineAt = Date.now() + ms;
+    deadlineGate = new Promise(function (resolve) {
+      t = setTimeout(function () { resolve(null); }, ms);
+    });
+    deadlineHit = function () { if (t) { clearTimeout(t); t = null; } };
+  }
+  armDeadline(FB_DEADLINE);
   /* 阶段一：只等本平台，最多 GRACE_MS（没有本平台音源时 GRACE_MS=0，直接跳过）*/
   if (GRACE_MS > 0) {
     const graceTag = { __grace: true };
@@ -16215,7 +16305,7 @@ async function resolveMediaSource(musicItem, quality) {
     startRunners();
   }
 
-  while (runners.length && Date.now() - fbStart < FB_DEADLINE) {
+  while (runners.length && Date.now() < fbDeadlineAt) {
     /* ⚠️ 这里的 waiting 每次重新取：startRunners 可能在 await 之前刚跑过，
        而 runners 数组是就地 push 的，所以要用「本轮回合后的快照」。 */
     const waiting = runners.filter(function (p) { return p && !p.__done; });
@@ -16240,9 +16330,28 @@ async function resolveMediaSource(musicItem, quality) {
       break;                                   // 本平台也明确失败了
     }
     let r;
-    const pool = ownRaced ? waiting.concat([deadlineGate]) : waiting.concat([deadlineGate, ownTagged]);
+    /* ⚠️ 必须带上唤醒哨兵：软释放在软超时回调里派新活，
+       而那时候 waiting 是上一轮的快照，新的一路不在里面。
+       不唤醒的话主循环会一直等着老的几个（它们可能要挂到超时），
+       明明新派出去的 youtube 两秒就好了，用户却要干等满总闸。 */
+    const pool = (ownRaced ? waiting : waiting.concat([ownTagged]))
+      .concat([deadlineGate, new Promise(function (res) { wakeSlot = function () { res(WAKE); }; })]);
     try { r = await Promise.race(pool); } catch (e) { break; }
-    if (r === null) break;                    // 到点，别再等了
+    if (r && r.__wake) continue;              // 有新的一路被派出去了 → 重新取快照
+    if (r === null) {
+      /* 总闸到点。但「还有请求在路上」跟「全平台都失败了」是两件事：
+         典型场景是内地四家连着不回、youtube/bilibili 刚被软释放出去、
+         正在解析甚至正在整首内联。这时候判失败 = 把唯一能播的那条掐掉。
+         所以延长一次 FB_EXTRA_MS —— 只延长一次，不会变成无限等待。 */
+      if (!fbExtended && fbInflight > 0 && !ownResult) {
+        fbExtended = true;
+        console.log("[粽子] 兜底总闸到点，仍有 " + fbInflight + " 路在跑 → 延长 "
+          + (FB_EXTRA_MS / 1000) + "s");
+        armDeadline(FB_EXTRA_MS);
+        continue;
+      }
+      break;                                  // 到点，别再等了
+    }
     if (r && r.own) {
       ownRaced = true;
       if (r.u) {
@@ -16260,7 +16369,7 @@ async function resolveMediaSource(musicItem, quality) {
     /* ⚠️ 别让「验活」把已经到点的总闸又拖长一截。
        剩余时间不够一次探测时，先把这条地址当成结果用，判定丢后台跑 ——
        否则 8 秒总闸后面还能再挂 1.5 秒，播放器那边已经中断了。 */
-    const remainMs = FB_DEADLINE - (Date.now() - fbStart);
+    const remainMs = fbDeadlineAt - Date.now();
     if (remainMs < PROBE_RACE_MS + 300) {
       deadlineHit();
       console.log("[粽子] 到点，直接采用未验完的兜底流: " + provider + " → " + r.p
@@ -16885,7 +16994,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.62",
+  version: "4.10.63",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
