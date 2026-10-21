@@ -904,7 +904,7 @@ const NEWS_TITLE_RE = /苹果日报|蘋果日報|联合报|聯合報|自由时�
  * 「标题长度是查询词的 2.5 倍以上」—— 正常的歌名不会这么长，
  * 长到这种程度的多半是标题党视频。
  * ============================================================ */
-const NON_MUSIC_VIDEO_RE = /水晶球|占卜|塔罗|塔羅|星座|冥想|催眠|助眠|白噪音|白噪音|ASMR|解压|解壓|开箱|開箱|教学|教學|教程|测评|測評|reaction|vlog|紀錄片|纪录片|访谈|訪談|演讲|演講|搞笑|恶搞|惡搞|整活|鬼畜|合集|盘点|盤點|排行榜|解说|解說|直播回放|直播间|直播間|粉丝群|粉絲群|頻道|频道/i;
+const NON_MUSIC_VIDEO_RE = /水晶球|占卜|塔罗|塔羅|星座|冥想|催眠|助眠|白噪音|白噪音|ASMR|解压|解壓|开箱|開箱|教学|教學|教程|测评|測評|reaction|vlog|紀錄片|纪录片|访谈|訪談|演讲|演講|搞笑|恶搞|惡搞|整活|鬼畜|合集|盘点|盤點|排行榜|解说|解說|直播回放|直播间|直播間|粉丝群|粉絲群|頻道|频道|指弹|指彈|曲谱|曲譜|谱子|譜子|扒带|扒帶|震惊|震驚|排练|排練|弹出来|彈出來|封杀|封殺|被封|内幕|內幕|揭秘|真相|反动|反動|时政|時政|政治|起底|炒作|八卦|爆料|那些事|背后的故事|背後的故事|資本|资本/i;
 
 /* 「音乐相关，但不是一首歌」的素材类字样。
  * 实测搜「Taylor Swift」，B站第一条是
@@ -1471,6 +1471,30 @@ function titleCoversAllWords(title, query) {
  * 《时光的摇晃》只有前半个词也照样返回。连续包含能直接拦掉这类。
  * 而真正对的结果（「ゆらゆら帝国」）靠 anchors 里的原名兜住。
  */
+/* 纯中文名字的**右边界**校验。
+ *
+ * ⚠️ 为什么必须要有（实测 2026-10-21 搜「李志」）：
+ *    原来只要求标题里「连续包含」查询词，于是
+ *      恋爱循环 李志轩 / 月(Cover) - 李志成 / 亲戚李志斌的笑容
+ *      关于李志是个营销号 / 吐槽反李志波兰球逝频
+ *    全部通过 —— 它们确实包含「李志」两个字，但说的是另一个人或另一件事，
+ *    用户第一屏看到的就是鬼畜、吐槽、亲戚。
+ *
+ * 规则：名字匹配到之后紧跟的那个字，如果还是汉字，就必须是「能接在名字后面
+ * 继续描述这个人」的连接字（的/版/唱/演…）。是「轩/斌/洲/是/波」这种，
+ * 说明这是更长的名字或者别的词，直接否。
+ *
+ * 只查右边不查左边：左边的情况（「原唱李志」「反李志」）分不清谁是谁，
+ * 误杀风险比收益大；而右边界这一侧，「李志X」几乎必然是另一个人。 */
+const NAME_TAIL_CONNECTIVE = "的之版唱翻演现场会歌音曲乐新老合集系原词作编制混等和与及再共";
+
+function cjkTailOk(t, at, n) {
+  const after = t.charAt(at + n);
+  if (!after) return true;                          // 名字在结尾
+  if (!/[一-鿿]/.test(after)) return true;  // 空格/标点/数字/英文都算断开
+  return NAME_TAIL_CONNECTIVE.indexOf(after) >= 0;
+}
+
 function titleMatchesAnchors(title, anchors, query) {
   const t = normTextZ(title);
   if (!t) return false;
@@ -1490,7 +1514,16 @@ function titleMatchesAnchors(title, anchors, query) {
       if (titleCoversAllWords(title, a)) return true;
     } else {
       const n = normTextZ(a);
-      if (n && t.indexOf(n) >= 0) return true;
+      if (!n) continue;
+      // 逐个出现位置检查右边界，任意一处合法就算命中
+      // （「李志 李志轩」这种标题里第一个「李志」是干净的）
+      let from = 0;
+      while (true) {
+        const at = t.indexOf(n, from);
+        if (at < 0) break;
+        if (cjkTailOk(t, at, n.length)) return true;
+        from = at + 1;
+      }
     }
   }
   return false;
@@ -3933,6 +3966,50 @@ async function mbFindArtist(name) {
    只有 MusicBrainz 标了 front=true 才拼，否则 404 会变成灰块。 */
 const CAA_RG = "https://coverartarchive.org/release-group/";
 
+/* 华语歌手在 YouTube 上常写罗马音/英文名（趙薇 → Vicki Zhao / Zhao Wei /
+   Triệu Vy）。判断「这条视频是不是本人」时必须把这些写法都算上，
+   否则真原唱的条目会因为「歌手对不上」被扣分，让别人的 Topic 条目顶上去。 */
+const SINGER_LATIN = {
+  "赵薇": ["vicki zhao", "zhao wei", "zhaowei", "triệu vy", "trieu vy"],
+  "周杰伦": ["jay chou", "jaychou"],
+  "邓丽君": ["teresa teng"],
+  "王菲": ["faye wong"],
+  "陈奕迅": ["eason chan"],
+  "林俊杰": ["jj lin"],
+  "孙燕姿": ["stefanie sun"],
+  "蔡依林": ["jolin tsai"],
+  "张惠妹": ["a-mei", "amei", "chang hui mei"],
+  "五月天": ["mayday"],
+  "张学友": ["jacky cheung"],
+  "刘德华": ["andy lau"],
+  "张国荣": ["leslie cheung"],
+  "梅艳芳": ["anita mui"],
+  "罗大佑": ["lo ta yu", "lo da you"],
+  "李宗盛": ["jonathan lee"],
+  "李志": ["li zhi"],
+};
+
+/** 这条 YouTube 结果是不是这位歌手本人（标题或频道名里认得出人） */
+function artistHitIn(y, artistName) {
+  const want = String(artistName || "").trim();
+  if (!want) return false;
+  const raw = String((y && y.title) || "") + " " + String((y && y.artist) || "");
+  const hay = normTextZ(raw);
+  const names = splitSingers(want);
+  for (let i = 0; i < names.length; i++) {
+    const n = String(names[i] || "").trim();
+    if (!n) continue;
+    const nz = normTextZ(n);
+    if (nz && nz.length >= 2 && hay.indexOf(nz) >= 0) return true;
+    const lat = SINGER_LATIN[n] || SINGER_LATIN[nz] || [];
+    const low = raw.toLowerCase();
+    for (let k = 0; k < lat.length; k++) {
+      if (low.indexOf(lat[k]) >= 0) return true;
+    }
+  }
+  return false;
+}
+
 async function mbArtistCatalog(name) {
   const q = String(name || "").trim();
   if (!q) return null;
@@ -4189,7 +4266,12 @@ async function ytSearchRaw(query) {
                    (v.title && v.title.simpleText) || "",
             artist: ((v.ownerText && v.ownerText.runs) || []).map((x) => x.text).join("") ||
                     ((v.longBylineText && v.longBylineText.runs) || []).map((x) => x.text).join("") || "",
-            durationText: (v.lengthText && v.lengthText.simpleText) || "",
+            /* ⚠️ lengthText 有两种形态：simpleText（旧接口）和 runs[]（现在
+               ANDROID 的搜索接口返回的是 runs）。只读 simpleText 的话时长永远
+               是空串 —— MB 目录那条「按时长差压翻唱/现场」的权重整条失效，
+               实测赵薇《双》11 首里 8 首匹配不到音源就是这个原因。 */
+            durationText: (v.lengthText && (v.lengthText.simpleText ||
+              ((v.lengthText.runs || []).map((x) => x.text || "").join("")))) || "",
             artwork: ((v.thumbnail && v.thumbnail.thumbnails) || []).slice(-1)[0]?.url || "",
           });
         }
@@ -4207,6 +4289,35 @@ async function ytSearchRaw(query) {
  *   - 时长 2~10 分钟像首歌，超长（演唱会/合辑）和超短（切片）降权
  *   - 标题含 歌词/翻唱/remix/DJ/伴奏/纯享 等降权
  */
+/**
+ * 兜底时判断「这条 YouTube 视频是不是目标歌手唱的」。
+ *
+ * 背景事故（2026-10-21）：赵薇《不要告别》兜底命中
+ *   「Triệu Vy - Vol5.9: Không cần cáo biệt | 不要告别 | 2zhaowei.net***爱赵薇」
+ * 歌名在标题里、频道名里也有「爱赵薇」，但那是越南语合集。
+ *
+ * 判据（宁可给不出，也不给别人的声音）：
+ *   ① 标题里出现目标歌手 → 认（「趙薇 - 不要告别」这种最标准）
+ *   ② Topic 官方频道 + 标题干净（不含 | 多段拼接、长度不离谱）→ 认
+ *   ③ 其他 → 不认
+ */
+function ytIsThisArtist(v, want) {
+  const singers = splitSingers(want.singer).map((x) => normText(toSimplified(x))).filter(Boolean);
+  if (!singers.length) return true;                  // 没给歌手，无从判断
+  const title = String(v.title || "");
+  const tNorm = normText(toSimplified(title));
+  if (singers.some((x) => tNorm.indexOf(x) >= 0)) return true;
+
+  /* Topic 频道 = YouTube 自动生成的官方发行版，标题一般就是「歌名」，
+     偶尔带 (Official Audio) 之类。这种可以信。 */
+  if (/-\s*Topic$/i.test(String(v.artist || ""))) {
+    if (/\|/.test(title)) return false;              // 多段拼接 = 合集
+    if (tNorm.length > normText(toSimplified(want.name)).length * 2 + 12) return false;
+    return true;
+  }
+  return false;
+}
+
 function ytRank(list, want) {
   const t = normText(want.name);
   const scorer = list.map((v) => {
@@ -4593,11 +4704,19 @@ async function resolveYoutube(id, want, quality) {
       const list = await ytSearchRaw(kws[k]);
       if (!list.length) continue;
       const ranked = ytRank(list, want);
-      for (let i = 0; i < Math.min(2, ranked.length); i++) {
+      /* ⚠️ 以前只试前 2 条。加上严格校验后，前两条经常都被拒
+         （越南语合集、十七周年展播合集），真正的「趙薇 - 不要告别」
+         排在第 3、4 条，永远轮不到。校验已经够严，多试几条不会串歌。 */
+      for (let i = 0; i < Math.min(6, ranked.length); i++) {
         const cand = ranked[i];
         if (cand.score < 0) continue;
         // 兜底场景下必须是同一首歌，别拿同名/近似名的顶替
         if (id === null && !isDefinitelySameSong({ title: cand.v.title, artist: "" }, { name: want.name, singer: "", album: "" })) continue;
+        /* 兜底时还要确认是**这个人**唱的。
+           ⚠️ 事故：赵薇《不要告别》命中「Triệu Vy - Vol5.9: Không cần cáo biệt |
+              不要告别 | 2zhaowei.net***爱赵薇」—— 歌名在标题里、频道名里也有
+              「爱赵薇」，但那是越南语合集，不是她这一版。 */
+        if (id === null && !ytIsThisArtist(cand.v, want)) continue;
         try { return await ytFetchUrl(cand.v.id, quality); }
         catch (e) { errors.push("搜索取流: " + e.message); }
       }
@@ -4632,24 +4751,71 @@ const BILI_MIXIN_TAB = [
 let biliWbiKey = "";
 let biliWbiAt = 0;
 
+/** 用户自己填的 B 站 cookie（可选）。
+ *  填了就用它——带 SESSDATA 的登录态比匿名 buvid 抗风控得多。
+ *  只取这几个字段名，避免把用户浏览器里无关的 cookie 一起带出去。 */
+function biliUserCookie() {
+  try {
+    const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
+    const raw = String(vars.biliCookie || "").trim();
+    if (!raw) return "";
+    /* 允许用户直接粘 F12 里那一整行（带分号、带别的字段），这里只挑要的 */
+    const keep = [];
+    const parts = raw.split(";");
+    for (let i = 0; i < parts.length; i++) {
+      const c = parts[i].trim();
+      if (/^(SESSDATA|bili_jct|buvid3|buvid4|b_nut|buvid_fp|DedeUserID|DedeUserID__ckMd5|sid)=/.test(c)) {
+        if (c) keep.push(c);
+      }
+    }
+    // 整行里一个都没匹配上，说明用户填的是裸值（只给了 SESSDATA 的值）
+    return keep.length ? keep.join("; ") : "SESSDATA=" + raw.replace(/^SESSDATA=/, "");
+  } catch (e) { return ""; }
+}
+
 async function biliEnsureCookie() {
   // 十分钟过期重取
   if (biliCookie && Date.now() - biliCookieAt < 10 * 60 * 1000) return biliCookie;
+  /* 匿名指纹优先走 frontend/finger/spi —— 它直接吐 buvid3/buvid4 的值，
+     比扒首页 Set-Cookie 稳（首页有时不下发 buvid4，缺了会 -352）。 */
+  let anon = "";
   try {
-    const r = await axios_1.get("https://www.bilibili.com/", {
-      timeout: 15000,
-      headers: { "User-Agent": BILI_UA, Accept: "text/html" },
+    const r = await axios_1.get("https://api.bilibili.com/x/frontend/finger/spi", {
+      timeout: 10000,
+      headers: { "User-Agent": BILI_UA, Referer: "https://www.bilibili.com/" },
       validateStatus: () => true,
     });
-    const raw = (r.headers && r.headers["set-cookie"]) || [];
-    const picked = [];
-    for (let i = 0; i < raw.length; i++) {
-      const c = String(raw[i]).split(";")[0];
-      if (/^(buvid3|buvid4|b_nut|buvid_fp|buvid_info)/.test(c)) picked.push(c);
+    const d = (r.data && r.data.data) || {};
+    if (d.b_3) {
+      anon = "buvid3=" + d.b_3;
+      if (d.b_4) anon += "; buvid4=" + d.b_4;
     }
-    biliCookie = picked.join("; ");
-    biliCookieAt = Date.now();
-  } catch (e) { /* 拿不到就裸奔，可能被 -352 */ }
+  } catch (e) { /* 下面退回首页 */ }
+  if (!anon) {
+    try {
+      const r = await axios_1.get("https://www.bilibili.com/", {
+        timeout: 15000,
+        headers: { "User-Agent": BILI_UA, Accept: "text/html" },
+        validateStatus: () => true,
+      });
+      const raw = (r.headers && r.headers["set-cookie"]) || [];
+      const picked = [];
+      for (let i = 0; i < raw.length; i++) {
+        const c = String(raw[i]).split(";")[0];
+        if (/^(buvid3|buvid4|b_nut|buvid_fp|buvid_info)/.test(c)) picked.push(c);
+      }
+      anon = picked.join("; ");
+    } catch (e) { /* 拿不到就裸奔，可能被 -352 */ }
+  }
+  /* 用户 cookie 覆盖在匿名指纹上面：登录态优先，但缺 buvid 时补上匿名那部分 */
+  const user = biliUserCookie();
+  if (user) {
+    const has3 = /(^|;\s*)buvid3=/.test(user);
+    biliCookie = has3 ? user : (anon ? user + "; " + anon : user);
+  } else {
+    biliCookie = anon;
+  }
+  biliCookieAt = Date.now();
   return biliCookie;
 }
 
@@ -4661,7 +4827,13 @@ async function biliEnsureWbi() {
   try {
     const r = await axios_1.get("https://api.bilibili.com/x/web-interface/nav", {
       timeout: 15000,
-      headers: { "User-Agent": BILI_UA, Referer: "https://www.bilibili.com/" },
+      headers: {
+        "User-Agent": BILI_UA,
+        Referer: "https://www.bilibili.com/",
+        // 带上 cookie：登录态下 nav 回的真实 wbi_img 更稳（匿名时是 -101 + 一份匿名 key，
+        // 两种都能签名用，但登录态那份不会因为匿名 cookie 轮换失配）
+        Cookie: biliCookie || "",
+      },
       validateStatus: () => true,
     });
     const w = r.data && r.data.data && r.data.data.wbi_img;
@@ -4693,12 +4865,23 @@ function biliSign(params) {
   return qs + "&w_rid=" + w_rid;
 }
 
+/** B 站 API 请求头。
+ *  ⚠️ 光有 User-Agent 不够：B 站风控会看 sec-ch-ua / sec-fetch-* 这一套
+ *  （Chrome 从 89 起所有请求都带）。缺了它们，同一个 UA 也可能被判成脚本。
+ *  这套头对着 Chrome 131 的真实请求抄的，别随便删字段。 */
 function biliHeaders() {
   return {
     "User-Agent": BILI_UA,
     Referer: "https://www.bilibili.com/",
     Origin: "https://www.bilibili.com",
     Accept: "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
     Cookie: biliCookie,
   };
 }
@@ -4706,8 +4889,28 @@ function biliHeaders() {
 async function biliSearch(keyword, page, zone) {
   await biliEnsureCookie();
   await biliEnsureWbi();
-  /* 主路径：签名后的 search/all/v2（2026-10-21 起唯一能用的搜索口）。
-     返回结构是「分区分块」，视频只取 result_type === "video" 那块。 */
+  /* 主路径：签名后的 search/type。
+     ① 2026-10-21 之前它裸发会 -412，加上 w_rid 就恢复成 code 0 ——
+        不是端点废了，只是必须要签名。
+     ② 比 search/all/v2 强在支持 page_size：实测一次给 50 条，v2 固定 20 条。
+        一页 50 条意味着「赵薇 不要告别」这种关键词能多捞二十几条翻唱/冷门版本，
+        兜底取流时更好挑。 */
+  const call = async (extra) => {
+    const params = Object.assign({
+      search_type: "video", keyword: keyword, page: String(page || 1),
+      page_size: "50", order: "totalrank", web_location: "1430654",
+    }, extra || {});
+    const url = "https://api.bilibili.com/x/web-interface/search/type?" + biliSign(params);
+    const r = await axios_1.get(url, {
+      timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
+    });
+    const d = r.data || {};
+    if (d.code !== 0) return { code: d.code, message: d.message, list: [] };
+    return { code: 0, list: (d.data && d.data.result) || [] };
+  };
+  /* 备用路径：search/all/v2。结构是「分区分块」，视频在 result_type === "video"
+     那块里。page_size 不生效，一页 20 条，但它是另一套后端，
+     跟 type 一起挂的概率低，留着当活口。 */
   const callV2 = async (extra) => {
     const params = Object.assign({
       keyword: keyword, page: String(page || 1),
@@ -4725,15 +4928,6 @@ async function biliSearch(keyword, page, zone) {
     }
     return { code: d.code, message: d.message, list: vids };
   };
-  /* 备用路径：旧的 search/type。签名也发一份 ——
-     B 站要是哪天把 type 端点放出来，有签名比裸奔活得久。 */
-  const call = (extra) =>
-    axios_1.get("https://api.bilibili.com/x/web-interface/search/type?" + biliSign(Object.assign({
-      search_type: "video", keyword: keyword, page: String(page || 1),
-      page_size: "20", order: "totalrank",
-    }, extra || {})), {
-      timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
-    });
   // ⚠️ 必须限定「音乐区」（tids=3）。不传 tids 就是全站搜：搜「摇晃帝国」
   //    会返回《美国帝国崩溃三部曲》《瑞士独臂接触者》这类时政/新闻视频，
   //    而且 B 站在交错合并里排最前，整个结果列表会被它刷屏。
@@ -4749,19 +4943,15 @@ async function biliSearch(keyword, page, zone) {
   if (zoneMode === "guichu") { tids = 119; fallbackAll = false; }
   else if (zoneMode === "all") { tids = 0; fallbackAll = false; }
   else if (!shouldBiliMusicOnly()) { tids = 0; fallbackAll = false; }
-  /* 先打签名 v2；它要是也顶不住（风控升级/接口又改），
-     退回旧 type 端点再试一次 —— 两个端点一起死的概率比单点低。 */
+  /* 先打签名 type（一页 50 条）；它要是顶不住（风控升级/接口又改），
+     退回 all/v2 再试一次 —— 两个端点走不同后端，一起死的概率比单点低。 */
   let raw = [];
   let lastErr = "";
   const tries = [];
+  tries.push(() => call(tids ? { tids: String(tids) } : null));
+  if (fallbackAll) tries.push(() => call({ tids: "0" }));
   tries.push(() => callV2(tids ? { tids: String(tids) } : null));
   if (fallbackAll) tries.push(() => callV2({ tids: "0" }));
-  tries.push(async () => {
-    const r = await call(tids ? { tids: String(tids) } : null);
-    const d = r.data || {};
-    if (d.code !== 0) return { code: d.code, message: d.message, list: [] };
-    return { code: 0, list: (d.data && d.data.result) || [] };
-  });
   for (let i = 0; i < tries.length; i++) {
     try {
       const res = await tries[i]();
@@ -4988,6 +5178,18 @@ async function resolveBilibili(id, want, quality) {
         if (/伴奏|教学|教程|鼓谱|吉他谱|钢琴谱|纯音乐|karaoke/i.test(v.title)) continue;
         // 标题必须跟查询对得上（复用严格校验，但 artist 传空避免误杀）
         if (!isDefinitelySameSong({ title: v.title, artist: "" }, { name: want.name, singer: "", album: "" })) continue;
+        /* 兜底时（id 为 null）还要确认**就是这个人**唱的。
+           B站标题里普遍带演唱者（「【点播反馈】超载乐队《不要告别》」），
+           以前只校标题，结果赵薇的歌兜底到了超载乐队的版本。
+           判据：标题或 UP 主名里出现目标歌手。不做「排除别的歌手」的
+           反向判断（名字没法穷举），宁可少给也不给错。 */
+        if (id === null) {
+          const singers = splitSingers(want.singer).map((x) => normText(toSimplified(x))).filter(Boolean);
+          if (singers.length) {
+            const hay = normText(toSimplified(v.title + " " + (v.artist || "")));
+            if (!singers.some((x) => hay.indexOf(x) >= 0)) continue;
+          }
+        }
 
         let sc = 40;
         const singer = splitSingers(want.singer)[0] || "";
@@ -4998,7 +5200,9 @@ async function resolveBilibili(id, want, quality) {
       }
       scored.sort((a, b) => b.sc - a.sc);
 
-      for (let i = 0; i < Math.min(2, scored.length); i++) {
+      /* 同理放宽到 4 条：加了「必须是这个歌手」的校验后，
+         排在前面的常常是别人的翻唱 / 合集，真正的版本排在后面。 */
+      for (let i = 0; i < Math.min(4, scored.length); i++) {
         try { return await biliFetchUrl(scored[i].v.id, quality); }
         catch (e) { errors.push("取流: " + e.message); }
       }
@@ -10299,12 +10503,23 @@ async function getAlbumDetail(albumItem, page) {
             (tBare && yBare.indexOf(tBare) >= 0) ||
             (tBare && tBare.indexOf(yBare) >= 0 && yBare.length >= 2);
           if (!hitTitle) continue;
+          /* ⚠️ 原来是「Topic 频道 +100」，等于把打分变成「谁的频道最像官方」，
+             标题和歌手都退居其次。实测赵薇《双》：11 首里 3 首被 Topic 抢走 ——
+             《夜长梦多》给了王梓琪 - Topic、《不要告别》给了謝雷 - Topic，
+             全是别人的歌。现在歌手命中是第一权重，Topic 只是加分项，
+             认不出歌手的 Topic 条目拿不到高分。 */
+          const singerHit = artistHitIn(y, artistName);
+          /* 一两个字的歌名（赵薇《爱》、李志《春》）必须**整名对上**：
+             允许「被包含」的话《愛之玄》《愛情大魔咒》全会顶到《爱》头上 ——
+             实测《双》里的《爱》就是这么变成《愛情大魔咒》的。 */
+          if (tn.length <= 2 && yn !== tn && yBare !== tBare) continue;
           let sc = 0;
-          if (/[-–—]\s*Topic$/i.test(String(y.artist || ""))) sc += 100;
-          if (yn === tn) sc += 40;
-          else if (yBare === tBare) sc += 30;
+          if (singerHit) sc += 30; else sc -= 30;
+          if (/[-–—]\s*Topic$/i.test(String(y.artist || ""))) sc += singerHit ? 60 : 15;
+          if (yn === tn) sc += 45;
+          else if (yBare === tBare) sc += 38;
           else sc -= Math.max(0, yn.length - tn.length);
-          if (/歌词|歌詞|lyrics|翻唱|cover|remix|dj|伴奏|純享|纯享|live|現場|现场|演唱[会會]/i.test(y.title || "")) sc -= 60;
+          if (/歌词|歌詞|lyrics|翻唱|cover|remix|dj|伴奏|純享|纯享|live|現場|现场|演唱[会會]|公益|karaoke|教学|教程/i.test(y.title || "")) sc -= 70;
           const sec = ytDurSec(y.durationText);
           if (sec > 0 && t.duration > 0) {
             const dd = Math.abs(sec - Math.round(t.duration / 1000));
@@ -10544,8 +10759,12 @@ async function getAlbumDetail(albumItem, page) {
             if (!yn || yn.indexOf(tn) < 0) continue;
             let sc = 0;
             /* 「xxx - Topic」是 YouTube 给唱片公司自动生成的官方频道，
-               几乎必然是正版录音室版 —— 这是最硬的信号。 */
-            if (/[-–—]\s*Topic$/i.test(String(y.artist || ""))) sc += 60;
+               但它只说明「这是某个唱片公司的正版」，不说明是**这位歌手**的。
+               所以 Topic 加权必须挂在「歌手认得出来」上，
+               否则王梓琪 - Topic 会顶掉赵薇的原唱。 */
+            const singerHit = artistHitIn(y, albumItem.artist || "");
+            if (singerHit) sc += 25; else sc -= 25;
+            if (/[-–—]\s*Topic$/i.test(String(y.artist || ""))) sc += singerHit ? 60 : 10;
             // 标题正好就是歌名（不含「XX翻唱」「@某音乐节」这些）
             if (yn === tn) sc += 40;
             else sc -= (yn.length - tn.length);   // 多出来的字越多越不像
@@ -11935,6 +12154,34 @@ async function searchMusicAll(query, page) {
       droppedNews++;
       continue;
     }
+    /* 搜歌手名时，「歌手不是他、标题里也没有他的名字」的条目直接不收。
+       ⚠️ 实测 2026-10-21 搜「李志」：名单里混着
+          《今生只爱你一个》- 李志洲 / 《月》- 李志成 / 《完美犯罪》- 李志强
+          《水墨兰亭》- 李志辉（五首）/《走吧 回家》- 大勇（李志勇）
+        —— 全是名字里恰好带「李志」两个字的另一个人。
+        排序那层已经判得出「不是同一个人」（oneNameEq 要求中文名不能多字），
+        但它们照样留在列表里占位，用户翻下去一片陌生人。
+        判据用**两道 OR**：
+          a) 歌手字段确实是他（含繁简归一、拉丁前后缀）
+          b) 标题里出现他的名字（带右边界校验，挡掉「李志轩」这类）
+        B 站条目的 artist 是 UP 主昵称，只能靠 (b) 兜；YTM/Apple 补进来的
+        条目 artist 已经是目录歌手名，靠 (a) 过。
+        ⚠️ 目录补进来的条目（_ytm）天然可信：artist 已经是该歌手本名，放行。 */
+    if (artistQuery && !it._ytm) {
+      let ok = isArtistQuery(query, it.artist);
+      if (!ok) {
+        const tn = normTextZ(it.title);
+        const qn2 = normTextZ(query);
+        let from = 0;
+        while (!ok && qn2) {
+          const at = tn.indexOf(qn2, from);
+          if (at < 0) break;
+          if (cjkTailOk(tn, at, qn2.length)) ok = true;
+          from = at + 1;
+        }
+      }
+      if (!ok) { droppedNews++; continue; }
+    }
     /* 视频平台上的标题党视频 → 不是歌。
        实测搜「晴天」混进来一条：
          【🔮透視水晶球】光的頻率解析🌟你的防護罩有多強大？｜…晴天。光之旅程
@@ -12205,7 +12452,23 @@ async function searchMusicAll(query, page) {
         不比对名字就会拿它去问 YTM（实测白花 1.7s）。 */
   const _wantCatalog = artistQuery || artistHits >= 2 ||
     (!!appleCat && !exactTitleHit && normTextZ(appleCat.name) === normTextZ(query));
-  const _appleWeak = !appleCat || appleCat.tracks.length < 10;
+  /* ⚠️ 「Apple 目录够大」≠「Apple 目录管用」。李志的 Apple 目录 75 首看着齐全，
+     但他作品国内全下架，这一轮一条音源都落不到地上（见下面 _useYtmFill 的注释）。
+     所以除了「曲目少」，「结果里真正落在目录上的条目少」也算弱 ——
+     这种时候照样去问一次 YTM，它给的每条都自带 videoId，是真能播的。
+     ⚠️ 覆盖数必须**连歌手一起判**。只看标题会被翻唱骗过去：
+        实测搜「李志」，QQ 上耿十三翻唱的《关于郑州的记忆》《天空之城》
+        标题全都命中 Apple 目录，算出 14 条「有目录」→ 判定「目录管用」
+        → 不去问 YTM，而真正能播的李志原唱一条都没有。
+        目录里有这首歌 ≠ 这条是**他唱的**。 */
+  let _appleHitNow = 0;
+  if (appleCat) {
+    for (let i = 0; i < relevant.length; i++) {
+      if (appleCatScore(relevant[i], appleCat) >= 0 &&
+          isArtistQuery(query, relevant[i].artist)) _appleHitNow++;
+    }
+  }
+  const _appleWeak = !appleCat || appleCat.tracks.length < 10 || _appleHitNow < 6;
   if (_wantCatalog && _appleWeak) {
     const ytmT0 = Date.now();
     /* 给 2.8s 上限：目录本身 2.6s，再多就是白等。
@@ -12213,7 +12476,14 @@ async function searchMusicAll(query, page) {
        下次搜同一个歌手直接命中）。 */
     ytmCat = await Promise.race([
       ytmArtistCatalog(appleQuery || query).catch(function () { return null; }),
-      new Promise(function (res) { setTimeout(function () { res(null); }, 2800); }),
+      /* ⚠️ 2.8s 不够。实测 2026-10-21：李志 13 张专辑逐张拉曲目要 2987ms，
+         正好卡在 2800ms 的线上 —— 每次都被判超时，ytmCat 永远是 null，
+         于是「Apple 目录够大但拿不到音源」这种情形（作品国内全下架）
+         彻底没有兜底，列表里只剩翻唱和鬼畜。
+         而 Apple 目录已经判定不可用时（_appleWeak），YTM 是唯一能给出
+         真音源的一路，多等 1.8s 比返回一屏错的强。
+         正常歌手（Apple 目录管用）不会进这条路，不受影响。 */
+      new Promise(function (res) { setTimeout(function () { res(null); }, _appleWeak ? 4600 : 2800); }),
     ]);
     if (ytmCat) {
       console.log("[粽子] YTM 目录「" + ytmCat.name + "」"
@@ -12323,7 +12593,21 @@ async function searchMusicAll(query, page) {
      （YTM 的专辑排序按新→旧，代表作反而排在后面）。
      实测「脆弱少女组」：一加 YTM 补全就把它挤掉，头部从
      「脆弱少女組 - 都市青春戀曲（樂人 Session）」退回到 B 站杀马特搬运。 */
-  const _useYtmFill = !appleCat || appleCat.tracks.length < 10;
+  /* ⚠️ 「Apple 有目录」不等于「Apple 目录能用」。
+     实测 2026-10-21 搜「李志」：Apple 目录 19 张 75 首，看着齐全，
+     但作品国内全下架，平台结果里一条他自己的都没有 ——
+     这时既进不了下面 Apple 逐首补全（要求 10~60 首，75 超了），
+     又被这条挡着不去问 YTM，两边都不补，列表里全是耿十三的翻唱和 B 站鬼畜。
+     所以补一道「目录覆盖率」判据：先看结果里有几条**歌手对得上**的真条目，
+     太少就说明这份目录这轮拿不到音源，退到 YTM 去。 */
+  let _catHit = 0;
+  if (appleCat) {
+    for (let i = 0; i < relevant.length; i++) {
+      if (appleCatScore(relevant[i], appleCat) >= 0 &&
+          isArtistQuery(query, relevant[i].artist)) _catHit++;
+    }
+  }
+  const _useYtmFill = !appleCat || appleCat.tracks.length < 10 || _catHit < 6;
   if (ytmCat && _useYtmFill && (artistQuery || artistHits >= 2)) {
     /* ⚠️⚠️ 这里的 have 必须**按歌手**算，不能只按歌名 ——
        实测（2026-10-21）搜「李志」：
@@ -13633,7 +13917,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.28",
+  version: "4.10.29",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -13682,6 +13966,11 @@ module.exports = {
       key: "biliGuichu",
       name: "Bilibili 鬼畜区（默认开）",
       hint: "填 1 开启、0 关闭。开启后搜索会额外问一次 B 站鬼畜区（tids=119），并在「榜单」页多一组「B站鬼畜 · 本周热门」。鬼畜条目按匹配度正常参与排序，不再统一压到音乐条目之后 —— 真原唱靠权威目录自然排前面，鬼畜排在翻唱那一档。它们**不会**出现在推荐页，推荐页仍然只有正经歌单。关掉就彻底不碰鬼畜。",
+    },
+    {
+      key: "biliCookie",
+      name: "Bilibili Cookie（可选）",
+      hint: "一般不用填 —— 插件会自动拿匿名 buvid3/buvid4 指纹，搜索走 wbi 签名，实测不登录也能搜能播。\n\n只有 B 站风控升级、搜索开始报 -412 或取流报 -403 时才需要填：浏览器登录 B 站 → F12 → Network → 点任一 api.bilibili.com 请求 → Request Headers 里复制整行 Cookie 粘进来。带 SESSDATA 的登录态最抗风控。\n\n不用删多余的字段，插件只会取 SESSDATA / bili_jct / buvid3 / buvid4 / b_nut / buvid_fp / DedeUserID 这几项。",
     },
     {
       key: "useMiguApi",
@@ -14077,31 +14366,34 @@ function isDefinitelySameSong(it, want) {
   //    也不能长出太多（听书标题动辄几十字）
   if (t.length > q.length * 3 + 8) return false;
 
-  // 5) 歌手：兜底时放宽——只要不冲突就接受
-  //    （跨平台歌手名写法差异大，严格比会全灭）
+  // 5) 歌手：必须是**这个人**唱的
+  //
+  //    ⚠️ 原来这里是「不冲突就放行」（两边都超过 3 个字才算冲突）。
+  //       代价：赵薇《不要告别》兜底命中网易云 327560，
+  //       那是**张惠妹**的版本（4:50），点开就是别人的声音 ——
+  //       3 个字的歌手名（张惠妹/刘若英/陈奕迅）全被那条规则放行了。
+  //
+  //    现在：对不上就拒绝。归一化走 toSimplified + VARIANT_CHARS，
+  //    所以「葉蒨文/叶倩文」「趙薇/赵薇」这种写法差异不会误杀；
+  //    合唱 / feat. 只要任一位对得上就认。
+  //    对方没给歌手时无从判断 —— 放行，标题已经过上面的严格校验。
   if (want.singer && rawArtist) {
-    const a = normText(rawArtist);
-    const s = normText(splitSingers(want.singer)[0] || "");
-    if (s && a) {
-      const hit = a.indexOf(s) >= 0 || s.indexOf(a) >= 0;
-      // 不冲突就放行，但有明显冲突（都对不上且都很长）时不接受
-      if (!hit && a.length > 3 && s.length > 3) return false;
+    const a = normText(toSimplified(rawArtist));
+    const wantList = splitSingers(want.singer).map((x) => normText(toSimplified(x))).filter(Boolean);
+    const candList = splitSingers(rawArtist).map((x) => normText(toSimplified(x))).filter(Boolean);
+    if (a && wantList.length) {
+      const hit = wantList.some((s) => candList.some((c) => c.indexOf(s) >= 0 || s.indexOf(c) >= 0));
+      if (!hit) return false;
     }
   }
   return true;
 }
 
-function isDefinitelySameSong(it, want) {
-  const title = it.title || it.name || it.SONGNAME || "";
-  const artist = it.artist || it.singer || it.ARTIST || "";
-  if (!want.name || !title) return false;
-  if (!titleMatch(title, want.name)) return false;
-  if (want.singer) {
-    if (!artist) return false;
-    if (!singerMatch(artist, want.singer)) return false;
-  }
-  return true;
-}
+/* ⚠️ 这里原本还有一个「宽松版」isDefinitelySameSong。函数声明会被提升，
+   后写的覆盖先写的 —— 上面那套严格校验从 v4.9.8 起其实一直是死的。
+   症状：兜底时「趙薇 - 不要告别」和越南语合集
+   「Triệu Vy - Vol5.9: Không cần cáo biệt | 不要告别 | 2zhaowei.net***爱赵薇」
+   同分，选谁看返回顺序，点开就是别人的声音。已删除，别再写回来。 */
 
 
 /* ============================================================
