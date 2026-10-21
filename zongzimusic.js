@@ -3031,12 +3031,21 @@ async function appleArtistWorks(artistId, page, type, rn) {
     return { isEnd: begin + ps >= list.length, data: list.slice(begin, begin + ps) };
   }
 
+  /* 专辑名后面补年份：「飘 · 2004」。
+     歌手页的曲目列表里，专辑名就是分类标签 —— 77 首全是《天使旅行箱》
+     看着像只有一张唱片，加上年份至少能看出是哪几年的东西。 */
+  const yearByAlbum = {};
+  for (let i = 0; i < v.albums.length; i++) {
+    const a = v.albums[i];
+    const ak = normAlbumName(a.title || "");
+    if (ak && a.date) yearByAlbum[ak] = a.date;
+  }
   const data = v.tracks.slice(begin, begin + ps).map((t, i) => ({
     id: "apt:" + artistId + ":" + (begin + i),
     platform: "Apple Music",
     title: t.title,
     artist: artistName,
-    album: t.album,
+    album: albumLabelOf(t.album, yearByAlbum[normAlbumName(t.album || "")]),
     artwork: t.artwork,
     duration: t.dur,
     _provider: "apple",
@@ -3198,8 +3207,10 @@ function authorityScore(item, auth) {
   if (t !== at && t.indexOf(at) < 0 && at.indexOf(t) < 0 && titleSimZ(item.title, auth.title) < 0.8) return 0;
 
   const albumRaw = String(item.album || "");
-  const album = normText(toSimplified(albumRaw));
-  const authAlbum = normText(toSimplified(auth.album || ""));
+  /* ⚠️ 用 normAlbumName 而不是 normText：歌手页的曲目 album 是「飘 · 2004」，
+     直接 normText 会连年份一起比，跟权威库的「飘」永远对不上。 */
+  const album = normAlbumName(albumRaw);
+  const authAlbum = normAlbumName(auth.album || "");
   let sc = 0;
   // 歌手是不是**明确**对不上（既不是同一个人、也不是 Topic 官方频道）
   let artistMismatch = false;
@@ -3354,7 +3365,7 @@ function buildKeywords(want) {
   const first = splitSingers(want.singer)[0] || "";
   // 歌名 + 歌手（召回最好，尤其酷狗）
   if (want.name && first) push(want.name + " " + first);
-  if (want.name && want.album) push(want.name + " " + want.album);
+  if (want.name && want.album) push(want.name + " " + stripAlbumYear(want.album));
   if (want.name) push(want.name);
   // 实在不行再单搜歌手
   if (first) push(first);
@@ -6458,9 +6469,30 @@ function rankByName(list, query, nameKey, artistRank, auth) {
  *  iTunes 里单曲专辑叫《說散就散 - Single》，国内平台就叫《说散就散》，
  * 不削掉尾巴就永远对不上。 */
 function normAlbumName(s) {
-  return normTextZ(s)
+  return normTextZ(stripAlbumYear(s))
     .replace(/[-–—]\s*(single|ep|album|单曲|單曲)$/i, "")
     .trim();
+}
+
+/** 从日期串里取年份：「2004-11-16」→「2004」，取不到给空串。 */
+function albumYearOf(date) {
+  const m = String(date || "").match(/(19|20)\d{2}/);
+  return m ? m[0] : "";
+}
+
+/** 专辑名 + 年份，给歌手页当分类标签用：「飘」+2004 →「飘 · 2004」。
+    ⚠️ 只影响显示。内部比对一律走 normAlbumName，它会把这段尾巴削掉。 */
+function albumLabelOf(name, date) {
+  const n = String(name || "");
+  if (!n) return "";
+  const y = albumYearOf(date);
+  return y ? (n + " · " + y) : n;
+}
+
+/** 把「专辑名 · 年份」的尾巴削掉，还原成纯专辑名。
+    歌手页曲目带的 album 是带年份的，播放时拿去拼查询词会把年份也搜进去。 */
+function stripAlbumYear(s) {
+  return String(s || "").replace(/\s*[·・]\s*(19|20)\d{2}\s*$/, "");
 }
 
 /** 统计「这张专辑到底是谁的」。
@@ -12282,10 +12314,13 @@ async function getArtistWorksUncached(artistItem, page, type) {
                可在专辑页里同一首歌封面是对的：《飘》的 CAA 正面图一直在缓存里，
                只是这条补曲目的路径没去取。 */
             const artByAlbum = {};
+            const yearByAlbum = {};
             for (let i = 0; i < mcat.albums.length; i++) {
               const a = mcat.albums[i];
               const ak = normAlbumName(a.title || "");
-              if (ak && a.artwork) artByAlbum[ak] = a.artwork;
+              if (!ak) continue;
+              if (a.artwork) artByAlbum[ak] = a.artwork;
+              if (a.date) yearByAlbum[ak] = a.date;
             }
             let added = 0;
             /* 上限 90 首：一页塞两百条会卡，用户也翻不动。
@@ -12300,7 +12335,7 @@ async function getArtistWorksUncached(artistItem, page, type) {
                 platform: "MusicBrainz",
                 title: t.title,
                 artist: mcat.name,
-                album: t.album || "",
+                album: albumLabelOf(t.album, yearByAlbum[normAlbumName(t.album || "")]),
                 artwork: artByAlbum[normAlbumName(t.album || "")] || "",
                 duration: Number(t.duration || 0),
                 _provider: "mb",
@@ -15354,7 +15389,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.40",
+  version: "4.10.41",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
