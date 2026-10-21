@@ -522,7 +522,7 @@ async function pushToFeishu(text) {
 /* ============================================================
  * 基础工具
  * ============================================================ */
-function httpGet(url, params, headers) {
+function httpGet(url, params, headers, timeoutMs) {
   let full = url;
   if (params) {
     const qs = Object.keys(params)
@@ -531,8 +531,12 @@ function httpGet(url, params, headers) {
       .join("&");
     if (qs) full += (url.indexOf("?") >= 0 ? "&" : "?") + qs;
   }
-  return axios_1.get(full, { timeout: 20000, headers: Object.assign({ "User-Agent": UA }, headers || {}) })
-    .then((r) => r.data);
+  /* timeoutMs 可选：榜单页那种「一次要打十几个请求、用户正在等首屏」的
+     场景必须给短超时，默认 20s 是给单曲取流留的余量，不是给这里的。 */
+  return axios_1.get(full, {
+    timeout: Number(timeoutMs) || 20000,
+    headers: Object.assign({ "User-Agent": UA }, headers || {}),
+  }).then((r) => r.data);
 }
 
 function httpPost(url, body, headers) {
@@ -4644,7 +4648,19 @@ function ytPickAudio(list, quality) {
  *   - 内存占用 ≈ 文件大小 × 1.33
  *   所以必须限大小，超过上限回退流式。
  * ============================================================ */
-const YT_INLINE_MAX_BYTES = 6 * 1024 * 1024;   // 超过 6MB 不内联（无损/长音频）
+/* 上限 2MB（原 6MB）。
+ *
+ * ⚠️ 2026-10-21 事故：整个 App 无响应、无法切歌（同 B 站那次，一起踩的）。
+ *   base64 之后字符串是原大小的 1.33 倍，6MB 音频 = 8MB 字符串，
+ *   播放器在主线程解码这一整条，切歌点击事件排在后面根本进不来。
+ *
+ *   YouTube 内联本来是为了绕开两件事：URL 带时效签名、部分版权内容只放行
+ *   开头 1MB。第二条是真的（实测 2MB 处取字节返回 416/403），
+ *   所以不能像 B 站那样彻底退回纯流式 —— 那样受限曲目播到 1MB 就断。
+ *
+ *   折中：2MB 以内（覆盖绝大多数 mv 音轨，实测《晴天》1.56MB）照旧内联，
+ *   超过就走流式。内联池 3 条 × 2MB ≈ 8MB，Hermes 吃得下。 */
+const YT_INLINE_MAX_BYTES = 2 * 1024 * 1024;
 
 /* ⚠️ 内联必须有**总超时**（2026-10-21 事故：「一直转」）。
    原来只有每块的 20 秒超时，整首是 4 路并发分块下载，
@@ -5354,9 +5370,24 @@ async function biliStreams(bvid) {
  *
  * 实测：85~129 秒的鬼畜音频 0.8~3MB，下载 + base64 一共 0.3~1 秒。
  */
-/* 上限 8MB：内联缓存只留 3 首（见 INLINE_CACHE_MAX），8MB×3 = 24MB 是
-   Hermes 能接受的上限。超过 8MB 的长音频自动退回流式，播放器照样能放。 */
-const BILI_INLINE_MAX_BYTES = 8 * 1024 * 1024;
+/* 上限 1MB（原 8MB）。
+ *
+ * ⚠️ 2026-10-21 事故：整个 App 无响应、无法切歌。
+ *   B 站 4K MV 转出来的音频动辄 3~4MB，base64 之后写成一条 4.4MB 的字符串。
+ *   播放器拿到 `data:` URI 要在主线程解码这一整条字符串 ——
+ *   1MB 左右还能感觉到卡，4.4MB 直接把主线程堵死，
+ *   切歌的点击事件排在解码后面，进不来，表现就是「整机假死」。
+ *
+ *   这个内联机制当初是为了绕开「B 站 CDN 不带 Referer 就 403」。
+ *   但那个 403 的真正原因是请求头按**条目来源**查表（见 decorateSource
+ *   上面的 HOST_HEADER_RULES），兜底命中 B 站时 provider 还是 "mb"，
+ *   Referer 压根没附上。现在按流域名补头，播放器能正常流式拉 B 站音频了
+ *   （直搜的 B 站曲目一直能播，就是证据：那条路径 provider 正好是 bilibili）。
+ *
+ *   所以内联退回「只给小文件用」：短音频、鬼畜片段（< 1MB）内联确实省事，
+ *   整首歌一律走流式 —— 播放器边下边播，主线程不再被字符串解码占住。
+ *   缓存 3 条 × 1MB ≈ 3MB，Hermes 无压力。 */
+const BILI_INLINE_MAX_BYTES = 1 * 1024 * 1024;
 
 function shouldInlineBili() {
   try {
@@ -8227,52 +8258,166 @@ function neTopItem(p) {
   };
 }
 
+/* 网易官方榜单的固定目录（64 个）。
+   ⚠️ 这份表是**内置**的，不再靠 music.163.com/api/toplist 现拉。
+   原因：它是「榜单」页的第一组，也是唯一一组非联网就有的东西；
+   以前每次进页面都为一个几乎不变的表去等一次请求，网易那边一卡
+   就是整页白屏。2026-10-21 实测拉一次 0.5~1s，稳的时候纯属浪费，
+   不稳的时候就是「点进榜单一直转」。榜单目录一周才换一两个，
+   内置足够；真想更新时下面 updateNeTopBuiltin() 会悄悄刷一次。
+   字段：[歌单id, 名称, 更新频率, 封面] */
+let NE_TOP_BUILTIN = [
+  ["19723756","飙升榜","刚刚更新","https://p2.music.126.net/rIi7Qzy2i2Y_1QD7cd0MYA==/109951170048506929.jpg"],
+  ["3779629","新歌榜","刚刚更新","https://p2.music.126.net/5guhqPBTcIrrhLBotgaT6w==/109951170048511751.jpg"],
+  ["2884035","原创榜","每周四更新","https://p2.music.126.net/BaP9nrocNTL3gGThysv4eQ==/109951170091896587.jpg"],
+  ["3778678","热歌榜","更新18首","https://p2.music.126.net/0SUEG8yDACfx0Bw2MYFv4Q==/109951170048519512.jpg"],
+  ["71384707","网易云古典榜","每周四更新","https://p2.music.126.net/urByD_AmfBDBrs7fA9-O8A==/109951167976973225.jpg"],
+  ["1978921795","网易云电音榜","每周五更新","https://p2.music.126.net/hXGObvXfsGtFjFvRhOYAkA==/109951170091888741.jpg"],
+  ["991319590","网易云中文说唱榜","每周五更新","https://p2.music.126.net/GgHbgDfGXHpE2YTchU7IvA==/109951171510498108.jpg"],
+  ["18478568150","小天才热歌榜","更新15首","https://p2.music.126.net/GmmRZwOmh-DFwtF3TVJJrw==/109951174096842449.jpg"],
+  ["18176153161","实时分享榜","更新22首","https://p2.music.126.net/b2-_Xw-6DwDXWIn7RNuCYQ==/109951173652479140.jpg"],
+  ["14028249541","网易云全球说唱榜","每周五更新","https://p2.music.126.net/0hhFjP6WyIjHYDXKW5E7BA==/109951171535150782.jpg"],
+  ["13372522766","潮流风向榜","更新87首","https://p2.music.126.net/dIKA5e7jCncz2Br1Toxgaw==/109951170621574552.jpg"],
+  ["12911403728","音乐合伙人推荐榜","每周一更新","https://p2.music.126.net/s6ITpmGjKbyDpi7DPkqd2w==/109951170187827373.jpg"],
+  ["12911589513","音乐合伙人热歌榜","每周一更新","https://p2.music.126.net/RgYxQmB-ZUjkMRo2N1jWnQ==/109951170187823494.jpg"],
+  ["12911619970","音乐合伙人留名榜","每周一更新","https://p2.music.126.net/aJJzGIxhkVaD7dX0XBNUnw==/109951170187831145.jpg"],
+  ["12911379734","音乐合伙人高分新歌榜","每周一更新","https://p2.music.126.net/bfk15bvanhdPFU7yjPFgWA==/109951170187832038.jpg"],
+  ["12768855486","音乐合伙人高分榜","更新55首","https://p2.music.126.net/fPP5T0Z8Ac15qNvRTcHa6g==/109951170074028970.jpg"],
+  ["5453912201","黑胶VIP爱听榜","每周四更新","https://p2.music.126.net/qo6-o9n5AhMjNyejev38-A==/109951169743111905.jpg"],
+  ["71385702","网易云ACG榜","每周四更新","https://p2.music.126.net/na1kEeCS1iZEkzOrs9r_9g==/109951167976973667.jpg"],
+  ["745956260","网易云韩语榜","每周四更新","https://p2.music.126.net/5oN9YaFznwNGXkmi8i2Ytw==/109951167430864741.jpg"],
+  ["180106","UK排行榜周榜","每天更新","https://p2.music.126.net/fhAqiflLy3eU-ldmBQByrg==/109951165613082765.jpg"],
+  ["60198","美国Billboard榜","更新11首","https://p2.music.126.net/rwRsVIJHQ68gglhA6TNEYA==/109951165611413732.jpg"],
+  ["3812895","Beatport全球电子舞曲榜","刚刚更新","https://p2.music.126.net/oT-RHuPBJiD7WMoU7WG5Rw==/109951166093489621.jpg"],
+  ["21845217","KTV唛榜","每周五更新","https://p2.music.126.net/5wDP78s43ydVTKt62C8OjQ==/109951165613100063.jpg"],
+  ["60131","日本Oricon榜","每天更新","https://p2.music.126.net/aXUPgImt8hhf4cMUZEjP4g==/109951165611417794.jpg"],
+  ["2809513713","网易云欧美热歌榜","每周四更新","https://p2.music.126.net/70_EO_Dc7NT_hhfvsapzcQ==/109951167430862162.jpg"],
+  ["2809577409","网易云欧美新歌榜","更新26首","https://p2.music.126.net/0lPWpI9Ejn1OiW2LSbg-qw==/109951167430863224.jpg"],
+  ["27135204","法国 NRJ Vos Hits 周榜","每周五更新","https://p2.music.126.net/-fyzrPWd06FfWl_0JDAxMQ==/109951165613108584.jpg"],
+  ["3001835560","网易云ACG动画榜","更新77首","https://p2.music.126.net/SkGlKQ6acixthb77VlD9eQ==/109951164432300406.jpg"],
+  ["3001795926","网易云ACG游戏榜","更新87首","https://p2.music.126.net/hivOOHMwEmnn9s_6rgZwEQ==/109951164432303700.jpg"],
+  ["3001890046","网易云ACG VOCALOID榜","更新92首","https://p2.music.126.net/Ag7RyRCYiINcd9EtRXf6xA==/109951164432303690.jpg"],
+  ["5059644681","网易云日语榜","每周二更新","https://p2.music.126.net/YFBFNI2F-4BveUpv6FKFuw==/109951167430864069.jpg"],
+  ["5059633707","网易云摇滚榜","每周五更新","https://p2.music.126.net/LjkX2hktgFD1NXc3W6w0sA==/109951170048522513.jpg"],
+  ["5059642708","网易云国风榜","每周五更新","https://p2.music.126.net/kTJC5OBhg8I477X_ZmXyDQ==/109951168539740982.jpg"],
+  ["5338990334","潜力爆款榜","每周二更新","https://p2.music.126.net/Mi4QPklg1mtbWAfq74tEqQ==/109951165498334721.jpg"],
+  ["5059661515","网易云民谣榜","每周五更新","https://p2.music.126.net/Xe9qLTAqtBAWX_hPgFHMyw==/109951170048510929.jpg"],
+  ["6688069460","听歌识曲榜","每周四更新","https://p2.music.126.net/wJVUAiUuykKk7yGbQxDBug==/109951167430857712.jpg"],
+  ["6723173524","网络热歌榜","每周五更新","https://p2.music.126.net/_kSxOPqQ5J5etC5DKTFwNA==/109951170048519530.jpg"],
+  ["6732051320","俄语榜","每周四更新","https://p2.music.126.net/HbJ0BK5doY4I4pEMY6-FQw==/109951167430852698.jpg"],
+  ["6732014811","越南语榜","每周四更新","https://p2.music.126.net/N-Y5maLGWgrowt3TE6RtSg==/109951167430857045.jpg"],
+  ["6886768100","中文慢摇DJ榜","每周四更新","https://p2.music.126.net/w_01BfDU012ojxnzLO6tYw==/109951167977358686.jpg"],
+  ["6939992364","俄罗斯top hit流行音乐榜","每周五更新","https://p2.music.126.net/KLVO8PxVZzOoLdWQQNyprA==/109951166327316568.jpg"],
+  ["7095271308","泰语榜","每周四更新","https://p2.music.126.net/4W0WBHBgwYlYfRniuyL47A==/109951167430843284.jpg"],
+  ["7356827205","BEAT排行榜","每周四更新","https://p2.music.126.net/yhzlQJCJ9NcT4MvJBG_HgQ==/109951167977014958.jpg"],
+  ["7325478166","星云榜VOL.31 翁杰新专来袭，愿我们拥有广阔的天地！","每周五更新","https://p2.music.126.net/m9HWYdcz9xH-7SSito3-3A==/109951172864859483.jpg"],
+  ["7603212484","LOOK直播歌曲榜","每周二更新","https://p2.music.126.net/u-RQC-LyY0aoeseRumJ14A==/109951167977730469.jpg"],
+  ["7775163417","赏音榜","更新95首","https://p2.music.126.net/m9hQzC-d5wefBipedNPaHg==/109951168178601971.jpg"],
+  ["7785123708","黑胶VIP新歌榜","更新27首","https://p2.music.126.net/vjitpkT9nXBCth6tvdDMWg==/109951169743115266.jpg"],
+  ["7785066739","黑胶VIP热歌榜","刚刚更新","https://p2.music.126.net/Ay3mLgQ9weG_c8JjYrD-Bw==/109951169743106495.jpg"],
+  ["7785091694","黑胶VIP爱搜榜","更新39首","https://p2.music.126.net/R7DtZqNraesnsiaIKvzTHA==/109951169743112799.jpg"],
+  ["8246775932","实时热度榜","更新14首","https://p2.music.126.net/pvB8xRE2LMNxa-15ro69tw==/109951173645098023.jpg"],
+  ["8537588450","喜力®星电音派对潮音榜","每周五更新","https://p2.music.126.net/HVu2hGYvzN5XBuvFc_4Bgg==/109951168730309120.jpg"],
+  ["8661209031","乐夏榜","每周一更新","https://p2.music.126.net/RlStCmE97y0xYFk7rS3Zww==/109951168864907822.jpg"],
+  ["8703179781","特斯拉车友爱听榜","每周一更新","https://p2.music.126.net/UL8dhobSa3TR6Wd1JmWe_g==/109951168924385363.jpg"],
+  ["8703052295","理想车友爱听榜","每周一更新","https://p2.music.126.net/U--PWdWupY1ER5cVSjr1jQ==/109951168928365496.jpg"],
+  ["8702582160","比亚迪车友爱听榜","每周一更新","https://p2.music.126.net/S1OG-OLTaofa3HfrHW48kA==/109951168924393585.jpg"],
+  ["8703220480","蔚来车友爱听榜","每周一更新","https://p2.music.126.net/r9kBQNsOro1EAB82Ol51WQ==/109951168924380971.jpg"],
+  ["8702982391","极氪车友爱听榜","每周一更新","https://p2.music.126.net/Cu0RXoKewSPM9Gyc7Cp8jw==/109951168924391596.jpg"],
+  ["8532443277","蛋仔派对听歌榜","每周五更新","https://p2.music.126.net/TMb0be5QLMZKOFeuOKT4tg==/109951168717283910.jpg"],
+  ["9651277674","AI歌曲榜","刚刚更新","https://p2.music.126.net/M0m6GeZ1Y8Osz9jqxaW8Wg==/109951169462048035.jpg"],
+  ["10131772880","昊铂车友爱听榜","每周一更新","https://p2.music.126.net/EL7H4rkKejZY7Uv54EFNXg==/109951169655010112.jpg"],
+  ["10162841534","埃安车友爱听榜","每周一更新","https://p2.music.126.net/FcP1U6Bck0wPKqd0XgBwSQ==/109951169679731241.jpg"],
+  ["12225155968","欧美R&B榜","每周五更新","https://p2.music.126.net/0E6MzYzyA5uvQ4CSoIG2mw==/109951169739660034.jpg"],
+  ["12344472377","黑胶VIP限免榜","刚刚更新","https://p2.music.126.net/WXCSf4ZNcDCdOTY5ixm3Bg==/109951169809318325.jpg"],
+  ["12717025277","吉利车友爱听榜","每周一更新","https://p2.music.126.net/XVmZb3JSyrwMgqu9WVz61A==/109951170037568570.jpg"]
+];
+
+/* 异步刷新内置榜单目录：只在首次进榜单页之后跑一次，不阻塞出参。
+   拿到的新目录替换内存里的表 + 清缓存，下一次进页面就是新的。
+   失败无所谓，继续用内置的。 */
+let neTopRefreshed = false;
+function updateNeTopBuiltin() {
+  if (neTopRefreshed) return;
+  neTopRefreshed = true;
+  httpGet("https://music.163.com/api/toplist", null, NETEASE_HEADERS, NE_TOP_TIMEOUT)
+    .then((r) => {
+      const list = ((r && r.list) || []).filter((p) => p && p.id && p.name);
+      if (list.length < 20) return;   // 明显不正常，别覆盖内置表
+      NE_TOP_BUILTIN = list.map((p) => [
+        String(p.id), p.name,
+        String(p.updateFrequency || "").replace(/^最近更新：/, ""),
+        String(p.coverImgUrl || p.coverImageUrl || ""),
+      ]);
+      NE_TOP_CACHE = null;
+      console.log("[粽子] 网易榜单目录已刷新，共 " + list.length + " 个");
+    })
+    .catch(() => { /* 用内置的就行 */ });
+}
+
+function neTopBuiltinGroup() {
+  const data = [];
+  for (let i = 0; i < NE_TOP_BUILTIN.length; i++) {
+    const x = NE_TOP_BUILTIN[i];
+    data.push({
+      id: x[0],
+      platform: "网易云",
+      title: x[1],
+      artist: x[2] || "",
+      artwork: x[3] || "",
+      worksNum: 0,
+      playCount: 0,
+      description: x[2] || "",
+      _provider: "netease",
+    });
+  }
+  return data.length ? [{ title: "网易云榜单", data: data }] : [];
+}
+
 /** 分类精选用哪几个分类。太少显得空，太多会让「榜单」页打开变慢 */
 const NE_SHEET_CATS = ["华语", "流行", "摇滚", "民谣", "电子", "轻音乐", "爵士", "古风"];
 
-async function neteaseTopListGroups() {
-  const groups = [];
+/* 榜单页对网易的容忍时间。榜单页是「打开就要看到东西」的首屏，
+   网易任何一个接口卡住都不该拖着整页白屏 —— 所以每个请求 5s 截止，
+   整页再套一层 2.5s 软等待（见 getTopLists）。 */
+const NE_TOP_TIMEOUT = 5000;
+const NE_TOP_TTL = 10 * 60 * 1000;
+let NE_TOP_CACHE = null;   // { at, groups }
 
-  // ① 官方榜单（不带任何参数就是全部 64 个）
-  try {
-    const r = await httpGet("https://music.163.com/api/toplist", null, NETEASE_HEADERS);
-    const list = ((r && r.list) || []).filter((p) => p && p.id && p.name);
-    if (list.length) {
-      groups.push({
-        title: "网易云榜单",
-        data: list.map(neTopItem),
-      });
-    }
-  } catch (e) { console.log("[粽子] 榜单失败: " + e.message); }
+/* 网易那几组**联网**的（推荐歌单 + 8 个分类精选）。
+   ⚠️ 原来这是和「网易云榜单」串在一条 async 函数里顺序 await 的：
+     三段各自吃满 20s 超时的时候最坏 60 秒才返回 —— 手机上就是
+     「点进榜单一直转」。现在：网易云榜单走内置表（不联网、零等待），
+     这里这两段彼此并发，各自 5s 截止，整体还有一层软等待兜着。 */
+async function neteaseSheetGroups() {
+  if (NE_TOP_CACHE && Date.now() - NE_TOP_CACHE.at < NE_TOP_TTL) return NE_TOP_CACHE.groups;
 
-  // ② 官方推荐歌单
-  try {
-    const r = await httpGet("https://music.163.com/api/personalized/playlist", { limit: 12 }, NETEASE_HEADERS);
-    const list = ((r && r.result) || []).filter((p) => p && p.id && p.name);
-    if (list.length) {
-      groups.push({
-        title: "推荐歌单",
-        data: list.map(neTopItem),
-      });
-    }
-  } catch (e) { console.log("[粽子] 推荐歌单失败: " + e.message); }
+  const p2 = httpGet("https://music.163.com/api/personalized/playlist", { limit: 12 }, NETEASE_HEADERS, NE_TOP_TIMEOUT)
+    .then((r) => {
+      const list = ((r && r.result) || []).filter((p) => p && p.id && p.name);
+      return list.length ? [{ title: "推荐歌单", data: list.map(neTopItem) }] : [];
+    })
+    .catch((e) => { console.log("[粽子] 推荐歌单失败: " + e.message); return []; });
 
-  // ③ 分类精选：每个分类取 8 张精品歌单，并发拉，单条失败不影响其他
-  try {
-    const results = await Promise.all(NE_SHEET_CATS.map((cat) =>
-      httpGet("https://music.163.com/api/playlist/highquality/list",
-        { cat: cat, limit: 8, lasttime: 0, area: "全部" }, NETEASE_HEADERS)
-        .then((r) => ((r && r.playlists) || []).map(neTopItem))
-        .catch(() => [])
-    ));
+  const p3 = Promise.all(NE_SHEET_CATS.map((cat) =>
+    httpGet("https://music.163.com/api/playlist/highquality/list",
+      { cat: cat, limit: 8, lasttime: 0, area: "全部" }, NETEASE_HEADERS, NE_TOP_TIMEOUT)
+      .then((r) => ((r && r.playlists) || []).map(neTopItem))
+      .catch(() => [])
+  )).then((results) => {
+    const out = [];
     for (let i = 0; i < NE_SHEET_CATS.length; i++) {
-      if (results[i] && results[i].length) {
-        groups.push({ title: NE_SHEET_CATS[i] + "精选", data: results[i] });
-      }
+      if (results[i] && results[i].length) out.push({ title: NE_SHEET_CATS[i] + "精选", data: results[i] });
     }
-  } catch (e) { console.log("[粽子] 分类精选失败: " + e.message); }
+    return out;
+  }).catch((e) => { console.log("[粽子] 分类精选失败: " + e.message); return []; });
 
-  return groups.filter((g) => g.data && g.data.length);
+  const parts = await Promise.all([p2, p3]);
+  const groups = parts[0].concat(parts[1]).filter((g) => g.data && g.data.length);
+  /* 只缓存「拿到过东西」的结果。全灭（比如断网）时缓存空数组，
+     会让用户接下来 10 分钟都看不到榜单 —— 宁可下次重试。 */
+  if (groups.length) NE_TOP_CACHE = { at: Date.now(), groups: groups };
+  return groups;
 }
 
 /* ============================================================
@@ -10368,6 +10513,7 @@ const APPLE_CHART_REGIONS = [
 const APPLE_CHART_ALBUM_REGIONS = [["cn", "中国"], ["us", "美国"], ["jp", "日本"]];
 
 const APPLE_CHART_CACHE = {};
+const PENDING = {};   // 同一 feed 的在飞请求，避免重复点击叠成多个请求
 const APPLE_CHART_TTL = 30 * 60 * 1000;
 
 /* 榜单页愿意为 Apple 专辑/歌单榜等多久。超过就先把现有的吐出去，
@@ -10383,26 +10529,38 @@ function shouldUseAppleChart() {
   } catch (e) { return true; }
 }
 
-/** 带重试的 Apple 榜单请求。单次 8s，失败再来一次 —— 苹果这边超时是常态 */
-async function appleChartRaw(cc, kind, limit) {
+/** 带重试的 Apple 榜单请求。单次 8s，失败再来一次 —— 苹果这边超时是常态。
+ *  已经在后台预热过的条目（WARM）直接命中缓存，不再等网络。
+ *  opts.timeout / opts.attempts 用来收紧「用户正盯着转圈」的那几条路径。 */
+async function appleChartRaw(cc, kind, limit, opts) {
   const ck = cc + ":" + kind + ":" + limit;
   const hit = APPLE_CHART_CACHE[ck];
   if (hit && Date.now() - hit.at < APPLE_CHART_TTL) return hit.v;
+  if (PENDING[ck]) return PENDING[ck];   // 同一 feed 只飞一次，重复点击不叠加
 
+  const o = opts || {};
+  const tmo = Number(o.timeout) || 8000;
+  const tries = Number(o.attempts) || 2;
   const url = APPLE_CHART_BASE + "/" + cc + "/music/most-played/" + limit + "/" + kind + ".json";
-  let out = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const r = await axios_1.get(url, {
-        timeout: 8000,
-        headers: { "User-Agent": UA },
-        validateStatus: () => true,
-      });
-      if (r && r.status === 200 && r.data && r.data.feed) { out = r.data.feed; break; }
-    } catch (e) { /* 换一次重试 */ }
-  }
-  if (out) APPLE_CHART_CACHE[ck] = { at: Date.now(), v: out };
-  return out;
+
+  const job = (async () => {
+    let out = null;
+    for (let attempt = 0; attempt < tries; attempt++) {
+      try {
+        const r = await axios_1.get(url, {
+          timeout: tmo,
+          headers: { "User-Agent": UA },
+          validateStatus: () => true,
+        });
+        if (r && r.status === 200 && r.data && r.data.feed) { out = r.data.feed; break; }
+      } catch (e) { /* 换一次重试 */ }
+    }
+    if (out) APPLE_CHART_CACHE[ck] = { at: Date.now(), v: out };
+    delete PENDING[ck];
+    return out;
+  })();
+  PENDING[ck] = job;
+  return job;
 }
 
 /** 批量补时长 + 专辑名。查不到就算了，不影响列表出来 */
@@ -10412,7 +10570,7 @@ async function appleChartMeta(cc, ids) {
   try {
     const r = await axios_1.get("https://itunes.apple.com/lookup", {
       params: { id: ids.join(","), country: cc, entity: "song", limit: 200 },
-      timeout: 10000,
+      timeout: 5000,
       headers: { "User-Agent": UA },
       validateStatus: () => true,
     });
@@ -10427,7 +10585,10 @@ async function appleChartMeta(cc, ids) {
 
 /** 热门歌曲榜 → 可播放列表 */
 async function appleChartSongList(cc, limit) {
-  const feed = await appleChartRaw(cc, "songs", limit);
+  /* 这是「点榜单条目 → 曲目列表」那条路，用户在等着看列表。
+     苹果这边冷启动实测 1.4~3s，但偶尔一路吃满 8s 再重试 → 10s 以上。
+     首次 4s 就够（正常 3s 内回来），重试一次，最坏 8s。 */
+  const feed = await appleChartRaw(cc, "songs", limit, { timeout: 4000, attempts: 2 });
   const list = (feed && feed.results) || [];
   if (!list.length) return [];
   const meta = await appleChartMeta(cc, list.map((x) => x.id));
@@ -10531,9 +10692,12 @@ function applePageTracks(json) {
  *  代价是打开榜单页时要多拉 2 个 chart（中国区专辑 + 歌单），
  *  实测 1~3 秒，都有 30 分钟缓存，不重复请求。
  */
-async function appleChartEntries() {
-  const groups = [];
+/* 榜单页愿意为一个联网分组等多久。超过就先把手头有的吐出去，
+   剩下的留在后台继续拉（拉完进缓存，下次进页面就有）。 */
+const TOP_SOFT_WAIT = 2500;
 
+/** 8 个地区的热门歌曲条目 —— 纯静态，不联网 */
+function appleChartSongEntries() {
   const songs = [];
   for (let i = 0; i < APPLE_CHART_REGIONS.length; i++) {
     const cc = APPLE_CHART_REGIONS[i][0];
@@ -10549,7 +10713,11 @@ async function appleChartEntries() {
       _provider: "apple",
     });
   }
-  groups.push({ title: "Apple Music 热门歌曲", data: songs });
+  return { title: "Apple Music 热门歌曲", data: songs };
+}
+
+async function appleChartEntries() {
+  const groups = [appleChartSongEntries()];
 
   /* 专辑 / 歌单只展开中国区：再多个区，榜单页会长到要滚好几屏，
      而且这几个 chart 是打开页面就得等的，多了会明显变慢。 */
@@ -11383,6 +11551,17 @@ async function getArtistWorksOf(artistItem, page, type) {
               const k = normTextZ(head[i].title || "");
               if (k) have[k] = 1;
             }
+            /* ⚠️ 补进来的曲目必须带上它所在专辑的封面。
+               原先这里写死 artwork: ""，结果整份 MB 目录的曲目全靠兜底贴纸 ——
+               实测赵薇《一直下雨的星期天》（专辑《飘》）在单曲列表里是白毛贴纸，
+               可在专辑页里同一首歌封面是对的：《飘》的 CAA 正面图一直在缓存里，
+               只是这条补曲目的路径没去取。 */
+            const artByAlbum = {};
+            for (let i = 0; i < mcat.albums.length; i++) {
+              const a = mcat.albums[i];
+              const ak = normAlbumName(a.title || "");
+              if (ak && a.artwork) artByAlbum[ak] = a.artwork;
+            }
             let added = 0;
             /* 上限 90 首：一页塞两百条会卡，用户也翻不动。
                补齐的意义是「别让他看起来只发过一张唱片」，不是把全部作品一次倒完。 */
@@ -11397,7 +11576,7 @@ async function getArtistWorksOf(artistItem, page, type) {
                 title: t.title,
                 artist: mcat.name,
                 album: t.album || "",
-                artwork: "",
+                artwork: artByAlbum[normAlbumName(t.album || "")] || "",
                 duration: Number(t.duration || 0),
                 _provider: "mb",
               });
@@ -13520,6 +13699,37 @@ const PLAY_HEADERS = {
   qq: { Referer: "https://y.qq.com/" },
 };
 
+/* ⚠️ 2026-10-21 事故：整机假死、无法切歌。
+   根因一：请求头按**条目来源**查表，而不是按**这条流实际所在平台**查。
+   MusicBrainz / Apple 目录补出来的曲目 `_provider` 是 "mb" / "apple"，
+   播放时兜底竞速命中 B 站，provider 仍然是 "mb" —— 于是 Referer 一条都没附上。
+   播放器拿到裸 URL，B 站 CDN 直接 403，表现就是「播两秒跳下一首」。
+   当时为了绕开这个 403 才上了「整首下载转 data: URI」，
+   而 data: 又引出根因二（见 BILI_INLINE_MAX_BYTES 那段）。
+
+   现在按**流地址的域名**判平台，不管这条流是谁家兜底来的。
+   域名认不出来时才回落到 provider。 */
+const HOST_HEADER_RULES = [
+  { re: /(^|\.)bilivideo\.(com|cn)$/i, key: "bilibili" },
+  { re: /(^|\.)bilibili\.com$/i, key: "bilibili" },
+  { re: /(^|\.)kugou\.com(\.cn)?$/i, key: "kugou" },
+  { re: /(^|\.)kuwo\.cn$/i, key: "kuwo" },
+  { re: /(^|\.)qqmusic\.qq\.com$/i, key: "qq" },
+  { re: /(^|\.)stream\.qqmusic\.qq\.com$/i, key: "qq" },
+  { re: /(^|\.)music\.126\.net$/i, key: "qq" },
+];
+
+function providerForUrl(url, fallbackProvider) {
+  let host = "";
+  try { host = String(new URL(url).host || ""); } catch (e) { host = ""; }
+  if (host) {
+    for (let i = 0; i < HOST_HEADER_RULES.length; i++) {
+      if (HOST_HEADER_RULES[i].re.test(host)) return HOST_HEADER_RULES[i].key;
+    }
+  }
+  return fallbackProvider;
+}
+
 function decorateSource(result, provider) {
   if (!result || !result.url) return result;
   const u = String(result.url);
@@ -13537,7 +13747,8 @@ function decorateSource(result, provider) {
     }
   }
 
-  const h = PLAY_HEADERS[provider];
+  /* 按流地址域名判平台 —— 兜底来的 B 站流也必须带上 Referer */
+  const h = PLAY_HEADERS[providerForUrl(out, provider)];
   if (h) {
     result.url = out;
     result.headers = Object.assign({}, result.headers || {}, h);
@@ -14290,7 +14501,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.33",
+  version: "4.10.34",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -14358,12 +14569,12 @@ module.exports = {
     {
       key: "inlineYoutube",
       name: "YouTube 整首预载（默认开）",
-      hint: "填 1 开启、0 关闭。开启后 YouTube 的每首歌会先完整下载并内联，播放时不卡（代价是首次多等 2~5 秒）。超过 6MB 的文件会自动回退流式。其它平台不受影响。",
+      hint: "填 1 开启、0 关闭。开启后 YouTube 的音轨会先完整下载并内联，播放时不卡（代价是首次多等 2~5 秒）。超过 2MB 的文件自动回退流式。\n\n⚠️ 关掉它：看到「整个 App 卡死 / 点切歌没反应」时先关这个和下面那个。内联是把音频转成一长条字符串塞给播放器，字符串越大主线程越容易堵。",
     },
     {
       key: "inlineBili",
       name: "Bilibili 整首预下载（默认开）",
-      hint: "填 1 开启、0 关闭。开启后 B 站音频会先整首下载进内存再交给播放器。B 站 CDN 强制要求 Referer，播放器拿裸链接会 403（表现为播两秒超时跳下一首）；预下载能彻底避开。单曲约 1~3MB，多等 0.3~1 秒。",
+      hint: "填 1 开启、0 关闭。开启后 B 站 1MB 以内的短音频会先整首下载进内存再交给播放器。\n\n超过 1MB 的整首歌一律走流式（播放器自己边下边播），因为大文件内联会把主线程堵死——2026-10-21 出现「整个 App 无响应、无法切歌」就是这个原因。\n\n⚠️ 万一你的播放器版本不认插件返回的请求头（表现为 B 站歌播两秒就跳下一首、提示 403），把这个设成 1 并反馈给我，我再调高上限。",
     },
     {
       key: "prefetch",
@@ -14580,24 +14791,50 @@ module.exports = {
   getArtistWorks: getArtistWorksOf,
   /* 榜单页入口。返回 [{ title, data: [歌单] }]，
      MusicFree 会按分组渲染成「网易云榜单 / 推荐歌单 / 华语精选 …」。
-     点进去走 getMusicSheetInfo（_provider 是 netease，正好复用现有歌单详情）。 */
+     点进去走 getMusicSheetInfo（_provider 是 netease，正好复用现有歌单详情）。
+
+     ⚠️ 这个方法的出参就是榜单页的首屏。它慢 = 整页白屏，用户看到的是
+     「点进榜单一直转」。所以两件事都不能忍：① 内部任何一路卡住都不能
+     拖着整页；② 超时之后也得有东西显示，不能空着。
+     做法：网易云榜单（内置表）+ Apple 8 个地区 + 鬼畜这三组完全不联网，
+     立刻成型；只有「推荐歌单 / 分类精选 / Apple 专辑歌单」三组要联网，
+     整体只等 TOP_SOFT_WAIT，超时就把上次的缓存顶上，页面照样能看。 */
   getTopLists: function () {
-    /* Apple 榜单是静态条目、不联网，所以可以和网易那批并发；
-       Promise.all 里任何一边失败都各自兜住，缺谁都不影响另一边。 */
-    const ne = neteaseTopListGroups().catch((e) => {
-      console.log("[粽子] 榜单页整体失败: " + e.message);
+    const useApple = shouldUseAppleChart();
+    const guichu = shouldUseBilibili() && shouldBiliGuichu()
+      ? { title: "B站鬼畜", data: biliGuichuEntries() }
+      : null;
+    const cachedNe = () => (NE_TOP_CACHE ? NE_TOP_CACHE.groups.slice() : []);
+    const neLive = neteaseSheetGroups().catch((e) => {
+      console.log("[粽子] 榜单页联网分组失败: " + e.message);
+      return null;
+    });
+
+    /* 拼装顺序：网易云榜单 → 网易推荐/精选 → Apple → 鬼畜。
+       Apple 那几组没回来时至少放上 8 个地区的静态入口（点进去才联网），
+       别让 Apple 整块消失。 */
+    const assemble = (neGroups, apGroups) => {
+      const out = neTopBuiltinGroup();
+      out.push.apply(out, (neGroups || []).slice());
+      if (useApple) out.push.apply(out, (apGroups && apGroups.length) ? apGroups : [appleChartSongEntries()]);
+      if (guichu) out.push(guichu);
+      return out.filter((g) => g && g.data && g.data.length);
+    };
+
+    const softTimeout = () => new Promise((res) => setTimeout(() => res(null), TOP_SOFT_WAIT));
+
+    if (!useApple) {
+      return Promise.race([neLive, softTimeout()]).then((g) => assemble(g || cachedNe(), []));
+    }
+
+    const ap = appleChartEntries().catch((e) => {
+      console.log("[粽子] Apple 榜单分组失败: " + e.message);
       return [];
     });
-    if (!shouldUseAppleChart()) return ne;
-    const ap = Promise.resolve(appleChartEntries());
-    return Promise.all([ne, ap]).then((r) => {
-      const all = r[0].concat(r[1]);
-      /* 鬼畜榜单独一组，而且**只**挂在榜单页 —— 推荐页那边不掺。
-         它排在网易/Apple 之后，日常听歌的人刷不到那儿也不碍事。 */
-      if (shouldUseBilibili() && shouldBiliGuichu()) {
-        all.push({ title: "B站鬼畜", data: biliGuichuEntries() });
-      }
-      return all;
+    return Promise.race([Promise.all([neLive, ap]), softTimeout()]).then((r) => {
+      if (r) return assemble(r[0] || cachedNe(), r[1]);
+      console.log("[粽子] 榜单页 " + TOP_SOFT_WAIT + "ms 内未拉齐，先用缓存顶上（后台继续拉，下次进页面就有）");
+      return assemble(cachedNe(), []);
     });
   },
   /* 榜单详情。网易的榜单条目和歌单是同一套结构，直接复用；
