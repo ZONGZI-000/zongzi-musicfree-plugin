@@ -4690,7 +4690,31 @@ function artistHitIn(y, artistName) {
   return false;
 }
 
-async function mbArtistCatalog(name) {
+/* ⚠️ 单飞（2026-10-21）：同一份歌手目录在进入歌手页的瞬间会被**同时**要两次
+   —— 歌曲页一次、专辑页一次，两个分支各自往 MusicBrainz 发一遍
+   artist + release 两个请求（MB 限流 1.1s 一条，等于白白多等 2 秒）。
+   更糟的是 MB 慢的时候两次都会拖满 9 秒，用户看到的就是「点进歌手页一直转」。
+   这里按归一化名字合并成一个在跑的作业，后来的直接等它。 */
+const MB_CAT_INFLIGHT = {};
+
+function mbArtistCatalog(name) {
+  const ck = "mbcat:" + singerNorm(String(name || "").trim());
+  const hit = MB_CACHE[ck];
+  if (hit && Date.now() - hit.at < (hit.v ? MB_CAT_TTL : MB_FAIL_TTL)) return Promise.resolve(hit.v);
+  const running = MB_CAT_INFLIGHT[ck];
+  if (running) return running;
+  const job = mbArtistCatalogUncached(name).then(function (v) {
+    delete MB_CAT_INFLIGHT[ck];
+    return v;
+  }, function (e) {
+    delete MB_CAT_INFLIGHT[ck];
+    return null;
+  });
+  MB_CAT_INFLIGHT[ck] = job;
+  return job;
+}
+
+async function mbArtistCatalogUncached(name) {
   const q = String(name || "").trim();
   if (!q) return null;
   const ck = "mbcat:" + singerNorm(q);
@@ -12164,6 +12188,13 @@ async function kuwoSheetsByAlbum(albumId) {
 const ARTIST_GENERIC_CACHE = {};
 const ARTIST_GENERIC_TTL = 15 * 60 * 1000;
 
+/* ⚠️ 单飞（2026-10-21）：MusicFree 进歌手页的瞬间会把「歌曲」和「专辑」
+   两个分支**同时**打进来，两个分支的 gcKey 只差最后一段 type，缓存都还是空的，
+   于是各自把整条链路（Apple 目录 + 酷狗判断 / MB 补齐）完整跑一遍。
+   赵薇这种要走 MB 的歌手，等于同时往 MB 发两份请求，撞上 1.1s 限流就一起变慢。
+   这里按「平台+id+类型+页码」合并并发作业，后来的直接等同一个 promise。 */
+const ARTIST_WORKS_INFLIGHT = {};
+
 async function getArtistWorksOf(artistItem, page, type) {
   const id = artistItem && artistItem.id;
   if (!id) return { isEnd: true, data: [] };
@@ -12171,14 +12202,64 @@ async function getArtistWorksOf(artistItem, page, type) {
   const gcKey = "g|" + String(artistItem.platform || "") + "|" + String(id) +
     "|" + String(type || "music") + "|" + String(page || 1);
   const gcHit = ARTIST_GENERIC_CACHE[gcKey];
-  if (gcHit && Date.now() - gcHit.at < ARTIST_GENERIC_TTL) {
+  if (gcHit && Date.now() - gcHit.at < (gcHit.ttl || ARTIST_GENERIC_TTL)) {
     return { isEnd: gcHit.isEnd, data: gcHit.data };
   }
-  const gcOut = await getArtistWorksUncached(artistItem, page, type);
-  if (gcOut && Array.isArray(gcOut.data) && (page || 1) === 1) {
-    ARTIST_GENERIC_CACHE[gcKey] = { at: Date.now(), data: gcOut.data, isEnd: gcOut.isEnd };
-  }
-  return gcOut;
+  const running = ARTIST_WORKS_INFLIGHT[gcKey];
+  if (running) return running;
+
+  /* ---- 硬时限兜底（2026-10-21 修「歌手页全卡死」）----
+     每条分支自己都有超时，但它们会叠：Apple 目录 lookup 5s、MB 9s + 限流重试、
+     酷狗再来一遍。用户感知到的不是「某一段慢」，而是**整页一直转**。
+     所以总出口再加一道闸：到点先把手上能给的交出去（有过期的上一份就用它），
+     没有就返回空 + isEnd（界面显示「没有找到相关结果」，而不是无限转圈）。
+     作业本身继续在后台跑，跑完照旧写进缓存，下次进来直接命中。
+     ⚠️ 不能 reject —— 抛错会让播放器弹「加载失败」，比空列表更糟。
+     ⚠️ 闸门要挂在 inflight 那份 promise 上（不是裸 job），否则第二个进来的
+        调用（专辑页）拿到的是没有闸的 job，等于白加。 */
+  const ARTIST_WORKS_DEADLINE_MS = 12000;
+  const job = (async function () {
+    let hitDeadline = false;
+    const work = (async function () {
+      const o = await getArtistWorksUncached(artistItem, page, type);
+      if (o && Array.isArray(o.data) && (page || 1) === 1) {
+        /* ⚠️ 残缺结果（_partial，MusicBrainz 还在后台拉）只缓存 20 秒（2026-10-21）。
+           以前它会被当正常结果缓存 15 分钟：MB 在后台补完了，用户这 15 分钟里
+           每次进歌手页拿到的还是那 10 首，看起来就是「数据没修好 / 卡死」。
+           20 秒足够挡住「歌曲页→专辑页」这种连点，又不至于把残缺结果锁死。 */
+        ARTIST_GENERIC_CACHE[gcKey] = {
+          at: Date.now(),
+          data: o.data,
+          isEnd: o.isEnd,
+          ttl: o._partial ? 20 * 1000 : ARTIST_GENERIC_TTL,
+        };
+      }
+      return o;
+    })();
+    /* ⚠️ work 出错必须冒泡，但 inflight 也要摘掉。 */
+    const settled = work.then(
+      function (v) { delete ARTIST_WORKS_INFLIGHT[gcKey]; return v; },
+      function (e) { delete ARTIST_WORKS_INFLIGHT[gcKey]; throw e; }
+    );
+    const guarded = await Promise.race([
+      settled,
+      new Promise(function (res) {
+        setTimeout(function () { hitDeadline = true; res(null); }, ARTIST_WORKS_DEADLINE_MS);
+      }),
+    ]);
+    if (!hitDeadline) return guarded;
+    console.log("[粽子] 歌手页超时 " + ARTIST_WORKS_DEADLINE_MS + "ms，先返回已有内容："
+      + (artistItem.name || id));
+    /* 过期的上一份也比空白强（用户至少能继续点歌）。
+       ⚠️ 只回同一类型的 —— 拿歌曲列表去顶专辑页，界面上会把歌渲染成专辑卡片，
+       比空列表更让人困惑。作业仍在后台跑，跑完会刷新缓存。 */
+    if (gcHit && Array.isArray(gcHit.data)) {
+      return { isEnd: gcHit.isEnd, data: gcHit.data };
+    }
+    return { isEnd: true, data: [] };
+  })();
+  ARTIST_WORKS_INFLIGHT[gcKey] = job;
+  return job;
 }
 
 async function getArtistWorksUncached(artistItem, page, type) {
@@ -12276,7 +12357,8 @@ async function getArtistWorksUncached(artistItem, page, type) {
     const artistId = String(id).slice(6);
     if (!artistId) return { isEnd: true, data: [] };
     const isAlbum = type === "album";
-    const r = await appleArtistWorks(artistId, page, isAlbum ? "album" : "music", rn);
+    /* ⚠️ 不能直接改 appleArtistWorks 的返回值：它带 1 小时缓存，被别处共用。 */
+    const r = Object.assign({}, await appleArtistWorks(artistId, page, isAlbum ? "album" : "music", rn));
 
     /* ---- Apple 目录太薄时，用 MusicBrainz 补齐 ----
        实测（2026-10-21）「赵薇」：Apple 香港区只有《天使旅行箱》10 首，
@@ -12287,12 +12369,45 @@ async function getArtistWorksUncached(artistItem, page, type) {
        ⚠️ 补进来的曲目**没有 audio id**，播放时走跨平台兜底（跟 Apple
           占位条目同一套），所以 platform 标 MusicBrainz 而不是 Apple。 */
     const thin = r && (r.data || []).length < 20;
+    /* ⚠️ MB 之后补进来的结果，要连同 r._partial 一起往外交（见下面 return r）。 */
     if (page === 1 && thin) {
       try {
-        const mcat = await Promise.race([
-          mbArtistCatalog(artistItem.name || "").catch(function () { return null; }),
-          new Promise(function (res) { setTimeout(function () { res(null); }, 6000); }),
+        /* ⚠️ 分成「等」和「不等」两段（2026-10-21 修「歌手页全卡死」）。
+           以前这里只有一个 6 秒的 race：等到了就直接用，等不到就**彻底放弃**
+           MusicBrainz 那份目录 —— 而 MB 在国内实测经常 5~9 秒才回来
+           （赵薇第一次 4.5s，撞上限流重试就 9s+）。
+           于是慢网下用户看到的是「先空等 6 秒，然后还是原来那 10 首」，
+           下一次进来又重新等 6 秒，表现就是整页卡住不动。
+           现在：等 MB_CAT_FAST_MS（命中缓存 0ms），超时就把 Apple 那部分先交出去，
+           但 **MB 那份继续在后台拉**，拉完写进缓存 —— 用户再进来（或切回歌曲页）
+           就是全量 77 首，而不是像以前那样「每次进来都重新空等 6 秒」。
+           ⚠️ 必须 catch，否则后台那个 rejection 会变成 unhandled。
+           ⚠️ 窗口只给 1.5 秒（不是 6 秒）：MB 要么已有缓存（0ms），要么就是
+              4~9 秒起（撞上 1.1s 限流重试更久）。等 6 秒等于把「MB 慢」这件事
+              直接变成用户的白屏时间，而这段时间里 Apple 那部分其实早就能给了。 */
+        const MB_CAT_FAST_MS = 1500;
+        let mcat = null;
+        let stillRunning = true;
+        const mbP = mbArtistCatalog(artistItem.name || "").catch(function () { return null; });
+        mcat = await Promise.race([
+          mbP.then(function (v) { stillRunning = false; return v; }),
+          new Promise(function (res) { setTimeout(function () { res(null); }, MB_CAT_FAST_MS); }),
         ]);
+        if (!mcat && stillRunning) {
+          /* 后台继续拉：拉到就写进 MB 缓存，下次进来直接全量。 */
+          mbP.then(function (v) {
+            if (v && v.tracks) {
+              console.log("[粽子] MusicBrainz「" + v.name + "」后台补齐 "
+                + v.tracks.length + " 首（本次先返回 Apple 那部分）");
+            }
+          });
+          /* ⚠️ 关键（2026-10-21）：这次交给用户的是**残缺**结果（只有 Apple 那 10 首）。
+             如果它被当成正常结果缓存 15 分钟，那么 MB 后台补完也没用 ——
+             接下来 15 分钟每次进歌手页都是那 10 首，用户看到的就是「卡死/没数据」。
+             打个 _partial 标记，让外层只缓存很短时间（见 getArtistWorksOf），
+             后台补完后下一次进来就能拿到全量。 */
+          r._partial = true;
+        }
         if (mcat) {
           const head = (r && r.data) || [];
           if (isAlbum) {
@@ -12347,7 +12462,9 @@ async function getArtistWorksUncached(artistItem, page, type) {
                 + mcat.name + "」补 " + added + " 首");
             }
           }
-          return { isEnd: true, data: head };
+          /* ⚠️ _partial 要带出去：这次虽然是 MB 补齐的结果（好结果），
+             但如果 MB 本身是「还在后台跑」的那次，它就是残缺的。 */
+          return { isEnd: true, data: head, _partial: !!r._partial };
         }
       } catch (e) { /* MB 挂了就用 Apple 那份 */ }
     }
@@ -15389,7 +15506,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.41",
+  version: "4.10.42",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
