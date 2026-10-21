@@ -1494,18 +1494,87 @@ function titleCoversAllWords(title, query) {
  *
  * 只查右边不查左边：左边的情况（「原唱李志」「反李志」）分不清谁是谁，
  * 误杀风险比收益大；而右边界这一侧，「李志X」几乎必然是另一个人。 */
-const NAME_TAIL_CONNECTIVE = "的之版唱翻演现场会歌音曲乐新老合集系原词作编制混等和与及再共";
+/* ⚠️ 2026-10-21 第二次调参：白名单法误杀太狠。
+ *    原来要求「紧跟的汉字必须落在连接字白名单里」，但 normTextZ 会先把
+ *    空格和括号全删掉，于是
+ *      「李志 叙事歌」   → 李志叙事歌   「叙」不在白名单 → 误杀
+ *      「李志《墙上的向日葵》」→ 李志墙上的…  「墙」不在白名单 → 误杀
+ *      「【李志】天空之城」→ 李志天空之城  → 误杀
+ *      「叶倩文巅峰时期《情人知己》」      → 误杀
+ *    实测搜「叶倩文」100 条里被误杀 8 条，全是正经现场。
+ *
+ *    改成两条**只在明确是另一个人**时才拦的规则：
+ *      A. 右侧紧跟的是句子里的功能词（是/在/的/和/我/你/他…）
+ *         → 「关于李志是个营销号」这种吐槽视频
+ *      B. 查询词所在的连续中文块，正好只比查询词多一个字，且查询词在块首
+ *         → 「李志轩」「李志成」「李志斌」：三字姓名，但是另一个人
+ *    两条都要看**原始标题分隔符**（不能先删空格括号），
+ *    「李志 叙事歌」中间有空格就天然断开，不会进 A/B。 */
+/* 紧跟的若是这些「动作/体裁字」，说明名字后面接的是歌名或表演，不是人名 */
+const NAME_TAIL_VERB = "唱演版翻弹奏说讲写作改编合等和与及共集合录混";
+/* 紧跟的是这些「句子功能词」时，说的是「李志在干嘛」「李志是个营销号」
+   这种叙述句，不是「歌手 + 歌名」。
+   ⚠️ 刻意**不**收 的/和/与/之/版 ——
+   「李志的梵高先生」「李志和某某合唱」都可能是真结果。 */
+/* ⚠️ 「还」不能收：「李志还原度99%」是正经现场，「当/当/再」要收：
+   「叶倩文当年一脱火30年」是八卦标题，不是一首歌。 */
+const NAME_TAIL_STOP = "是在都也就太这那我你他她它们不没要会能又但而或呢吗吧啊么当初曾已";
 
-function cjkTailOk(t, at, n) {
-  const after = t.charAt(at + n);
-  if (!after) return true;                          // 名字在结尾
-  if (!/[一-鿿]/.test(after)) return true;  // 空格/标点/数字/英文都算断开
-  return NAME_TAIL_CONNECTIVE.indexOf(after) >= 0;
+/** 跟 normTextZ 一样做繁简归一，但把标点/空格/**括号**都换成同一个哨兵。
+ *  ⚠️ 三处跟 normTextZ 不同，都是为右边界判断服务的：
+ *    ① 空格、书名号、竖线保留成哨兵 —— 否则「李志 叙事歌」被压成
+ *       「李志叙事歌」，就跟三字人名「李志轩」混成一类了
+ *    ② 括号只换字符、**不删内容** —— 「不多（cover李志）」里的李志
+ *       必须还能找到（normTextZ 保留内容，这里也要保留）
+ *    ③ 不做 toLowerCase（这里只判中文，省一步） */
+function normKeepSep(s) {
+  return toSimplified(String(s || ""))
+    .replace(/[《》「」【】\[\]（）()]/g, "\u0001")
+    .replace(/[\s\-_|/,，。.、·~～!！?？:：;；"'"'*#@&+]+/g, "\u0001");
+}
+
+/** 该位置左侧所在连续中文块的起点 */
+function cjkRunStart(s, at) {
+  let i = at;
+  while (i > 0 && /[一-鿿]/.test(s.charAt(i - 1))) i--;
+  return i;
+}
+/** 该位置右侧所在连续中文块的终点（不含） */
+function cjkRunEnd(s, from) {
+  let i = from;
+  while (i < s.length && /[一-鿿]/.test(s.charAt(i))) i++;
+  return i;
+}
+
+function cjkTailOk(s, at, n) {
+  if (!s.charAt(at + n)) return true;                       // 名字就在结尾
+  if (!/[一-鿿]/.test(s.charAt(at + n))) return true;       // 空格/标点/英文都算断开
+  // 规则 0：紧跟句子功能词 → 叙述句，不是「歌手 + 歌名」
+  if (NAME_TAIL_STOP.indexOf(s.charAt(at + n)) >= 0) return false;
+  // 规则 A：被夹在一个更长的中文块中间（左右都是汉字）
+  //   「亲戚李志斌的笑容」「关于李志是个营销号」——
+  //   真结果的写法几乎总是「李志 歌名」「李志《歌名》」「歌名-李志」，
+  //   名字要么在块首、要么在块尾，不会插在一串汉字中间。
+  if (/[一-鿿]/.test(s.charAt(at - 1))) {
+    const rEnd = cjkRunEnd(s, at + n);
+    if (rEnd > at + n) return false;                        // 右边还有汉字 → 夹在中间
+  }
+  // 规则 B：整块就是「查询词 + 一个字」，是另一个人的三字姓名
+  //   「李志轩」「李志成」「李志斌」；但「李志唱」「李志翻」这种
+  //   是「李志 + 动作」，属于真结果，用动作字白名单放行。
+  const lStart = cjkRunStart(s, at);
+  const rEnd = cjkRunEnd(s, at);
+  if (lStart === at && rEnd === at + n + 1) {
+    if (NAME_TAIL_VERB.indexOf(s.charAt(at + n)) < 0) return false;
+  }
+  return true;
 }
 
 function titleMatchesAnchors(title, anchors, query) {
   const t = normTextZ(title);
   if (!t) return false;
+  /* 保留分隔符的版本，专供右边界判断用 */
+  const ts = normKeepSep(title);
   // ⚠️ 查询本身是多词时（「Lemon 米津玄師」「海阔天空 beyond」），
   //    必须**原查询的每个词都出现**，不能拿别名去放行 ——
   //    否则别名「米津玄師」单块命中，就会把《LOSER》《IRIS OUT》
@@ -1526,11 +1595,23 @@ function titleMatchesAnchors(title, anchors, query) {
       // 逐个出现位置检查右边界，任意一处合法就算命中
       // （「李志 李志轩」这种标题里第一个「李志」是干净的）
       let from = 0;
+      let hit = false;
       while (true) {
-        const at = t.indexOf(n, from);
+        const at = ts.indexOf(n, from);
         if (at < 0) break;
-        if (cjkTailOk(t, at, n.length)) return true;
+        if (cjkTailOk(ts, at, n.length)) { hit = true; break; }
         from = at + 1;
+      }
+      if (hit) return true;
+      // 分隔符把名字本身切开了（极罕见，如「李 志」）时退回无分隔版本
+      if (ts.indexOf(n) < 0) {
+        let f2 = 0;
+        while (true) {
+          const at = t.indexOf(n, f2);
+          if (at < 0) break;
+          if (cjkTailOk(t, at, n.length)) return true;
+          f2 = at + 1;
+        }
       }
     }
   }
@@ -5034,6 +5115,45 @@ async function biliSearch(keyword, page, zone) {
     });
   }
   return list;
+}
+
+/* ============================================================
+ * 分页并发拼接
+ *
+ * 为什么：签名版 search/type 一页给 50 条（numResults 报的是 1000+），
+ * 但原来只取第 1 页。搜「李志」第一页 50 条里过完时长/相关性过滤只剩
+ * 16 条，剩下的真货全在第 2~6 页 —— 用户看到的就是「李志自己的歌没了」。
+ *
+ * 实测（2026-10-21，签名接口）：
+ *   1 页  306~530ms  去重 50 条
+ *   2 页  291~307ms  去重 97~100 条
+ *   3 页  319~335ms  去重 134~139 条
+ *   6 页  953ms      去重 279 条
+ * 也就是说 3 页以内**基本不额外花时间**（并发发出，总耗时等于最慢那一页），
+ * 召回翻近 3 倍；到 6 页才开始被 B 站单 IP 并发限流拖到 1 秒。
+ * 所以默认拼 3 页，只在「结果太少」时再补 3 页。
+ * ============================================================ */
+async function biliSearchPages(keyword, pageCount, zone, startPage) {
+  const from = Math.max(1, startPage | 0 || 1);
+  const n = Math.max(1, Math.min(8, pageCount | 0));
+  const pages = await Promise.all(
+    Array.from({ length: n }, function (_, i) {
+      return biliSearch(keyword, from + i, zone).catch(function () { return []; });
+    })
+  );
+  const seen = Object.create(null);
+  const out = [];
+  for (let p = 0; p < pages.length; p++) {
+    const arr = pages[p] || [];
+    for (let i = 0; i < arr.length; i++) {
+      const x = arr[i];
+      if (!x || !x.id || seen[x.id]) continue;
+      seen[x.id] = 1;
+      x._page = p + 1;
+      out.push(x);
+    }
+  }
+  return out;
 }
 
 /* ============================================================
@@ -11726,8 +11846,11 @@ async function searchMusicAll(query, page) {
   const ytFirstRawP = shouldUseYoutube()
     ? ytSearchRaw(query).catch(function () { return []; })
     : null;
+  /* ⚠️ 首发就打 3 页并发（见 biliSearchPages 的实测数据：3 页以内不花额外时间），
+     返回的是第 1 页优先、按页序拼接去重后的 150 条上限。
+     后面如果发现过完过滤条数太少，会再补第 4~6 页。 */
   const biliFirstRawP = shouldUseBilibili()
-    ? biliSearch(query, 1).catch(function () { return []; })
+    ? biliSearchPages(query, 3).catch(function () { return []; })
     : null;
 
   /* iTunes 权威目录也提前发出去（只依赖 query，见 authorityPrefetch 的说明） */
@@ -11902,29 +12025,55 @@ async function searchMusicAll(query, page) {
       //    反查拿到原名后，B 站和 YouTube 都能搜到正确结果。
       // 跟 YouTube 一样：查询词那一发立刻出手，别等别名
       aliasGrace(450).then(async (ag) => {
+        /* 过滤 + 转成统一条目结构。抽出来是因为「补页」之后要再跑一遍。 */
+        const shape = (raw, anchList) => (raw || [])
+          .filter((x) => {
+            const d = x.duration / 1000;
+            if (d > 0 && (d < 60 || d > 900)) return false;
+            if (/伴奏|教学|教程|鼓谱|吉他谱|钢琴谱|karaoke|测评|reaction/i.test(x.title)) return false;
+            if (shouldFilterAudiobook() && isAudiobookTitle(x.title)) return false;
+            // ⚠️ 标题必须真的命中查询词/原名。B 站是分词匹配，
+            //    搜「摇晃帝国」会返回《时光的摇晃》《摇晃的汽水》，
+            //    这些标题里根本没有「帝国」两个字，必须拦掉。
+            if (!titleMatchesAnchors(x.title, anchList, query)) return false;
+            return true;
+          })
+          .map((x) => ({
+            id: x.id, platform: "Bilibili", title: x.title, artist: x.artist,
+            album: "", artwork: x.artwork, duration: x.duration,
+            playCount: Number(x.play || 0),   // 只有 B 站有这个字段
+            _provider: "bilibili", _raw: x,
+          }));
+        /* ⚠️ 补页：首发只拼了 3 页（150 条）。搜歌手时这 150 条里能过
+           时长/相关性过滤的往往只有三四十条，而 numResults 通常报 1000+，
+           第 4~6 页里还有大量正经现场和翻唱。所以过完滤不足 BILI_WANT 条
+           就再并发拉 3 页补上 —— 多花约 0.3~0.6s，只在「本来就少」时发生。 */
+        const BILI_WANT = 60;
+        const supplement = async (kw, anchList, have, usedPages) => {
+          if (have.length >= BILI_WANT) return have;
+          if (usedPages >= 6) return have;
+          let more = [];
+          try { more = await biliSearchPages(kw, 3, undefined, 4); } catch (e) { return have; }
+          const got = shape(more, anchList);
+          const seen = Object.create(null);
+          const merged2 = [];
+          for (const x of have.concat(got)) {
+            if (!x || !x.id || seen[x.id]) continue;
+            seen[x.id] = 1;
+            merged2.push(x);
+          }
+          return merged2;
+        };
         const tryOne = async (kwList, anchList, preRaw) => {
         for (let k = 0; k < kwList.length; k++) {
           let raw = [];
-          if (k === 0 && preRaw) raw = preRaw;
-          else { try { raw = await biliSearch(kwList[k], 1); } catch (e) { continue; } }
-          const keep = (raw || [])
-            .filter((x) => {
-              const d = x.duration / 1000;
-              if (d > 0 && (d < 60 || d > 900)) return false;
-              if (/伴奏|教学|教程|鼓谱|吉他谱|钢琴谱|karaoke|测评|reaction/i.test(x.title)) return false;
-              if (shouldFilterAudiobook() && isAudiobookTitle(x.title)) return false;
-              // ⚠️ 标题必须真的命中查询词/原名。B 站是分词匹配，
-              //    搜「摇晃帝国」会返回《时光的摇晃》《摇晃的汽水》，
-              //    这些标题里根本没有「帝国」两个字，必须拦掉。
-              if (!titleMatchesAnchors(x.title, anchList, query)) return false;
-              return true;
-            })
-            .map((x) => ({
-              id: x.id, platform: "Bilibili", title: x.title, artist: x.artist,
-              album: "", artwork: x.artwork, duration: x.duration,
-              playCount: Number(x.play || 0),   // 只有 B 站有这个字段
-              _provider: "bilibili", _raw: x,
-            }));
+          let usedPages = 1;
+          if (k === 0 && preRaw) { raw = preRaw; usedPages = 3; }
+          else {
+            try { raw = await biliSearchPages(kwList[k], 3); usedPages = 3; } catch (e) { continue; }
+          }
+          let keep = shape(raw, anchList);
+          keep = await supplement(kwList[k], anchList, keep, usedPages);
           // 这个关键词过滤后全灭就换下一个（比如原名在 B 站没收录）
           if (keep.length) {
             console.log("[粽子] Bilibili " + keep.length + " 条（关键词: " + kwList[k] + "）");
@@ -13995,7 +14144,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.30",
+  version: "4.10.31",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
