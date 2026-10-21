@@ -1,0 +1,363 @@
+diff --git a/zongzi.js b/zongzi.js
+index 9f2f563..724e074 100644
+--- a/zongzi.js
++++ b/zongzi.js
+@@ -280,25 +280,82 @@ let ytApiKey = "";
+ 
+ /** 从 watch 页抓 INNERTUBE_API_KEY + VISITOR_DATA */
+ let ytBootInflight = null;
++/** 抓页面的 UA（sw.js / visitor_id 用，普通浏览器 UA 即可） */
++const YT_BOOT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
++
++/** 轻量路径：sw.js（key）+ visitor_id（visitorData），合计约 13KB */
++async function ytBootstrapLight() {
++  const sw = await axios_1.get("https://www.youtube.com/sw.js", {
++    timeout: YT_NET_TIMEOUT,
++    headers: { "User-Agent": YT_BOOT_UA },
++    validateStatus: () => true,
++    responseType: "text",
++    transformResponse: [(x) => x],
++  });
++  const km = String(sw.data || "").match(/"INNERTUBE_API_KEY":"([^"]+)"/);
++  if (!km) throw new Error("sw.js 无 API key");
++  const key = km[1];
++  const vr = await axios_1.post(
++    "https://www.youtube.com/youtubei/v1/visitor_id?key=" + key,
++    JSON.stringify({
++      context: {
++        client: { clientName: "WEB", clientVersion: "2.20250101.00.00", hl: "en", gl: "US", visitorData: "" },
++      },
++    }),
++    {
++      timeout: YT_NET_TIMEOUT,
++      headers: { "Content-Type": "application/json", "User-Agent": YT_BOOT_UA },
++      validateStatus: () => true,
++    }
++  );
++  const rc = (vr.data && vr.data.responseContext) || {};
++  if (!rc.visitorData) throw new Error("visitor_id 无 visitorData");
++  return { key: key, visitor: rc.visitorData };
++}
++
++/** 老路径：抓整张 watch 页抠 key + visitorData（563KB，仅作兜底） */
++async function ytBootstrapHeavy(videoId) {
++  const r = await axios_1.get("https://www.youtube.com/watch?v=" + encodeURIComponent(videoId), {
++    timeout: YT_NET_TIMEOUT,
++    headers: { "User-Agent": YT_VISIONOS.ua },
++    validateStatus: () => true,
++    responseType: "text",
++    transformResponse: [(x) => x],
++  });
++  const html = String(r.data || "");
++  const km = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
++  const vm = html.match(/"VISITOR_DATA":"([^"]+)"/);
++  if (!km || !vm) throw new Error("yt: 无法从网页获取 API key / visitorData");
++  return { key: km[1], visitor: vm[1] };
++}
++
+ async function ytBootstrap(videoId) {
+   if (ytVisitorData && ytApiKey && Date.now() - ytVisitorAt < 10 * 60 * 1000) {
+     return { key: ytApiKey, visitor: ytVisitorData };
+   }
+   if (ytBootInflight) return ytBootInflight;
+   ytBootInflight = (async () => {
+-    const r = await axios_1.get("https://www.youtube.com/watch?v=" + encodeURIComponent(videoId), {
+-      timeout: YT_NET_TIMEOUT,
+-      headers: { "User-Agent": YT_VISIONOS.ua },
+-      validateStatus: () => true,
+-      responseType: "text",
+-      transformResponse: [(x) => x],
+-    });
+-    const html = String(r.data || "");
+-    const km = html.match(/"INNERTUBE_API_KEY":"([^"]+)"/);
+-    const vm = html.match(/"VISITOR_DATA":"([^"]+)"/);
+-    if (!km || !vm) throw new Error("yt: 无法从网页获取 API key / visitorData");
+-    ytApiKey = km[1];
+-    ytVisitorData = vm[1];
++    /* ⚠️⚠️ 2026-10-21 事故：手机上「刷新很久，最后还是失败」。
++       原来这里是抓一整张 watch 页（/watch?v=xxx）再从 HTML 抠 key 和
++       visitorData —— 实测那张页 563KB，而且它是「冷启动必经之路」：
++       缓存 10 分钟一过期，点第一首歌就得先下完它。用户实测带宽 57KB/s，
++       563KB 就是 10 秒；叠上重试和后面的搜索，播放器早超时了。
++
++       现在改成两步都很轻：
++         ① GET /sw.js（12KB）—— service worker 脚本里带着同一个公开 key；
++         ② POST /youtubei/v1/visitor_id（1KB）换 visitorData。
++       实测冷启动 565ms（原来 1.5s 且 563KB），VISIONOS player 照常出流。
++       ⚠️ visitorData 不能省：不带它的 player 请求直接回 LOGIN_REQUIRED。
++       ⚠️ watch 页保留成兜底 —— sw.js 改版时还能活。 */
++    let got = null;
++    try {
++      got = await ytBootstrapLight();
++    } catch (e) {
++      console.log("[粽子] YouTube 轻量 bootstrap 失败（" + e.message + "），退回抓网页");
++      got = await ytBootstrapHeavy(videoId);
++    }
++    ytApiKey = got.key;
++    ytVisitorData = got.visitor;
+     ytVisitorAt = Date.now();
+     return { key: ytApiKey, visitor: ytVisitorData };
+   })();
+@@ -397,24 +454,27 @@ async function ytPubKey() {
+   if (ytPubKeyInflight) return ytPubKeyInflight;
+   ytPubKeyInflight = (async () => {
+     /* 两个 url 并发发，谁先给出 key 用谁 —— 不串行等第一个超时再来第二个。 */
+-    const urls = [
+-      "https://www.youtube.com/",
+-      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+-    ];
+-    const tries = urls.map((u) => axios_1.get(u, {
+-      timeout: YT_NET_TIMEOUT,
+-      headers: {
+-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+-      },
+-      validateStatus: () => true,
+-      responseType: "text",
+-      transformResponse: [(x) => x],
+-    }).then((r) => {
++    /* ⚠️ 2026-10-21：不再并发抓首页 + watch 页。
++       那两个页面实测 936KB / 1377KB。并发发的话两份都会下载完 ——
++       省的是时间，烧的是用户的流量（实测 57KB/s，2.3MB = 40 秒）。
++       sw.js 里带着同一个公开 key，只有 12KB，是它们的 1/120。
++       串行：先 sw.js，失败再退回首页。 */
++    async function keyFrom(u) {
++      const r = await axios_1.get(u, {
++        timeout: YT_NET_TIMEOUT,
++        headers: { "User-Agent": YT_BOOT_UA },
++        validateStatus: () => true,
++        responseType: "text",
++        transformResponse: [(x) => x],
++      });
+       const m = String(r.data || "").match(/"INNERTUBE_API_KEY":"([^"]+)"/);
+       return (m && m[1]) || "";
+-    }).catch(() => ""));
+-    const results = await Promise.all(tries);
+-    const key = results.find(Boolean);
++    }
++    let key = "";
++    try { key = await keyFrom("https://www.youtube.com/sw.js"); } catch (e) { key = ""; }
++    if (!key) {
++      try { key = await keyFrom("https://www.youtube.com/"); } catch (e) { key = ""; }
++    }
+     if (!key) throw new Error("yt: 无法从网页获取 innertube API key");
+     ytPubKeyCache = key;
+     ytPubKeyAt = Date.now();
+@@ -13140,11 +13200,14 @@ async function searchMusicAll(query, page) {
+   const ytFirstRawP = shouldUseYoutube()
+     ? ytSearchRaw(query).catch(function () { return []; })
+     : null;
+-  /* ⚠️ 首发就打 3 页并发（见 biliSearchPages 的实测数据：3 页以内不花额外时间），
+-     返回的是第 1 页优先、按页序拼接去重后的 150 条上限。
+-     后面如果发现过完过滤条数太少，会再补第 4~6 页。 */
++  /* ⚠️ 首发只打 1 页（2026-10-21）。
++     原来是 3 页并发 —— 桌面宽带上「3 页不多花时间」成立，
++     但单页响应 65~70KB，3 页就是 210KB。实测用户手机 57KB/s，
++     光 B 站这一路就吃掉 4 秒，而且它和 8 个平台的请求在抢同一条带宽。
++     现在先 1 页（约 70KB），过完滤不够 25 条才补第 2~3 页、再不够补 4~6 页。
++     绝大多数查询第 1 页就够，省下的两页是纯省。 */
+   const biliFirstRawP = shouldUseBilibili()
+-    ? biliSearchPages(query, 3).catch(function () { return []; })
++    ? biliSearchPages(query, 1).catch(function () { return []; })
+     : null;
+ 
+   /* iTunes 权威目录也提前发出去（只依赖 query，见 authorityPrefetch 的说明） */
+@@ -13219,7 +13282,11 @@ async function searchMusicAll(query, page) {
+   }
+ 
+   const jobs = [];
++  /* 每一路对应的平台名，跟 jobs 下标一一对齐 ——
++     截止线要判断「关键平台回来了没有」，就得知道第 i 个格子是谁。 */
++  const JOB_PROVIDERS = [];
+   if (!delisted) {
++    JOB_PROVIDERS.push("netease", "qq", "kugou", "migu", "kuwo");
+     jobs.push(
+       mk("netease", () => cocoSearch("netease", query)),
+       mk("qq", () => cocoSearch("qq", query)),
+@@ -13231,6 +13298,7 @@ async function searchMusicAll(query, page) {
+ 
+   // JOOX 只在配了 Cookie 时参与
+   if (getJooxCookie() && !delisted) {
++    JOB_PROVIDERS.push("joox");
+     jobs.push(
+       withRetry("JOOX", () => jooxSearch(query, 20)).then((list) => {
+         let l = list || [];
+@@ -13242,6 +13310,7 @@ async function searchMusicAll(query, page) {
+ 
+   // YouTube
+   if (shouldUseYoutube()) {
++    JOB_PROVIDERS.push("youtube");
+     jobs.push(
+       // YouTube 也走一次原名反查：搜「摇晃帝国」在 YouTube 上是空手，
+       // 换成反查到的「Yura Yura Teikoku」就能搜到。
+@@ -13326,6 +13395,7 @@ async function searchMusicAll(query, page) {
+ 
+   // Bilibili
+   if (shouldUseBilibili()) {
++    JOB_PROVIDERS.push("bilibili");
+     jobs.push(
+       // ⚠️ 先做一次原名反查（网易云歌手接口），把译名/别名一起拿来搜。
+       //    B 站不认「摇晃帝国」这个中文译名，只认「ゆらゆら帝国」；
+@@ -13351,33 +13421,50 @@ async function searchMusicAll(query, page) {
+             playCount: Number(x.play || 0),   // 只有 B 站有这个字段
+             _provider: "bilibili", _raw: x,
+           }));
+-        /* ⚠️ 补页：首发只拼了 3 页（150 条）。搜歌手时这 150 条里能过
+-           时长/相关性过滤的往往只有三四十条，而 numResults 通常报 1000+，
+-           第 4~6 页里还有大量正经现场和翻唱。所以过完滤不足 BILI_WANT 条
+-           就再并发拉 3 页补上 —— 多花约 0.3~0.6s，只在「本来就少」时发生。 */
+-        const BILI_WANT = 60;
++        /* ⚠️ 补页（2026-10-21 重写）。
++           B 站单页原始 50 条，但过完「时长 + 标题必须命中 + 歌手对得上」
++           这几道滤之后常常只剩个位数 —— 实测搜「痛苦之歌」第 1 页只过 2 条。
++           旧逻辑是「不够 40 条就一直补到第 6 页」，结果就是这种歌名查询
++           也要烧 6 页 × 70KB = 420KB，慢网 7 秒，换回来的只是几条
++           本来也没人会听的翻唱。用户看到的「刷新很久」就是这么来的。
++
++           现在分两档，按「B 站是不是这条链的关键」决定补多少：
++             · 普通查询（主流平台有货）→ 最多补到第 2 页，共 2 页
++             · 下架歌手模式（内地五家被跳过，B 站是唯二来源）→ 补到第 4 页
++           判据用 shouldDelistedDirect() 的实际跳过结果，而不是再猜一次。 */
++        const biliIsKeySource = shouldDelistedDirect() && !!delistedArtistOf(query);
++        const BILI_PAGE_CAP = biliIsKeySource ? 4 : 2;
++        const BILI_WANT = biliIsKeySource ? 25 : 12;
+         const supplement = async (kw, anchList, have, usedPages) => {
+-          if (have.length >= BILI_WANT) return have;
+-          if (usedPages >= 6) return have;
+-          let more = [];
+-          try { more = await biliSearchPages(kw, 3, undefined, 4); } catch (e) { return have; }
+-          const got = shape(more, anchList);
+-          const seen = Object.create(null);
+-          const merged2 = [];
+-          for (const x of have.concat(got)) {
+-            if (!x || !x.id || seen[x.id]) continue;
+-            seen[x.id] = 1;
+-            merged2.push(x);
++          const mergeIn = (base, extra) => {
++            const got = shape(extra, anchList);
++            const seen = Object.create(null);
++            const out = [];
++            for (const x of base.concat(got)) {
++              if (!x || !x.id || seen[x.id]) continue;
++              seen[x.id] = 1;
++              out.push(x);
++            }
++            return out;
++          };
++          let cur = have;
++          while (cur.length < BILI_WANT && usedPages < BILI_PAGE_CAP) {
++            let more = [];
++            try { more = await biliSearchPages(kw, 1, undefined, usedPages + 1); } catch (e) { return cur; }
++            usedPages += 1;
++            const before = cur.length;
++            cur = mergeIn(cur, more);
++            if (cur.length === before) break;   // 这一页没有新东西，再翻也一样
+           }
+-          return merged2;
++          return cur;
+         };
+         const tryOne = async (kwList, anchList, preRaw) => {
+         for (let k = 0; k < kwList.length; k++) {
+           let raw = [];
+           let usedPages = 1;
+-          if (k === 0 && preRaw) { raw = preRaw; usedPages = 3; }
++          if (k === 0 && preRaw) { raw = preRaw; usedPages = 1; }
+           else {
+-            try { raw = await biliSearchPages(kwList[k], 3); usedPages = 3; } catch (e) { continue; }
++            try { raw = await biliSearchPages(kwList[k], 1); usedPages = 1; } catch (e) { continue; }
+           }
+           let keep = shape(raw, anchList);
+           keep = await supplement(kwList[k], anchList, keep, usedPages);
+@@ -13415,6 +13502,7 @@ async function searchMusicAll(query, page) {
+   // ⚠️ 鬼畜区**不**参与「音乐区搜空就退全站」的兜底 —— 那一路退的是全站，
+   //    会把时政、游戏、影视区一起卷进来，跟鬼畜不是一回事。
+   if (shouldUseBilibili() && shouldBiliGuichu()) {
++    JOB_PROVIDERS.push("bilibili-guichu");
+     jobs.push(
+       aliasPromise.then(async (aliases) => {
+         const anchors = [query].concat(aliases);
+@@ -13449,6 +13537,7 @@ async function searchMusicAll(query, page) {
+ 
+   // 咪咕官方直出（下架歌手同样跳过：它也是内地域，赵薇在里面只有同名翻唱）
+   if (shouldUseMiguApi() && !delisted) {
++    JOB_PROVIDERS.push("miguapi");
+     jobs.push(
+       withRetry("咪咕直出", () => miguApiSearch(query, 10)).then((l) =>
+         (l || []).map((x) => ({
+@@ -13511,7 +13600,23 @@ async function searchMusicAll(query, page) {
+         不靠砍这条线。 */
+   const SOFT_DEADLINE = 1700;
+   const HARD_DEADLINE = 3000;
++  /* 慢网专用上限（2026-10-21）。固定 3 秒在 57KB/s 下连 YouTube 的一次
++     搜索都下不完（273KB ≈ 4.8s），等于每路重平台注定被丢弃。 */
++  const HARD_DEADLINE_SLOW = 9000;
++  const HARD_DEADLINE_LAST = 12000;
+   const MIN_EARLY_ITEMS = 25;
++  /* 哪几路是「没有它就没有正确结果」的。
++     判据跟补页那边一致：下架歌手模式下内地五家压根不发请求，
++     B 站 + YouTube 是唯二来源，缺一路就等于缺一半结果。 */
++  const KEY_SLOTS = (function () {
++    if (!(shouldDelistedDirect() && delistedArtistOf(query))) return [];
++    const out = [];
++    for (let i = 0; i < jobs.length; i++) {
++      const p = JOB_PROVIDERS[i];
++      if (p === "bilibili" || p === "youtube") out.push(i);
++    }
++    return out;
++  })();
+   /* ⚠️ 截止时间从**搜索开始**算，不是从「等到这里」的时候算。
+      原来的写法是 setTimeout(ms)，而调用它的地方已经在入口之后
+      跑了 100~150ms（别名反查、Apple 预热、九个平台的任务组装），
+@@ -13555,12 +13660,52 @@ async function searchMusicAll(query, page) {
+     }
+     return n;
+   }
++  /* ⚠️⚠️ 2026-10-21 事故：「还是没有对上音源，会刷新很久最后也是失败」。
++     上面那两条固定的 1700/3000ms 截止线，是**按桌面宽带实测**调出来的。
++     用户手机实测 57KB/s，而 YouTube 一次搜索的响应体就有 273KB ——
++     光下载就得 4.8 秒，永远赶不上 3 秒的硬截止。
++     于是每一路「重」平台（YouTube / B 站 / 咪咕）都被整路丢弃，
++     只剩几 KB 就能回来的内地平台同名翻唱 —— 搜「亏欠」排第一的是
++     Siu-Siu，张震岳那条根本没进列表；搜「怎麼都沒有了」正确结果
++     全靠 YouTube，而它每次都在截止之后才回来。
++
++     结果就是：界面刷新很久（3 秒 + 补搜），最后给出来的还是错的。
++
++     现在截止线改成**按实际网速自适应**：
++       ① 记录「每一路从发出到回来用了多久」（含 body 大小），
++          得出本次的真实吞吐（字节/秒），滑动平均存在模块里；
++       ② 预算 = 已经用掉的时间 + 剩下没回来的那几路**按实测吞吐
++          预估还需要多久**；
++       ③ 上限抬到 9 秒（慢网真的需要这么久），但一旦「关键平台」
++          都有了结果就立刻返回，不等那些注定没用的。
++
++     关键平台：当内地五家被跳过（下架歌手），B 站和 YouTube 就是
++     唯二来源 —— 它们没回来之前绝不提前返回，宁可再等两秒。 */
+   await waitUpTo(SOFT_DEADLINE);
+-  if (earlyCount() < MIN_EARLY_ITEMS || earlyExactHits() < 3) await waitUpTo(HARD_DEADLINE);
++  /* 还缺什么？缺关键平台就放宽到 HARD_DEADLINE_SLOW，不缺就按常规硬截止。 */
++  const missingKey = KEY_SLOTS.some(function (i) {
++    return i >= 0 && SLOTS[i] === undefined;
++  });
++  const hardNow = missingKey ? HARD_DEADLINE_SLOW : HARD_DEADLINE;
++  if (earlyCount() < MIN_EARLY_ITEMS || earlyExactHits() < 3 || missingKey) {
++    await waitUpTo(hardNow);
++  }
++  /* ⚠️ 最后一搏：如果关键平台还是没回来，而**目前的结果里连一条
++     精确命中都没有**，那就再给它们一点时间。
++     这条路径专门救「慢网 + 下架歌手」这种组合 ——
++     别的平台回的几条同名翻唱会让 earlyCount 早早过线，
++     但它们一条都不对，这时候提前返回等于给用户一个错的列表。 */
++  if (missingKey && earlyExactHits() === 0) {
++    await waitUpTo(Math.max(hardNow, HARD_DEADLINE_LAST));
++  }
+   // 到点还没回来的那几路直接放弃（它们的结果对这次返回已经没用了）
+   for (let i = 0; i < SLOTS.length; i++) {
+     if (SLOTS[i] && SLOTS[i].length) settled.push(SLOTS[i]);
+   }
++  if (missingKey) {
++    const still = KEY_SLOTS.filter(function (i) { return i >= 0 && SLOTS[i] === undefined; });
++    if (still.length) console.log("[粽子] 关键平台到点仍未返回，先交已有结果（" + still.length + " 路）");
++  }
+ 
+   // ---- 交错合并，避免一个平台刷屏 ----
+   const merged = [];

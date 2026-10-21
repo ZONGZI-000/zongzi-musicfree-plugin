@@ -3713,7 +3713,7 @@ async function resolveNetease(id, want, quality) {
       catch (e) { errors.push("coco搜索: " + e.message); }
     }
   } catch (e) { errors.push("coco搜索: " + e.message); }
-  throw new Error(errors.join(" | "));
+  throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
 async function resolveQQ(id, want, quality) {
@@ -3731,7 +3731,7 @@ async function resolveQQ(id, want, quality) {
       catch (e) { errors.push("coco搜索: " + e.message); }
     }
   } catch (e) { errors.push("coco搜索: " + e.message); }
-  throw new Error(errors.join(" | "));
+  throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
 async function resolveKugou(id, want, quality) {
@@ -3761,7 +3761,7 @@ async function resolveKugou(id, want, quality) {
       catch (e) { errors.push("coco搜索: " + e.message); }
     }
   } catch (e) { errors.push("coco搜索: " + e.message); }
-  throw new Error(errors.join(" | "));
+  throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
 /* ============================================================
@@ -5588,7 +5588,7 @@ async function resolveYoutube(id, want, quality) {
       if (usable) break;
     }
   } catch (e) { errors.push("搜索: " + e.message); }
-  throw new Error(errors.join(" | "));
+  throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
 /* ============================================================
@@ -6050,6 +6050,21 @@ async function biliStreams(bvid) {
    完整的歌走流式，B站 CDN 现在能带对 Referer（见 HOST_HEADER_RULES）。 */
 const BILI_INLINE_MAX_BYTES = 400 * 1024;
 
+/* ⚠️ 2026-10-21：**没有 mcdn 节点时**才使用的另一档内联上限。
+ *
+ *   背景见 biliFetchUrl 里 isUaFree 那段：B 站 upos 集群按 UA 做防盗链，
+ *   播放器带什么 UA 插件管不了（有些会盖掉我们给的头），只有 mcdn 不校验。
+ *   但实测约 7/8 的条目**只有 upos、没有 mcdn**，这类条目走流式必 403。
+ *
+ *   所以这类条目必须由插件自己把音频下下来内联成 data: URI。
+ *   代价是主线程要处理这条长字符串，体积越大越危险 ——
+ *   400KB 时切歌会有轻微顿挫，1.5MB 时（内联后 2MB 字符串）
+ *   用户反馈是「整个软件卡顿」。1.5MB 是实测还能接受的上限，
+ *   再大就宁可让它 403（至少不卡死整个 App），或者退到别的平台。
+ *
+ *   mcdn 条目**不**走这个上限：它们能流式，没必要内联。 */
+const BILI_INLINE_FALLBACK_MAX = 1500 * 1024;
+
 function shouldInlineBili() {
   /* 预取阶段一律不内联：那时候用户还没点播放，
      为了「提前准备好」去下整首音频是本末倒置（见 prefetchTop）。 */
@@ -6080,23 +6095,86 @@ async function biliFetchUrl(bvid, quality) {
     order = use.slice().sort((a, b) => Math.abs(a.bw - target) - Math.abs(b.bw - target));
   }
 
-  const errors = [];
-  for (let i = 0; i < order.length; i++) {
-    const cands = [order[i].url].concat(order[i].alts || []);
+  /* ⚠️⚠️ 2026-10-21 关键修复：**把不校验 UA 的 PCDN 节点排到最前面**。
+   *
+   *   事故：用户反馈「点歌 → 最后没有播放」。插件里怎么测都正常，
+   *   播放器里就是不出声。逐个换 User-Agent 打同一批地址，结论很干脆：
+   *
+   *     upos-*（upos-sz-mirrorhw / estgoss / mirrorcos…）   0/19 坏UA能播
+   *     edge.mountaintoys.cn（另一家 PCDN）                 0/3  坏UA能播
+   *     mcdn.bilivideo.cn:8082（B 站自己的 PCDN）          **5/5 坏UA能播**
+   *
+   *   桌面 UA 打这三类全是 206；换上播放器真实会带的 UA
+   *   （stagefright / ijkplayer / Lavf 实测全中）之后，只有 mcdn 还活。
+   *   也就是说 B 站只在自家 upos 集群和 mountaintoys 上做 UA 防盗链，
+   *   mcdn 这条边缘 PCDN 不查。
+   *
+   *   而播放器带什么 UA 插件管不了 —— 有些客户端会用**它自己的** UA
+   *   盖掉我们放在 headers 里的那条（三种 header 合并顺序都实测过，
+   *   只要播放器最后写 UA 就 403）。插件自己的探活探针用桌面 UA，
+   *   于是永远验得通、用户永远 403 —— 最典型的「我这边测没问题」。
+   *
+   *   所以正确做法不是「让播放器带对的 UA」，而是**挑不挑 UA 的节点**。
+   *   冷门视频走 PCDN 可能慢一点，但它不会 403。
+   */
+  const isUaFree = (u) => /\.mcdn\.bilivideo\.(cn|com)/i.test(String(u || ""));
+  /* ⚠️ 候选要**跨所有码率档**收集。B 站每档（64k/132k/192k…）各带 3 个 CDN，
+     但不是每档都有 mcdn —— 实测同一条视频 132k 档全是 upos，
+     192k 档里才有 mcdn。只在选中的那一档里找，就会出现
+     「明明有 mcdn 却挑不到」，那些歌继续 403。 */
+  const candidates = [];
+  for (let i = 0; i < use.length; i++) {
+    const cands = [use[i].url].concat(use[i].alts || []);
+    const pref = order.indexOf(use[i]);
     for (let j = 0; j < cands.length; j++) {
-      const u = cands[j];
-      if (!u) continue;
-      // B 站 CDN 必须带 Referer，否则 403
-      const pr = await probeAudio(u, BILI_CDN_HEADERS());
-      if (!pr.ok) { errors.push(Math.round(order[i].bw / 1000) + "k#" + j); continue; }
+      if (cands[j]) candidates.push({ u: cands[j], bw: use[i].bw, idx: j, pref: pref });
+    }
+  }
+  /* 排序：① mcdn 一律优先；② 其余按原来的音质偏好顺序，原行为不变。 */
+  candidates.sort(function (a, b) {
+    const pa = isUaFree(a.u) ? 0 : 1, pb = isUaFree(b.u) ? 0 : 1;
+    if (pa !== pb) return pa - pb;
+    return a.pref - b.pref;
+  });
+
+  const errors = [];
+  for (let k = 0; k < candidates.length; k++) {
+    const u = candidates[k].u;
+    const uaFree = isUaFree(u);
+    // B 站 CDN 必须带 Referer，否则 403
+    const pr = await probeAudio(u, BILI_CDN_HEADERS());
+    if (!pr.ok) { errors.push(Math.round(candidates[k].bw / 1000) + "k#" + candidates[k].idx); continue; }
+
+    /* ① 不校验 UA 的节点 → 直接流式交给播放器，最省事也最稳。
+          （小文件照旧内联，省掉开头的缓冲） */
+    if (uaFree) {
       if (shouldInlineBili() && pr.total && pr.total <= BILI_INLINE_MAX_BYTES) {
         try {
           const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(), BILI_INLINE_MAX_BYTES);
-          if (dataUri) return dataUri;       // 播放器零请求，最稳
+          if (dataUri) return dataUri;
         } catch (e) { /* 失败就退回流式 */ }
       }
       return u;
     }
+
+    /* ② 只有 upos 节点 → 流式必 403（播放器 UA 我们控制不了）。
+          由插件自己下完内联，播放器零请求。体积超过兜底上限就放弃这一条，
+          宁可让这一首走跨平台兜底，也不能把主线程拖死。 */
+    if (shouldInlineBili() && pr.total && pr.total <= BILI_INLINE_FALLBACK_MAX) {
+      try {
+        const dataUri = await inlineAudio(u, pr.total, "mp4", BILI_CDN_HEADERS(), BILI_INLINE_FALLBACK_MAX);
+        if (dataUri) {
+          console.log("[粽子] B站无 mcdn 节点，已内联 " + (pr.total / 1024).toFixed(0) + "KB");
+          return dataUri;
+        }
+      } catch (e) { /* 内联失败 → 下面继续找 */ }
+    } else if (pr.total && pr.total > BILI_INLINE_FALLBACK_MAX) {
+      errors.push("无mcdn且" + (pr.total / 1024 / 1024).toFixed(1) + "MB过大");
+      continue;
+    }
+    /* 内联也失败（慢网/超时）→ 把流式地址交出去赌一次，
+       反正它至少比「直接报错」有机会播。 */
+    return u;
   }
   throw new Error("bili: 没有可播的音频节点（试过 " + errors.join("/") + "）");
 }
@@ -6177,7 +6255,7 @@ async function resolveBilibili(id, want, quality) {
       if (scored.length) break;
     }
   } catch (e) { errors.push("搜索: " + e.message); }
-  throw new Error(errors.join(" | "));
+  throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
 /* ============================================================
@@ -6347,7 +6425,7 @@ async function resolveMiguApi(id, want, quality) {
       if (list.length) break;
     }
   } catch (e) { errors.push("搜索: " + e.message); }
-  throw new Error(errors.join(" | "));
+  throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
 
@@ -6436,9 +6514,18 @@ function deadKey(platform, id) {
 function markTrackDead(platform, id) {
   if (!platform || !id) return;
   DEAD_TRACKS[deadKey(platform, id)] = Date.now();
-  // ⚠️ 必须同时清掉搜索缓存：否则同一个词再搜还是命中旧缓存，
-  //    黑名单里的条目照样显示（踩过这个坑）。
-  clearSearchCache();
+  /* ⚠️ 这里**不再**清空搜索缓存（2026-10-21 修「刷新很久 / 整个软件卡顿」）。
+     旧写法是 clearSearchCache()，本意是「下次搜同一个词别再显示这条」。
+     但它清的是**所有**搜索词的缓存，而拉黑在一次失败里是连着发生的：
+     一首歌点不通 → 兜底全平台跑一遍 → 每跑完一路就 markTrackDead 一次
+     → 每拉黑一条就把整锅搜索缓存清一次。
+     于是用户点一首播不了的歌，机器上所有搜过的词全部失效，
+     之后再搜任何东西都是 9 个平台从头打一遍 —— 这正是「刷新很久、
+     整个软件卡顿」。缓存本来是用来救这个的，结果被它自己拆了。
+
+     清缓存本身也没必要：黑名单改成在**读**的时候过滤 ——
+     dropDeadTracks（缓存命中路径）+ searchMusicAll 里 isTrackDead 那段
+     （新计算路径）。两条路都会拦，命中旧缓存不会漏。 */
 }
 
 /** 清空搜索结果缓存（不动平台层缓存） */
@@ -12930,7 +13017,7 @@ async function resolveJoox(id, want, quality) {
     }
   } catch (e) { errors.push("搜索: " + e.message); }
 
-  throw new Error(errors.join(" | "));
+  throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
 async function resolveMigu(id, want, quality) {
@@ -12944,7 +13031,7 @@ async function resolveMigu(id, want, quality) {
       catch (e) { errors.push("coco: " + e.message); }
     }
   } catch (e) { errors.push("coco: " + e.message); }
-  throw new Error(errors.join(" | "));
+  throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
 async function resolveKuwo(id, want, quality) {
@@ -12983,7 +13070,7 @@ async function resolveKuwo(id, want, quality) {
     }
   } catch (e) { errors.push("hi.cn: " + e.message); }
 
-  throw new Error(errors.join(" | "));
+  throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
 /* 「疑似只给试听片段」的计数：一次不算数，连续两次才真正拉黑。
@@ -14512,6 +14599,17 @@ const INLINE_MAX_CHARS = 900 * 1024;
 /* 持久化在模块作用域：resolveMediaSource 里 read，prefetchTop 里 write */
 var _prefetchMode = false;
 
+/* 整轮预取的总时间预算（毫秒）。
+ *
+ * ⚠️ 2026-10-21「刷新很久 / 整个软件卡顿」实测数据：
+ *   搜「晴天」搜索本身 33 个请求、1.7 秒；返回后 4 秒内后台又打了 60 个 ——
+ *   因为预取 3 首，每首都跑一次**完整兜底竞速**（本平台不通就挨个问 8 个平台）。
+ *   手机上和正在播放的音频抢带宽，表现就是列表出来了但点不动。
+ *
+ * 4 秒的理由：正常网络下取一首 0.5~3 秒，4 秒够跑完一两首；
+ * 慢网下与其继续烧流量，不如让用户点了再取（点播那条路有 12 秒硬闸兜着）。 */
+const PREFETCH_BUDGET_MS = 4000;
+
 function prefetchTop(list, count) {
   if (_prefetching) return;          // 避免上一轮还没跑完又开一轮
   if (!list || !list.length) return;
@@ -14532,28 +14630,57 @@ function prefetchTop(list, count) {
      预取走的是裸 resolveMediaSource，命中的是 YouTube/B站时那条路会
      把整首音频下载下来再 base64 —— 3 首并发 = 三个几 MB 的 Uint8Array
      同时建起来，手机上直接撞内存上限，GC 一跑整个界面就僵住。
-     串行之后同一时刻只有一份大缓冲，而且每首之间还能让出事件循环。 */
+     串行之后同一时刻只有一份大缓冲，而且每首之间还能让出事件循环。
+
+     ⚠️⚠️ 2026-10-21 二次修「刷新很久 / 整个软件卡顿」：
+     预取走的是 resolveMediaSource —— 那是**完整兜底链路**，
+     本平台不通就把 8 个平台挨个问一遍。3 首预取 = 3 轮全平台竞速。
+     实测搜「晴天」：搜索本身 33 个请求，返回后 4 秒内后台又打了 **60 个**，
+     合计 93 个。这些请求和用户正在看的列表、正在播的音频抢同一条带宽，
+     手机上就是「列表出来了但点不动、要等好几秒」。
+
+     现在给预取加两道闸：
+     ① **总预算**（PREFETCH_BUDGET_MS）：整轮预取最多花这么久，
+        到点无论跑到第几首都停下 —— 超时的那个 URL 也来不及用了；
+     ② **首败即停**：第一首就没拿到地址（说明当前网络对这个源不友好），
+        后面几首直接不试。预热是锦上添花，不该变成一直烧流量。
+     （`_prefetching` 的复位挪进 finally：原来只要 resolveMediaSource 里
+      出现未捕获异常，这个锁就永远卡在 true，之后所有预取全部失效。） */
   (async function () {
     _prefetchMode = true;
-    for (let i = 0; i < targets.length; i++) {
-      const it = targets[i];
-      try {
-        const r = await resolveMediaSource(it, "128k");
-        const u = r && r.url;
-        if (!u) continue;
-        /* 内联结果（data: URI）**绝对不能**塞进直链池：
-           它是几 MB 的字符串，MEDIA_URL_CACHE 是给几百字节的签名 URL 用的，
-           混进去以后 cachePut 的排序/淘汰会拿它当普通条目一起挪，
-           内存里就长期钉着好几条巨串 —— 之后每次 GC 都要扫它们。 */
-        if (String(u).indexOf("data:") === 0) {
-          if (String(u).length <= INLINE_MAX_CHARS) inlineCachePut(it, u);
-        } else {
-          mediaCachePut(it, u);
+    const budgetEnd = Date.now() + PREFETCH_BUDGET_MS;
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        if (Date.now() > budgetEnd) {
+          console.log("[粽子] 预取超预算，收工（已完成 " + i + "/" + targets.length + "）");
+          break;
         }
-      } catch (e) { /* 预取失败无所谓 */ }
+        const it = targets[i];
+        try {
+          const r = await resolveMediaSource(it, "128k");
+          const u = r && r.url;
+          if (!u) { if (i === 0) break; continue; }
+          /* 内联结果（data: URI）**绝对不能**塞进直链池：
+             它是几 MB 的字符串，MEDIA_URL_CACHE 是给几百字节的签名 URL 用的，
+             混进去以后 cachePut 的排序/淘汰会拿它当普通条目一起挪，
+             内存里就长期钉着好几条巨串 —— 之后每次 GC 都要扫它们。 */
+          if (String(u).indexOf("data:") === 0) {
+            if (String(u).length <= INLINE_MAX_CHARS) inlineCachePut(it, u);
+          } else {
+            mediaCachePut(it, u);
+          }
+        } catch (e) {
+          /* 第一首就失败 → 当前网络对这个源不友好，别再白烧后面几首。 */
+          if (i === 0) {
+            console.log("[粽子] 预取首首失败，本轮放弃: " + String(e.message || e).slice(0, 80));
+            break;
+          }
+        }
+      }
+    } finally {
+      _prefetchMode = false;
+      _prefetching = false;
     }
-    _prefetchMode = false;
-    _prefetching = false;
   })();
 }
 
@@ -14592,12 +14719,31 @@ function stripArtistVariants(query) {
   });
 }
 
+/* 缓存是在「写进去的那一刻」做的黑名单过滤，可拉黑是后来才发生的：
+   一份 5 分钟前缓存的搜索结果里，还留着刚被用户点废的那首歌。
+   所以命中缓存时要在出参前再补一遍 —— 否则「刚拉黑的那首歌」
+   会随着缓存继续出现在列表里，最长能赖 5 分钟。
+   （配合 markTrackDead 不再整锅清缓存：过滤放在读的时候做，比清缓存便宜得多。） */
+function dropDeadTracks(r) {
+  if (!r || !r.data || !r.data.length) return r;
+  const live = [];
+  for (let i = 0; i < r.data.length; i++) {
+    const it = r.data[i];
+    if (!isTrackDead(it.platform, it.id)) live.push(it);
+  }
+  if (live.length === r.data.length) return r;
+  const out = {};
+  for (const k in r) out[k] = r[k];
+  out.data = live;
+  return out;
+}
+
 const search = async function (query, page, type) {
   // 四种搜索都从这里过，「歌名+歌手」的分隔符统一换成空格再往下发。
   query = normalizeQuery(query);
   const ck = String(query).trim().toLowerCase();
   if (type === "music") {
-    if (page === 1) { const hit = cacheGet("search", type, ck); if (hit) return hit; }
+    if (page === 1) { const hit = cacheGet("search", type, ck); if (hit) return dropDeadTracks(hit); }
     const r = await searchMusicAll(query, page);
 
     // 结果太少 → 减弱查询重搜，合并结果池
@@ -15149,7 +15295,7 @@ async function resolveMediaSource(musicItem, quality) {
      实测正常网络兜底命中在 0.3~2.5 秒，5 秒已经是 2 倍余量；
      真到点了就把手上最好的那条地址交出去（下面 lastCandidate 那条路），
      总之：宁可早交一条「没验完」的地址，也不要晚交一个错误。 */
-  const FB_DEADLINE = 5000;
+  const FB_DEADLINE = 7000;
   const fbStart = Date.now();
   let ownRaced = false;
   let deadlineHit;
@@ -15179,7 +15325,26 @@ async function resolveMediaSource(musicItem, quality) {
     /* ⚠️ 这里的 waiting 每次重新取：startRunners 可能在 await 之前刚跑过，
        而 runners 数组是就地 push 的，所以要用「本轮回合后的快照」。 */
     const waiting = runners.filter(function (p) { return p && !p.__done; });
-    if (!waiting.length) break;
+    /* ⚠️ 兜底全跑完 ≠ 可以收工（2026-10-21 再修「点了没声音、几秒后中断」）。
+       旧写法是 waiting 空了就 break，直接跳到收尾判「全平台失败」——
+       可这时候**本平台那一路还在跑**：YouTube 冷启实测 1.4~14 秒
+       （慢网 + VPN 时更久），而 8 路兜底往往 3~5 秒就集体失败了。
+       于是表现成：点一首 YouTube 的歌 → 转 5 秒 → 全程无声音、直接中断。
+       用户截图里那条「怎麼都沒有了 IGU Band - Topic」就是这么挂的。
+       现在 waiting 空了不 break，改成「只等本平台，等到总闸到点为止」。 */
+    if (!waiting.length) {
+      if (ownSettled) break;
+      const onlyOwn = await Promise.race([ownTagged, deadlineGate]);
+      if (onlyOwn === null) break;             // 到点，本平台也没回来
+      ownRaced = true;
+      if (onlyOwn && onlyOwn.u) {
+        deadlineHit();
+        console.log("[粽子] 本平台命中（兜底全败后）: " + provider + " 《" + want.name + "》"
+          + "（" + (Date.now() - fbStart) + "ms）");
+        return { url: onlyOwn.u };
+      }
+      break;                                   // 本平台也明确失败了
+    }
     let r;
     const pool = ownRaced ? waiting.concat([deadlineGate]) : waiting.concat([deadlineGate, ownTagged]);
     try { r = await Promise.race(pool); } catch (e) { break; }
@@ -15826,7 +15991,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.47",
+  version: "4.10.48",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
