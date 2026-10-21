@@ -62,7 +62,7 @@ https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/vers
 | 推荐页 | 每天一张《拼好歌》，按分类（华语 / 古风 / 爵士 / 深夜 / 治愈 / 钢琴 / 说唱 / R&B）轮换 |
 | 榜单页 | 各平台热歌榜、新歌榜 |
 | 播放 | 取流时按你选的音质跨平台兜底：128k / 320k / 无损，取不到就往下退 |
-| 歌词 | 优先用原平台歌词，缺的从 LRCLIB 等公开歌词库补，带时间轴 |
+| 歌词 | 优先用原平台歌词，缺的从公开歌词库补，带时间轴 |
 | 下载 | 用播放器自带的下载功能，插件只提供地址不落盘 |
 
 音效、倍速、淡入淡出、悬浮歌词这些是播放器自己的功能，跟插件无关。
@@ -77,11 +77,12 @@ https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/vers
 
 | 平台 | 说明 |
 |---|---|
-| 网易云 / QQ / 酷狗 / 咪咕 / 酷我 | COCO 后端 + 官方直连，多通道路由 |
-| Bilibili | 免费，音质最高（实测 319kbps m4a） |
-| YouTube | ANDROID innertube |
+| 网易云 / QQ / 酷狗 / 咪咕 / 酷我 | 主力五家，多家独立上游互备 |
+| YouTube | 海外补充，冷门和现场版资源多 |
 | JOOX | 需要自己填 Cookie |
-| 咪咕直出 | 官方接口直接返回 MP3 |
+| 咪咕直出 | 作为咪咕的补充线路 |
+
+Bilibili 已于 v4.10.62 默认下线：它的取流链路不在插件控制范围内，播放成功率撑不住。代码保留，设置里把「Bilibili 参与」填 1 可重新启用。
 
 ## 插件设置项
 
@@ -90,11 +91,11 @@ https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/vers
 | `filterAudiobook` | 开 | 听书/有声书归到专辑页 |
 | `filterVip` | 开 | 过滤会员曲 |
 | `filterCover` | 开 | 过滤翻唱标记 |
-| `useBilibili` | 开 | Bilibili 参与搜索 |
+| `useBilibili` | 关 | Bilibili 参与搜索（v4.10.62 起默认关） |
 | `useYoutube` | 开 | YouTube 参与搜索 |
 | `useMiguApi` | 开 | 咪咕直出参与搜索 |
 | `biliMusicOnly` | 开 | Bilibili 只搜音乐区 |
-| `biliGuichu` | 开 | Bilibili 鬼畜区（搜索 + 榜单页，不进推荐） |
+| `biliGuichu` | 关 | Bilibili 鬼畜区（搜索 + 榜单页，不进推荐） |
 | `inlineYoutube` | 开 | YouTube 整首预载（超 6MB 退流式） |
 | `inlineBili` | 开 | Bilibili 整首预下载（超 8MB 退流式） |
 | `jooxCookie` | 空 | JOOX 登录 Cookie（不填则不参与） |
@@ -113,7 +114,7 @@ https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/vers
 几个必须说的限制：
 
 - **种子要填歌手，不要填歌名。** 按歌名反查原唱这条路在网易上不可靠 —— 匿名搜「晴天」前 30 条全是翻唱版，没有一条是周杰伦原唱。填歌名大概率解析不出来，那一项会被跳过。
-- **小众音乐人可能断链。** 草东没有派对在 Deezer 的相似歌手图谱里查无此人，只能靠歌单共现；如果连共现都没有，就只剩种子本人。
+- **小众音乐人可能断链。** 草东没有派对在公开的相似歌手图谱里查无此人，只能靠歌单共现；如果连共现都没有，就只剩种子本人。
 - **有一道搬运号过滤。** 歌单共现会带进一些短视频搬运号（热门曲里大量 90 秒以下的碎片）。判据是碎片率 > 15% 或原创占比 < 50% 就整位剔除。
 
 冷启动约 2 秒（本机直连，手机慢一些），结果缓存 30 分钟，翻页不重复算。
@@ -128,7 +129,7 @@ https://raw.githubusercontent.com/ZONGZI-000/zongzi-musicfree-plugin/master/vers
 
 ## 历史
 
-2026-10-18 起弃用 Gitee：它会静默风控含特定字样的 js 文件，上传返回 200 而下载返回 451，整个仓库连带不可用。现在只走 GitHub。
+2026-10-18 起弃用 Gitee：它对这类 js 文件有静默拦截，上传正常但下载不可用，整个仓库连带失效。现在只走 GitHub。
 
 ## 免责
 

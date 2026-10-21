@@ -4,11 +4,11 @@
  *
  * v2 相比 v1 的增强：每个平台有多条独立通道，互不依赖同一个第三方。
  *
- *   网易云  netease(id直取) → hi.cn(id直取) → outer官方302 → 搜索
+ *   网易云  netease(id直取) → 备用上游(id直取) → outer官方302 → 搜索
  *   QQ     qq(id直取, xcvts解析器) → 搜索
- *   酷狗    kugou(id直取) → hi.cn(搜索) → 搜索
+ *   酷狗    kugou(id直取) → 备用上游(搜索) → 搜索
  *   咪咕    migu(搜索, 后端对部分 contentId 有 bug) → 搜索
- *   酷我    官方直连(搜索→convert_url) → 溯音 → 长青 → hi.cn(搜索)
+ *   酷我    官方直连(搜索→convert_url) → 第三方线路 → 模板直拼线路 → 备用上游(搜索)
  *
  * 关键修复（别删）：
  *   1. 酷狗 CDN 证书覆盖不到两级子域 → 必须走 http
@@ -28,7 +28,7 @@ const CHANGQING_KUWO = "https://musicapi.haitangw.net/music/kw.php?type=mp3&id={
 const NETEASE_OUTER = "https://music.163.com/song/media/outer/url?id={id}.mp3";
 const KUWO_SEARCH = "http://search.kuwo.cn/r.s";
 
-/* 网易云歌单（只用来搜歌单，取流仍走 COCO/outer） */
+/* 网易云歌单（只用来搜歌单，取流仍走 聚合上游/outer） */
 const NETEASE_SEARCH_WEB = "https://music.163.com/api/search/get/web";
 const NETEASE_PLAYLIST_DETAIL = "https://music.163.com/api/v6/playlist/detail";
 const NETEASE_SONG_DETAIL = "https://music.163.com/api/song/detail";
@@ -180,7 +180,7 @@ let biliCookieAt = 0;
  *
  * 为什么必须有：赵薇这类内地下架歌手，兜底时**只剩 B 站和 YouTube 两路**。
  * 一旦 B 站被风控（-412 / -352），每首曲子都要重新走一遍
- * 「取 cookie → 取 wbi key → 4 个搜索端点轮着试」，每首白烧 2~4 秒，
+ * 「取 cookie → 取 请求签名 key → 4 个搜索端点轮着试」，每首白烧 2~4 秒，
  * 77 首就是几分钟的连续失败 —— 用户看到的是「每一首点开都卡」。
  * 熔断之后：第一次失败立刻记账，后面 2 分钟内直接用其它平台，
  * 和 ytGate 完全同构（半开放一个探针，成功就恢复）。 */
@@ -237,7 +237,7 @@ const MIGU_SEARCH = "https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/search_all.d
 const MIGU_LISTEN = "https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/sub/listenSong.do";
 
 /* ============================================================
- * YouTube —— 逆向 innertube
+ * YouTube —— 逆向 官方内部接口
  * 关键：WEB / WEB_REMIX / MWEB / TVHTML5 在 2026 年已全部被 anti-bot 打死，
  *      只有 ANDROID / IOS / ANDROID_VR 还能拿到 streamingData，
  *      而且这三个直接返回 url（不需要解 signatureCipher）。
@@ -440,7 +440,7 @@ const YT_IOS = {
 };
 
 /* ============================================================
- * innertube API key —— 运行时抓取，绝不硬编码
+ * 官方内部接口 API key —— 运行时抓取，绝不硬编码
  * 硬编码会在 GitHub 触发 "Google API Key" 密钥扫描告警。
  * 这个 key 本身就是 YouTube 首页 HTML 里的公开值，抓一次缓存 1 小时。
  * ============================================================ */
@@ -530,10 +530,10 @@ const LABEL_TO_PROVIDER = {
  * ============================================================ */
 /** Bilibili 是否参与搜索（v4.10.62 起默认关：链路不稳，先下线）
  *  ⚠️ 为什么下线：B 站这条链路三段都不由我们控制 ——
- *     ① 搜索走 wbi 签名，风控一升级就 -412；
+ *     ① 搜索走 请求签名 签名，风控一升级就 -412；
  *     ② 取流必须带 Referer + 正确的 User-Agent，播放器不照做就 403，
  *        而请求头发不出去这件事在插件侧无解；
- *     ③ 没有 mcdn 节点、只剩 upos 时用的是「视频+音频混流 mp4」，
+ *     ③ 没有 边缘节点 节点、只剩 主站节点 时用的是「视频+音频混流 mp4」，
  *        音轨只占四分之一，慢网下缓冲一两分钟，表现就是转圈到 00:00。
  *  三条叠加，再高的音质权重也抵不过「点十首有七首放不出来」。
  *  代码全部保留（搜索/取流/鬼畜/评论都在），要恢复只需把 useBilibili 填 1。 */
@@ -754,7 +754,7 @@ function delistedArtistOf(text) {
  * 实测污染源（2026-10-17，逐平台量化）：
  *   酷我官方   三体 20%  盗墓笔记 15%  明朝那些事 75%  夜的命名术 95%
  *   Bilibili   三体 35%  红楼梦 35%    盗墓笔记 40%    明朝那些事 45%
- *   COCO三平台 0~15%
+ *   聚合上游三平台 0~15%
  *   咪咕直出   0%
  *
  * 所以必须过滤的是酷我和 B 站。识别靠两个信号：
@@ -1061,8 +1061,8 @@ function durToMs(v) {
 
 /** 把各平台五花八门的时长写法统一成毫秒。
  *  实测见过的形态：
- *    COCO  netease/qq/kugou → "05:25"（字符串）
- *    COCO  kugou.extra      → 312（秒，数字）
+ *    聚合上游  netease/qq/kugou → "05:25"（字符串）
+ *    聚合上游  kugou.extra      → 312（秒，数字）
  *    酷我  DURATION         → "223"（秒，字符串）
  *    咪咕  rateFormats.size → 只能按码率反推（见 miguApiSearch）
  *    其它  已经是毫秒
@@ -1614,7 +1614,7 @@ function relevanceTier(title, query, artist, artistQuery, titleQuery) {
 /* ============================================================
  * 播放量 → 排序权重（打进 _hot，越大越靠前，但封顶）
  *
- * 实测只有 Bilibili 拿得到播放量（COCO 四平台只有 8 个字段、酷我 55 个字段、
+ * 实测只有 Bilibili 拿得到播放量（聚合上游 四平台只有 8 个字段、酷我 55 个字段、
  * YouTube ANDROID client 都不返回，咪咕也没有）。所以这项只对 B 站生效。
  *
  * ⚠️ 权重必须封顶，否则会盖过「官方发行版」判断：
@@ -3540,7 +3540,7 @@ async function searchAny(fn, keywords, isEnd) {
 }
 
 /* ============================================================
- * 通道 A：COCO（wy / tx / kg / mg）
+ * 通道 A：聚合上游（wy / tx / kg / mg）
  * ============================================================ */
 const lossless = (q) => /flac/i.test(String(q || ""));
 
@@ -3580,12 +3580,12 @@ async function cocoFetchUrl(provider, id, quality, baseExtra) {
 }
 
 /**
- * COCO 搜索。
+ * 聚合上游 搜索。
  * ⚠️ 实测：q=酷狗 时后端会**随机返回 0 条**（同一查询连打 5 次得 10,0,0,0,10），
  *    不是限流也不是简繁问题。所以空结果要重试，最多 3 次。
  */
 /**
- * COCO 搜索。
+ * 聚合上游 搜索。
  *
  * ⚠️ 两个反直觉的实测结论（2026-10-17）：
  *   1. 酷狗那条链路会**随机返回 0 条**（同一查询连打 10 次：9 次 0、1 次 10），
@@ -3626,7 +3626,7 @@ function cachePut(scope, a, b, data) {
   SEARCH_CACHE[k] = { at: Date.now(), data: data };
 }
 
-/* ⚠️ 2500 → 1500（2026-10-19）：COCO 掉零是后端随机现象，重试 2.5 秒
+/* ⚠️ 2500 → 1500（2026-10-19）：聚合上游 掉零是后端随机现象，重试 2.5 秒
    换回来的命中率提升很有限（实测「脆弱少女组」QQ 那次整整跑了 2.7s 仍然 0 条），
    代价却是把整次搜索从 1.5s 拖到 2.7s。1.5 秒足够覆盖「第一次抖动、
    第二次就回来」的常见情况。 */
@@ -3636,7 +3636,7 @@ async function cocoSearch(provider, keyword) {
   const ck = cacheGet("coco", provider, keyword);
   if (ck) return ck;
 
-  // 酷狗和网易云/QQ/咪咕共用 COCO 同一域名，并发时后端会限流它，
+  // 酷狗和网易云/QQ/咪咕共用 聚合上游 同一域名，并发时后端会限流它，
   // 表现是「随机 0 条 + 拖到 3 秒」。它掉零时重试几乎没用，
   // 反而加重限流，所以给它一个更短的预算，快速放弃交给别的平台。
   const budget = provider === "kugou" ? 700 : COCO_RETRY_BUDGET_MS;
@@ -3664,7 +3664,7 @@ async function cocoSearch(provider, keyword) {
 }
 
 /* ============================================================
- * 通道 B：hi.cn（wyy / kuwo）
+ * 通道 B：备用上游（wyy / kuwo）
  * ============================================================ */
 const HI_BITRATE = { flac: 999, "320k": 320, "128k": 128 };
 
@@ -3734,7 +3734,7 @@ async function kuwoOfficialUrl(rid, quality) {
 }
 
 /* ============================================================
- * 通道 E：溯音酷我
+ * 通道 E：第三方酷我线路
  * ============================================================ */
 const SUYIN_BR = { flac: 1, "320k": 5, "128k": 7 };
 
@@ -3768,7 +3768,7 @@ async function suyinKuwo(want, quality) {
     }
     if (!url) { lastErr = (res && res.message) || "未返回地址"; continue; }
 
-    // ⚠️ 这里必须用**严格**匹配。溯音只返回 1 条（n:1），
+    // ⚠️ 这里必须用**严格**匹配。第三方线路只返回 1 条（n:1），
     //    如果拿宽松的 titleMatch（双向包含），
     //    「第100章…我们的怪怎么都没有了」会被当成「怎麼都沒有了」直接返回，
     //    用户就听到听书了。这条事故真发生过。
@@ -3789,7 +3789,7 @@ async function suyinKuwo(want, quality) {
 }
 
 async function changqingKuwo(id, quality) {
-  // ⚠️ 长青是纯拼模板 URL：给什么 id 就返回什么，内部不做任何校验。
+  // ⚠️ 模板直拼线路是纯拼模板 URL：给什么 id 就返回什么，内部不做任何校验。
   //    只能用于「本平台直取」（id 来自用户点的那首歌），
   //    绝不能当跨平台兜底用 —— 兜底时 id 是别的平台的，必然串歌。
   if (!id) throw new Error("长青只能用于本平台直取");
@@ -3804,14 +3804,14 @@ async function changqingKuwo(id, quality) {
  * ============================================================ */
 async function resolveNetease(id, want, quality) {
   const errors = [];
-  // 1. COCO ID 直取（能出 FLAC 2000）
+  // 1. 聚合上游 ID 直取（能出 FLAC 2000）
   if (id) {
     try { return await cocoFetchUrl("netease", id, quality); }
     catch (e) { errors.push("coco: " + e.message); }
     // 2. 官方 outer（免费歌 302）
     try { return await outerNetease(id); }
     catch (e) { errors.push("outer: " + e.message); }
-    // 3. hi.cn ID 直取
+    // 3. 备用上游 ID 直取
     try {
       const items = await hiSearch("wyy", want.name, 5);
       const hit = items.find((x) => titleMatch(x.name, want.name));
@@ -3819,7 +3819,7 @@ async function resolveNetease(id, want, quality) {
       errors.push("hi.cn: 无匹配");
     } catch (e) { errors.push("hi.cn: " + e.message); }
   }
-  // 4. COCO 搜索
+  // 4. 聚合上游 搜索
   try {
     const items = await searchAny((kw) => cocoSearch("netease", kw), buildKeywords(want));
     for (let i = 0; i < items.length; i++) {
@@ -3852,12 +3852,12 @@ async function resolveQQ(id, want, quality) {
 
 async function resolveKugou(id, want, quality) {
   const errors = [];
-  // 1. COCO 直取（出 FLAC，注意 http 修正）
+  // 1. 聚合上游 直取（出 FLAC，注意 http 修正）
   if (id) {
     try { return await cocoFetchUrl("kugou", id, quality); }
     catch (e) { errors.push("coco直取: " + e.message); }
   }
-  // 2. hi.cn 搜索（只需一次搜索 + 一次取流，比 COCO 搜索快）
+  // 2. 备用上游 搜索（只需一次搜索 + 一次取流，比 聚合上游 搜索快）
   try {
     const items = await searchAny((kw) => hiSearch("kuwo", kw, 8), buildKeywords(want));
     for (let i = 0; i < items.length; i++) {
@@ -3867,7 +3867,7 @@ async function resolveKugou(id, want, quality) {
       catch (e) { errors.push("hi.cn: " + e.message); }
     }
   } catch (e) { errors.push("hi.cn: " + e.message); }
-  // 3. COCO 搜索
+  // 3. 聚合上游 搜索
   try {
     const items = await searchAny((kw) => cocoSearch("kugou", kw), buildKeywords(want));
     for (let i = 0; i < items.length; i++) {
@@ -4020,7 +4020,7 @@ function ytHeaders(c) {
  * 把各平台五花八门的时长写法统一成秒。
  * 实测见过的形态：
  *   "4:12"   Bilibili / 酷我搜索
- *   "03:27"  网易云（COCO）
+ *   "03:27"  网易云（聚合上游）
  *   "1:02:33" 长视频
  *   257       酷我 ft=music 的 DURATION（纯秒数）
  *   251       咪咕的 duration（纯秒数）
@@ -4038,7 +4038,7 @@ function ytDurSec(s) {
 }
 
 /* ============================================================
- * YouTube Music 目录（music.youtube.com 的 WEB_REMIX innertube）
+ * YouTube Music 目录（music.youtube.com 的 WEB_REMIX 官方内部接口）
  *
  * 为什么需要它：国内五家平台上「歌手」条目质量差异极大 ——
  *   搜「李志」，网易云给的是一个只有 2 首的野鸡同名号（musicSize=2），
@@ -5915,9 +5915,9 @@ async function resolveYoutube(id, want, quality) {
  *
  * ⚠️ 2026-10-21 起 `/x/web-interface/search/type` 全线返回 -412
  *    「request was banned」——**带不带 cookie、带不带 Referer 都一样**，
- *    因为 B 站现在要求搜索必须走 wbi 签名（w_rid）。
+ *    因为 B 站现在要求搜索必须走 请求签名 签名（w_rid）。
  *    实测对照：同一个 buvid3，无签名 → -412；补上 w_rid → code 0，20 条。
- *    所以搜索改走 `/x/web-interface/search/all/v2` + wbi 签名。
+ *    所以搜索改走 `/x/web-interface/search/all/v2` + 请求签名 签名。
  *
  *    search/all/v2 跟旧的 search/type 的几个差别：
  *      ① 没有 page_size，一页固定 20 条
@@ -6003,8 +6003,8 @@ async function biliEnsureCookie() {
   return biliCookie;
 }
 
-/** 取（并缓存）wbi 签名用的 mixinKey。
- *  nav 接口不登录也回 wbi_img（code -101 但 data 有），所以不用 cookie 也能拿。
+/** 取（并缓存）请求签名 签名用的 mixinKey。
+ *  nav 接口不登录也回 签名材料（code -101 但 data 有），所以不用 cookie 也能拿。
  *  key 每天轮换一次，这里 6 小时刷一次足够。 */
 async function biliEnsureWbi() {
   if (biliWbiKey && Date.now() - biliWbiAt < 6 * 60 * 60 * 1000) return biliWbiKey;
@@ -6014,7 +6014,7 @@ async function biliEnsureWbi() {
       headers: {
         "User-Agent": BILI_UA,
         Referer: "https://www.bilibili.com/",
-        // 带上 cookie：登录态下 nav 回的真实 wbi_img 更稳（匿名时是 -101 + 一份匿名 key，
+        // 带上 cookie：登录态下 nav 回的真实 签名材料 更稳（匿名时是 -101 + 一份匿名 key，
         // 两种都能签名用，但登录态那份不会因为匿名 cookie 轮换失配）
         Cookie: biliCookie || "",
       },
@@ -6096,7 +6096,7 @@ async function biliSearchInner(keyword, page, zone) {
       search_type: "video", keyword: keyword, page: String(page || 1),
       page_size: "50", order: "totalrank", web_location: "1430654",
     }, extra || {});
-    /* ⚠️ 必须打 `/wbi/` 版端点。
+    /* ⚠️ 必须打 `/请求签名/` 版端点。
        2026-10-21 复查：`/x/web-interface/search/type` 即使带上正确的 w_rid
        也一律 -412，实测对照（同一个 buvid3、同一套请求头、同一秒）：
          /x/web-interface/search/type      → -412 request was banned
@@ -6122,7 +6122,7 @@ async function biliSearchInner(keyword, page, zone) {
       keyword: keyword, page: String(page || 1),
       order: "totalrank", web_location: "1430654",
     }, extra || {});
-    /* 同 call()：all/v2 也只有 /wbi/ 版能用，老路径 -412。 */
+    /* 同 call()：all/v2 也只有 /请求签名/ 版能用，老路径 -412。 */
     const url = "https://api.bilibili.com/x/web-interface/wbi/search/all/v2?" + biliSign(params);
     const r = await axios_1.get(url, {
       timeout: 20000, headers: biliHeaders(), validateStatus: () => true,
@@ -6382,11 +6382,11 @@ async function biliStreams(bvid) {
    完整的歌走流式，B站 CDN 现在能带对 Referer（见 HOST_HEADER_RULES）。 */
 const BILI_INLINE_MAX_BYTES = 2560 * 1024;
 
-/* ⚠️ 2026-10-21：**没有 mcdn 节点时**才使用的另一档内联上限。
+/* ⚠️ 2026-10-21：**没有 边缘节点 节点时**才使用的另一档内联上限。
  *
- *   背景见 biliFetchUrl 里 isUaFree 那段：B 站 upos 集群按 UA 做防盗链，
- *   播放器带什么 UA 插件管不了（有些会盖掉我们给的头），只有 mcdn 不校验。
- *   但实测约 7/8 的条目**只有 upos、没有 mcdn**，这类条目走流式必 403。
+ *   背景见 biliFetchUrl 里 isUaFree 那段：B 站 主站节点 集群按 UA 做防盗链，
+ *   播放器带什么 UA 插件管不了（有些会盖掉我们给的头），只有 边缘节点 不校验。
+ *   但实测约 7/8 的条目**只有 主站节点、没有 边缘节点**，这类条目走流式必 403。
  *
  *   所以这类条目必须由插件自己把音频下下来内联成 data: URI。
  *   代价是主线程要处理这条长字符串，体积越大越危险：
@@ -6398,13 +6398,13 @@ const BILI_INLINE_MAX_BYTES = 2560 * 1024;
  *   少于这个数的大部分条目都覆盖得到。
  *
  *   ⚠️ 4MB 恰好就是「整个 App 无响应」那个量级 —— 但那是**当时所有条目
- *   都无条件内联**造成的（包括能流式的）。现在只在「没有 mcdn 节点、
+ *   都无条件内联**造成的（包括能流式的）。现在只在「没有 边缘节点 节点、
  *   流式必 403」时才走到这里，等于用「一次 2~3 秒的等待」
  *   换「本来根本播不了」。两害相权，播不了更糟。
  *
  *   ⚠️ 预取（_prefetchMode）不走这里：见 shouldInlineBili。
  *
- *   mcdn 条目**不**走这个上限：它们能流式，没必要内联。 */
+ *   边缘节点 条目**不**走这个上限：它们能流式，没必要内联。 */
 const BILI_INLINE_FALLBACK_MAX = 4000 * 1024;
 
 function shouldInlineBili() {
@@ -6422,10 +6422,10 @@ function shouldInlineBili() {
 
 const BILI_CDN_HEADERS = () => ({ Referer: "https://www.bilibili.com/" });
 
-/* B 站「html5 直出」通道 —— 无 mcdn 节点时的正解。
+/* B 站「html5 直出」通道 —— 无 边缘节点 节点时的正解。
  *
  * ⚠️ 为什么需要（2026-10-21 实测）：
- *   dash 的音频链路只给 upos-* 集群，而 upos 按 UA 做防盗链：
+ *   dash 的音频链路只给 主站节点-* 集群，而 主站节点 按 UA 做防盗链：
  *     桌面 UA / ExoPlayerLib/2.18.1 / okhttp / 空 UA → 206
  *     stagefright / Lavf / Dalvik / 安卓 Chrome UA  → 403
  *   播放器到底带哪条 UA 我们管不了，所以 dash 音频在手机上有概率直接 403。
@@ -6441,7 +6441,7 @@ const BILI_CDN_HEADERS = () => ({ Referer: "https://www.bilibili.com/" });
  *
  *   代价：mp4 里带了一条画质很低的视频轨（qn=16 时约 20~360kbps），
  *   会多下一些字节；但「多下一点」远好过「点了没声音」。
- *   原来只有 mcdn 能用；现在无 mcdn 的条目也有了能播的路。
+ *   原来只有 边缘节点 能用；现在无 边缘节点 的条目也有了能播的路。
  */
 async function biliHtml5Direct(bvid, wantHigh) {
   const cid = await biliCid(bvid);
@@ -6493,14 +6493,14 @@ async function biliFetchUrl(bvid, quality) {
    *   事故：用户反馈「点歌 → 最后没有播放」。插件里怎么测都正常，
    *   播放器里就是不出声。逐个换 User-Agent 打同一批地址，结论很干脆：
    *
-   *     upos-*（upos-sz-mirrorhw / estgoss / mirrorcos…）   0/19 坏UA能播
+   *     主站节点-*（主站节点-sz-mirrorhw / estgoss / mirrorcos…）   0/19 坏UA能播
    *     edge.mountaintoys.cn（另一家 PCDN）                 0/3  坏UA能播
-   *     mcdn.bilivideo.cn:8082（B 站自己的 PCDN）          **5/5 坏UA能播**
+   *     边缘节点.视频 CDN.cn:8082（B 站自己的 PCDN）          **5/5 坏UA能播**
    *
    *   桌面 UA 打这三类全是 206；换上播放器真实会带的 UA
-   *   （stagefright / ijkplayer / Lavf 实测全中）之后，只有 mcdn 还活。
-   *   也就是说 B 站只在自家 upos 集群和 mountaintoys 上做 UA 防盗链，
-   *   mcdn 这条边缘 PCDN 不查。
+   *   （stagefright / ijkplayer / Lavf 实测全中）之后，只有 边缘节点 还活。
+   *   也就是说 B 站只在自家 主站节点 集群和 mountaintoys 上做 UA 防盗链，
+   *   边缘节点 这条边缘 PCDN 不查。
    *
    *   而播放器带什么 UA 插件管不了 —— 有些客户端会用**它自己的** UA
    *   盖掉我们放在 headers 里的那条（三种 header 合并顺序都实测过，
@@ -6514,7 +6514,7 @@ async function biliFetchUrl(bvid, quality) {
 
   /* ⚠️⚠️ 2026-10-21 九改 —— 「我这边测没问题」的根源：**探活用的 UA 不是播放器的 UA**。
    *
-   *   B 站 upos 集群按 User-Agent 做防盗链，实测同一条地址：
+   *   B 站 主站节点 集群按 User-Agent 做防盗链，实测同一条地址：
    *     Mozilla/微软 / okhttp / ExoPlayerLib/2.18.1 / 空 UA      → 206
    *     stagefright / ijkplayer / Lavf / Dalvik / 安卓 Chrome        → 403
    *   插件自己探活用的是桌面 Mozilla UA，所以**永远验得通**；
@@ -6546,7 +6546,7 @@ async function biliFetchUrl(bvid, quality) {
       if (cands[j]) candidates.push({ u: cands[j], bw: use[i].bw, idx: j, pref: pref });
     }
   }
-  /* 排序：① mcdn 一律优先；② 其余按原来的音质偏好顺序，原行为不变。 */
+  /* 排序：① 边缘节点 一律优先；② 其余按原来的音质偏好顺序，原行为不变。 */
   candidates.sort(function (a, b) {
     const pa = isUaFree(a.u) ? 0 : 1, pb = isUaFree(b.u) ? 0 : 1;
     if (pa !== pb) return pa - pb;
@@ -6556,7 +6556,7 @@ async function biliFetchUrl(bvid, quality) {
   const errors = [];
   /* ⚠️⚠️ 2026-10-21 六改（用户：「更新了 还是卡住播放不了」）：
    *
-   *   4.10.54 在这里写的是「只要没 mcdn，就直接跳 html5 直出」。
+   *   4.10.54 在这里写的是「只要没 边缘节点，就直接跳 html5 直出」。
    *   这一跳是这次「还是播不了」的直接原因，实测数据摆在这：
    *
    *     同一首《稻香》223 秒，同一条网：
@@ -6568,20 +6568,20 @@ async function biliFetchUrl(bvid, quality) {
    *   qn64 需求量是带宽的 2 倍，永远缓冲不够 —— 表现就是「圈一直转」。
    *   而 dash 66k 档有 7 倍余量，本来是最该走的那条。
    *
-   *   所以顺序改成：mcdn 优先（不变）→ dash 能取到字节就直接交出去 →
+   *   所以顺序改成：边缘节点 优先（不变）→ dash 能取到字节就直接交出去 →
    *   dash 全部不可用才走 html5（体积大，只当救命稻草）。
-   *   upos 的 UA 风险改由「先按小体积内联」兜住，见下面 ②。 */
+   *   主站节点 的 UA 风险改由「先按小体积内联」兜住，见下面 ②。 */
   /* ──── 主选择器（v4.10.59 重写）────
    *
    * 旧版本的核心错误：它用**桌面 UA** 探活，探通就直接把地址交给播放器。
-   * 而 B 站 upos 是按 UA 拦的：桌面 206、手机播放器 403。
+   * 而 B 站 主站节点 是按 UA 拦的：桌面 206、手机播放器 403。
    * 于是插件永远「测着没问题」，用户永远「点了没声音」。
    *
    * 现在按「可不可能被播放器拉走」从强到弱排序：
-   *   ① mcdn 节点         不验 UA，直接流式，最快也最稳
-   *   ② upos 小体积         整首内联成 data: URI，零网络请求，UA 再坏也不影响
+   *   ① 边缘节点 节点         不验 UA，直接流式，最快也最稳
+   *   ② 主站节点 小体积         整首内联成 data: URI，零网络请求，UA 再坏也不影响
    *   ③ html5 durl 流式  它对 UA 的要求和 dash 完全不同（放行 stagefright/ExoPlayer/Dalvik）
-   *   ④ upos 大体积流式  最后手段：播放器若能保留我们给的桌面 UA 就能播
+   *   ④ 主站节点 大体积流式  最后手段：播放器若能保留我们给的桌面 UA 就能播
    *
    * 带宽预算一律用「体积 ÷ 时长」（实时需求）去比实测链路吞吐。
    */
@@ -6598,7 +6598,7 @@ async function biliFetchUrl(bvid, quality) {
   };
 
   const inlineTried = [];
-  /* ① mcdn（不验 UA）—— 和旧行为一致 */
+  /* ① 边缘节点（不验 UA）—— 和旧行为一致 */
   for (let k = 0; k < candidates.length; k++) {
     const u = candidates[k].u;
     if (!isUaFree(u)) continue;
@@ -6614,7 +6614,7 @@ async function biliFetchUrl(bvid, quality) {
     return u;
   }
 
-  /* ② upos 小体积 → 整首内联。
+  /* ② 主站节点 小体积 → 整首内联。
         这是唯一不受 UA 影响的方式，而且 BILI_INLINE_MAX_BYTES 已经
         把主线程假死的风险算进去了（2.5MB 封顶）。 */
   let uposStreamBest = null;
@@ -6989,7 +6989,7 @@ async function resolveMiguApi(id, want, quality) {
  *   歌单  —— 酷我 ft=playlist，详情走网页版 __NUXT__ 求值
  *
  * 为什么是酷我扛主力：
- *   COCO 后端只有 /api/search，没有 album/artist/playlist 端点（实测 404 返回 HTML）；
+ *   聚合上游 后端只有 /api/search，没有 album/artist/playlist 端点（实测 404 返回 HTML）；
  *   B站只有 video/bili_user，没有专辑概念；
  *   YouTube 的 playlistRenderer 在 ANDROID client 下不返回；
  *   咪咕有 album/singer 但没 playlist；
@@ -10241,7 +10241,7 @@ const MIX_SRC_SHEETS = 4;       // 从几张源歌单里取材
 const MIX_SRC_LIMIT = 50;       // 每张源歌单取前多少首（只借元数据，不整张拉）
 const MIX_COUNT_PER_PAGE = 1;   // 推荐页每屏放几张拼单（只放一张，没必要两张）
 
-/** 分类 → Deezer 搜索词。拼单封面从这里取。
+/** 分类 → 公开曲库 搜索词。拼单封面从这里取。
     ⚠️ 只有这条路能一条条命中：拼音（gufeng）在 Deezer 是空的，
        必须用英文风格词（guzheng）。全部 70 个分类 2026-10-18 实测过。 */
 const DZ_API = "https://api.deezer.com";
@@ -10664,7 +10664,7 @@ const mixBlurbShort = (cat) => {
 /* 曲目从哪儿来 —— 详情页末尾补一句，免得看着像凭空生成的。 */
 const MIX_SOURCE_NOTE = "曲目取自网易云、QQ 音乐等平台的公开歌单，每天重拼一次，同一天内容固定。";
 
-/** 某个分类的拼单封面：优先自绘那套，没有就回 Deezer 现搜（缓存 24h，一次 5 张） */
+/** 某个分类的拼单封面：优先自绘那套，没有就回 公开曲库 现搜（缓存 24h，一次 5 张） */
 async function dzCovers(cat) {
   const key = cat || "全部";
   const own = MIX_COVERS[key];
@@ -10828,7 +10828,7 @@ async function mixSheetDetail(recipe) {
      反差歌只要一首，所以给它 1 张歌单、20 首候选就够，不用整份拉。
      ⚠️ 用 allSettled 而不是 all：反差歌挂了不能让整张拼单跟着失败。 */
   const far = MIX_CONTRAST[cat] || "爵士";
-  /* 封面也塞进这批并发里。它要过一次网络（没自绘封面的分类走 Deezer），
+  /* 封面也塞进这批并发里。它要过一次网络（没自绘封面的分类走 公开曲库），
      放在歌曲之后串行等，就白搭上一次往返；并发进来是零成本。 */
   const coverJob = dzCovers(cat).catch(() => []);
   const both = await Promise.all([
@@ -10903,7 +10903,7 @@ async function mixSheetDetail(recipe) {
  *      ⚠️ 这条比「相似歌手」准得多：榜单/推荐类歌单是运营拼的，
  *      同档歌手会被拼在一起；而匿名可用的相似歌手接口基本都死了
  *      （网易 simiSong 匿名返回空数组、QQ musicu 500003、
- *      酷狗 Access Deny），Deezer 能替代但中文覆盖率差
+ *      酷狗 Access Deny），公开曲库 能替代但中文覆盖率差
  *      （草东没有派对 直接查无此人），只能当补充。
  *   ② 候选校验 —— 共现出来的名字必须能通过「歌手名匹配 + 曲库规模」
  *      两道关，把 UGC 歌单里那些私人号的杂名滤掉。
@@ -11558,7 +11558,7 @@ async function tasteSheetDetail(recipe) {
  *
  * 两个数据源：
  *   网易云  匿名可用，实测一首歌 197 万条，offset 正常翻页
- *   YouTube 走 innertube next，先用 watch 页 HTML 里的 ytInitialData
+ *   YouTube 走 官方内部接口 next，先用 watch 页 HTML 里的 ytInitialData
  *           找到 comment-item-section 的 token，再换
  *           frameworkUpdates.entityBatchUpdate 里的评论实体
  *
@@ -11875,7 +11875,7 @@ async function neteaseIdFor(musicItem) {
   if (hit && Date.now() - hit.at < NE_LOOKUP_TTL) return hit.v;
 
   let found = null;
-  /* ⚠️ 必须用 cloudsearch，不能用 COCO / search/get/web。
+  /* ⚠️ 必须用 cloudsearch，不能用 聚合上游 / search/get/web。
      实测同一首歌：
        cloudsearch  「起风了 买辣椒也用券」→ 第 1 条就是正版
        COCO / web   「起风了 买辣椒也用券」→ 全是 remix 和翻唱，正版被挤没了
@@ -13626,17 +13626,17 @@ async function resolveKuwo(id, want, quality) {
     }
   } catch (e) { errors.push("官方搜索: " + e.message); }
 
-  // 2. 溯音
+  // 2. 第三方线路
   try { return await suyinKuwo(want, quality); }
   catch (e) { errors.push("溯音: " + e.message); }
 
-  // 3. 长青
+  // 3. 模板直拼线路
   if (id) {
     try { return await changqingKuwo(id, quality); }
     catch (e) { errors.push("长青: " + e.message); }
   }
 
-  // 4. hi.cn 搜索（实测酷我三首全通）
+  // 4. 备用上游 搜索（实测酷我三首全通）
   try {
     const items = await searchAny((kw) => hiSearch("kuwo", kw, 8), buildKeywords(want));
     for (let i = 0; i < items.length; i++) {
@@ -13847,7 +13847,7 @@ async function searchMusicAll(query, page) {
       artist: raw.artist || raw.singer || raw.ARTIST || "",
       album: raw.album || raw.albumName || raw.ALBUM || "",
       artwork: raw.cover || raw.pic_url || raw.picUrl || raw.MVPIC || "",
-      // ⚠️ 各平台时长格式不统一：COCO 给 "03:27"、酷我给 257（秒）、B站给 "4:12"。
+      // ⚠️ 各平台时长格式不统一：聚合上游 给 "03:27"、酷我给 257（秒）、B站给 "4:12"。
       //    直接 Number() 会把 "03:27" 变成 NaN，导致界面显示 00:00。
       duration: ytDurSec(raw.durationText || raw.duration || raw.DURATION || 0) * 1000,
       playCount: Number(raw.playCount || raw.play || 0),   // 目前只有 B 站有
@@ -15649,16 +15649,16 @@ function mediaCacheForget(item) {
   delete MEDIA_URL_CACHE[mediaCacheKey(item)];
 }
 
-/** 这条地址是不是「B 站 upos 系」—— 那种会按 User-Agent 做防盗链。
+/** 这条地址是不是「B 站 主站节点 系」—— 那种会按 User-Agent 做防盗链。
  *
  *  实测（2026-10-21，同一批地址逐个换 UA 打 Range）：
- *    mcdn.bilivideo.cn:8082（B 站 PCDN）  任何 UA 都 206
- *    upos-*.bilivideo.com                 桌面UA 206，stagefright/ijkplayer/Lavf 403
+ *    边缘节点.视频 CDN.cn:8082（B 站 PCDN）  任何 UA 都 206
+ *    主站节点-*.视频 CDN.com                 桌面UA 206，stagefright/ijkplayer/Lavf 403
  *    *.edge.mountaintoys.cn               同上，403
  *
  *  播放器带什么 UA 插件管不了（有些客户端会用自带 UA 覆盖我们给的 headers），
  *  所以这类地址**不能**走「缓存直接复用」的快速通道 —— 必须每次重新过一遍
- *  取流，让 biliFetchUrl 有机会挑 mcdn 或者内联。 */
+ *  取流，让 biliFetchUrl 有机会挑 边缘节点 或者内联。 */
 function isUaGatedUrl(url) {
   const u = String(url || "");
   if (!u || u.indexOf("data:") === 0) return false;
@@ -15668,7 +15668,7 @@ function isUaGatedUrl(url) {
      于是这个判断永远返回 false —— 修复看起来加了，实际一条也没拦住。 */
   let host = "";
   try { host = String(new URL(u).host || ""); } catch (e) { return false; }
-  /* ⚠️ html5 直出的地址（durl）虽然也落在 upos-* 上，但它**不校验 UA**：
+  /* ⚠️ html5 直出的地址（durl）虽然也落在 主站节点-* 上，但它**不校验 UA**：
      URL 上带 platform=html5，路径是 xxx-1-16.mp4 这种渐进式 mp4。
      实测 stagefright / AppleCoreMedia / ExoPlayer / okhttp / Dalvik /
      空 UA 全部 206，不带 Referer 也 206。所以它属于「可以放心缓存复用」，
@@ -15697,7 +15697,7 @@ function isBiliHtml5Url(u) {
  *  用户点歌时会被快速通道直接复用，整首内联永远轮不到 —— 见 getMediaSource 里
  *  「四改」那段注释。
  *
- *  ⚠️ 必须对 host 做匹配（踩过 upos 那次：拿整条 URL 对 ^ 和 \. 永远不中）。 */
+ *  ⚠️ 必须对 host 做匹配（踩过 主站节点 那次：拿整条 URL 对 ^ 和 \. 永远不中）。 */
 function isYtStreamUrl(url) {
   const u = String(url || "");
   if (!u || u.indexOf("data:") === 0) return false;
@@ -15758,9 +15758,9 @@ const HTTPS_OK_HOST = /(^|\.)(qqmusic\.qq\.com|music\.126\.net|music\.163\.com|m
  *   事故：用户「点了没声音」，而插件自己的探活 100% 通过。
  *   原因就是我这边探活时 httpGet 默认带 UA，而交给播放器的 headers
  *   只有一条 Referer —— 播放器如果自己不补 UA（或者补的是 Lavf 那种），
- *   B 站 upos 集群直接 403。
+ *   B 站 主站节点 集群直接 403。
  *
- *   实测同一条 upos 直链（2026-10-21）：
+ *   实测同一条 主站节点 直链（2026-10-21）：
  *     只有 Referer                 → 403
  *     空 UA                        → 403
  *     Lavf/58.76.100（ffmpeg）     → 403
@@ -15917,7 +15917,7 @@ async function getMediaSource(musicItem, quality) {
    *   取决于你点的时候后台预取跑完没有。实测「周杰倫 晴天」连着点三次，
    *   第一次内联成功，第二、三次全走缓存 → 无声。
    *
-   *   正确做法跟下面 B 站 upos 那条完全同构：这类地址不进快速通道，
+   *   正确做法跟下面 B 站 主站节点 那条完全同构：这类地址不进快速通道，
    *   丢掉缓存重走一遍完整取流（这次会内联）。 */
   if (cached && isYtStreamUrl(cached)) {
     console.log("[粽子] 缓存里是 YouTube 流式地址（应内联），丢弃重取: "
@@ -15933,17 +15933,17 @@ async function getMediaSource(musicItem, quality) {
   if (cached) {
     /* ⚠️⚠️ 2026-10-21：命中了一条「会校验 UA 的 B 站地址」→ **丢弃缓存，重新取**。
      *
-     *   背景见 biliFetchUrl 里 isUaFree 那段：upos 节点按 UA 防盗链，
+     *   背景见 biliFetchUrl 里 isUaFree 那段：主站节点 节点按 UA 防盗链，
      *   而播放器带什么 UA 插件管不了（有的会用自带 UA 盖掉我们给的头）。
      *
      *   就是这条缓存路径让修复失效的：预取（_prefetchMode）走的是裸
-     *   resolveMediaSource，虽然那时已经会优先挑 mcdn，但只要当时没有 mcdn
-     *   可用（实测约 7/8 的条目只有 upos），写进缓存的就是一条 upos 裸地址。
-     *   之后用户点播 → 缓存命中 → 直接把这条 upos 扔给播放器 → 403。
+     *   resolveMediaSource，虽然那时已经会优先挑 边缘节点，但只要当时没有 边缘节点
+     *   可用（实测约 7/8 的条目只有 主站节点），写进缓存的就是一条 主站节点 裸地址。
+     *   之后用户点播 → 缓存命中 → 直接把这条 主站节点 扔给播放器 → 403。
      *   表现是「插件里测能播、App 里点开没声音」，而且**时好时坏**，
      *   取决于预取当时挑到了哪条 —— 最难查的那种。
      *
-     *   正确做法：这类地址不进快速通道，走一遍完整取流（会内联或挑 mcdn）。 */
+     *   正确做法：这类地址不进快速通道，走一遍完整取流（会内联或挑 边缘节点）。 */
     console.log("[粽子] 缓存里是 B站 upos 地址（校验 UA），丢弃重取: "
       + String(musicItem.title || "").slice(0, 20));
     mediaCacheForget(musicItem);
@@ -16068,8 +16068,8 @@ async function resolveMediaSource(musicItem, quality) {
    *   用户看到的就是「点进去转一分多钟，然后灰掉」。
    *
    *   根因是本平台这条路**一条闸都没有**：resolveNetease / resolveQQ /
-   *   resolveKugou 内部都是串行链（直取 → hi.cn → 酷我 → COCO 搜索 →
-   *   COCO 取流），每段 axios 超时 20 秒，5~8 段串下来就是一分多钟。
+   *   resolveKugou 内部都是串行链（直取 → 备用上游 → 酷我 → 聚合上游 搜索 →
+   *   聚合上游 取流），每段 axios 超时 20 秒，5~8 段串下来就是一分多钟。
    *   而兜底明明有 12 秒总闸 —— 只是轮不到它：本平台是把兜底**串在它后面**的，
    *   本平台不返回，兜底永远不发车。
    *
@@ -16238,7 +16238,7 @@ async function resolveMediaSource(musicItem, quality) {
       const fn = RESOLVERS[p];
       if (!fn) continue;
       // 传 null 作为 id：各 resolver 内部会走「搜索 → 严格匹配」路径，
-      // 不会用到需要本平台 id 的直取通道（如长青）。
+      // 不会用到需要本平台 id 的直取通道（如模板直拼线路）。
       fbQueue.push({ p: p, fn: fn });
     }
     pumpFallback();
@@ -16437,7 +16437,7 @@ async function resolveMediaSource(musicItem, quality) {
  *   ① 本源直取 —— 条目来自哪个平台就先问那个平台（命中最准）。
  *   ② 跨源兜底 —— B站 / YouTube / JOOX / Apple 本身没有歌词库，
  *      以及本源只回「暂无歌词」的曲子，按「歌名 + 歌手 + 时长」去公共库反查。
- *      顺序 LRCLIB → 网易云 → 酷狗 → hi.cn。
+ *      顺序 LRCLIB → 网易云 → 酷狗 → 备用上游。
  *
  * 实测（2026-10-18）：
  *   - LRCLIB 是公开 API，不用 key、不用登录，返回带时间轴的 LRC。
@@ -16446,7 +16446,7 @@ async function resolveMediaSource(musicItem, quality) {
  *     以前点了歌词永远是空的。
  *   - 网易云官方 /api/song/lyric 一次能同时拿原文和翻译（tlyric），
  *     译文按同一时间戳并排插在原文下一行，播放器滚词就是双语。
- *   - 酷我 COCO 通道固定返回 400（实测 kuwo/migu 都是），
+ *   - 酷我 聚合上游 通道固定返回 400（实测 kuwo/migu 都是），
  *     只有官方 m.kuwo.cn 按 musicId 直取才行。
  *   - 酷狗 krcs.kugou.com/search + lyrics.kugou.com/download
  *     返回 base64 的 LRC，华语老歌命中率高，能补网易云没有的曲目。
@@ -16805,7 +16805,7 @@ async function qqLyricByMid(mid) {
   return (tr && shouldLyricTranslation()) ? mergeTranslation(lrc, tr) : lrc;
 }
 
-/** 酷我官方：按 musicId 直取（COCO 的酷我通道固定 400） */
+/** 酷我官方：按 musicId 直取（聚合上游 的酷我通道固定 400） */
 async function kuwoLyricById(id) {
   if (!id) return "";
   const r = await httpGet(KW_LRC, { musicId: id }, { Referer: "https://www.kuwo.cn/", "User-Agent": UA });
@@ -16880,7 +16880,7 @@ async function lyricFromOwnSource(provider, item, want, durMs) {
   if (provider === "kuwo") return kuwoLyricById(id);
 
   if (provider === "kugou" || provider === "migu") {
-    // 酷狗/咪咕走 COCO：实测酷狗 63 行、咪咕 0 行（失败就走兜底）
+    // 酷狗/咪咕走 聚合上游：实测酷狗 63 行、咪咕 0 行（失败就走兜底）
     const res = await httpGet(COCO + "/api/lyric", { id: id, provider: provider, extra: "" }, cocoHeaders());
     const lines = (res && res.lines) || [];
     const out = [];
@@ -16966,7 +16966,7 @@ async function getLyricUncached(musicItem) {
     } catch (e) { /* 落到 hi.cn */ }
   }
 
-  /* ③ hi.cn（最后一道，网易云/酷我两路）
+  /* ③ 备用上游（最后一道，网易云/酷我两路）
      ⚠️ 酷我通道必须用「歌名 + 歌手」搜，只给歌名召回很差
         （实测 "晴天 周杰伦" 能中，"晴天" 单独搜 0 条） */
   const platforms = provider === "kuwo" ? ["kuwo", "wyy"] : ["wyy", "kuwo"];

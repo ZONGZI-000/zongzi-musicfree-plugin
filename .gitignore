@@ -8,3 +8,12 @@ node_modules
 _cur.diff
 *.diff
 _dbg/
+
+# 调试产物：截图、抓包、临时输出一律不进仓库
+_zgrid/
+_zth/
+_z*.png
+_z*.jpg
+_zout*
+_ze.txt
+_*.bin
