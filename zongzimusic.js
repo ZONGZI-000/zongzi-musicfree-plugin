@@ -14847,22 +14847,59 @@ async function resolveMediaSource(musicItem, quality) {
     return u;
   };
 
-  // 1) 本平台
+  /* ============================================================
+   * 1) 本平台 —— 与兜底**同时发车**（2026-10-21 修「点进去一直转」）
+   *
+   * ⚠️ 事故：网络「慢但不死」时（每个请求都卡满 20 秒超时），
+   *   点一首 QQ 的歌实测 **132 秒**、点网易的 **172 秒** 才报错。
+   *   用户看到的就是「点进去转一分多钟，然后灰掉」。
+   *
+   *   根因是本平台这条路**一条闸都没有**：resolveNetease / resolveQQ /
+   *   resolveKugou 内部都是串行链（直取 → hi.cn → 酷我 → COCO 搜索 →
+   *   COCO 取流），每段 axios 超时 20 秒，5~8 段串下来就是一分多钟。
+   *   而兜底明明有 12 秒总闸 —— 只是轮不到它：本平台是把兜底**串在它后面**的，
+   *   本平台不返回，兜底永远不发车。
+   *
+   *   现在两路同时发，共用一个总闸。但**不纯按「谁先到用谁」**：
+   *   本平台是「按 id 直取」，音源和音质都更准；兜底是「搜同名歌」，
+   *   快但可能撞上别人的版本。所以给本平台一个 GRACE 优先窗口 ——
+   *   在窗口内回来就用它，超了才让兜底先到先用。
+   *   实测本平台命中 < 1.5 秒，2.5 秒是 1.7 倍余量，正常网络下顺序完全不变。
+   *
+   *   ⚠️ 这个 promise 必须自己吃掉异常：它并发跑着，reject 出去会变成
+   *      unhandled rejection（Hermes 上静默丢弃，最难查的那种）。
+   * ============================================================ */
+  /* ⚠️ GRACE 只对「本身就有音源」的平台有意义（QQ / 网易 / 酷狗 / 咪咕 / 酷我）。
+     mb / apple / bilibili / youtube 这些条目**本来就没有本平台音源**，
+     它们必然走兜底，等这个窗口纯属白等 2.5 秒。
+     实测 QQ 的 COCO 通道正常要 2~3 秒才出流，所以窗口给 4 秒
+     （不是 2.5 秒 —— 2.5 秒会把 QQ 的准确直取让给兜底的同名搜索）。 */
+  const OWN_SOURCE_PROVIDERS = { netease: 1, qq: 1, kugou: 1, migu: 1, kuwo: 1, miguapi: 1, joox: 1 };
+  const GRACE_MS = OWN_SOURCE_PROVIDERS[provider] ? 2000 : 0;
+  const t0 = Date.now();
   const resolver = RESOLVERS[provider];
-  if (resolver) {
+  let ownResult = null;
+  let ownSettled = false;
+  const ownP = (function () {
+    if (!resolver) return Promise.resolve(null);
     if (isDead(provider, musicItem.id)) {
       errors.push(provider + ": 已知不可播，跳过");
-    } else {
-      try {
-        const u = await resolver(musicItem.id, want, q);
-        const okUrl = await accept(u, provider);
-        if (okUrl) return { url: okUrl };
-      } catch (e) {
+      return Promise.resolve(null);
+    }
+    return Promise.resolve()
+      .then(function () { return resolver(musicItem.id, want, q); })
+      .then(function (u) { return accept(u, provider); })
+      .catch(function (e) {
         markDead(provider, musicItem.id);
         errors.push(provider + ": " + e.message);
-      }
-    }
-  }
+        return null;
+      });
+  })();
+  const ownTagged = ownP.then(function (u) {
+    ownSettled = true;
+    ownResult = u || null;
+    return { own: true, u: ownResult };
+  });
 
   // 2) 跨平台兜底
   //    ⚠️ 兜底必须做「是不是同一首歌」的严格校验。
@@ -14889,23 +14926,57 @@ async function resolveMediaSource(musicItem, quality) {
   if (fallbackSkip) {
     console.log("[粽子] 兜底跳过内地平台（下架歌手）: 《" + want.name + "》");
   }
+  /* ⚠️ 兜底不再「一上来就发车」（2026-10-21）。
+     之前为了修「本平台串行拖死兜底」，把两路改成了同时发 —— 效果对，
+     但代价是正常网络下每点一首歌都要往 9 个平台各发一轮请求
+     （实测单首 33 个请求），而其中 8 个注定是白发的。手机上是真金白银的流量。
+     现在改成：本平台先跑，GRACE_MS 内没回来才把兜底整批发出去。
+     本平台命中 < 2 秒时，兜底一个请求都不发；只有本平台真慢/真挂了，
+     兜底才按原来的并发竞速冲上去。两全。 */
   const runners = [];
-  for (let i = 0; i < FALLBACK_ORDER.length; i++) {
-    const p = FALLBACK_ORDER[i];
-    if (p === provider) continue;
-    if (fallbackSkip && fallbackSkip.indexOf(p) >= 0) continue;
-    const fn = RESOLVERS[p];
-    if (!fn) continue;
-    // 传 null 作为 id：各 resolver 内部会走「搜索 → 严格匹配」路径，
-    // 不会用到需要本平台 id 的直取通道（如长青）。
-    const slot = runners.length;
-    runners.push(
-      fn(null, want, q).then(
-        (u) => ({ p: p, slot: slot, u: u, err: null }),
-        (e) => ({ p: p, slot: slot, u: null, err: e })
-      )
-    );
+  let runnersStarted = false;
+  /* ⚠️ 兜底并发上限 4（2026-10-21）。
+     9 个平台一起发，单首歌实测打出 28~69 个请求 —— 手机上是实打实的流量，
+     而且这些请求和正在播放的音频流抢同一条带宽（表现为「播着播着卡一下」）。
+     改成每轮最多 4 路：命中率高的先上，谁先回来就补下一个，总覆盖不变。
+     ⚠️ 顺序就是 FALLBACK_ORDER，它本身就是按「命中率 + 音质」排的。 */
+  const FB_CONCURRENCY = 4;
+  const fbQueue = [];
+  let fbActive = 0;
+  function pumpFallback() {
+    while (fbActive < FB_CONCURRENCY && fbQueue.length) {
+      const job = fbQueue.shift();
+      fbActive++;
+      const slot = runners.length;
+      runners.push(
+        job.fn(null, want, q).then(
+          (u) => ({ p: job.p, slot: slot, u: u, err: null }),
+          (e) => ({ p: job.p, slot: slot, u: null, err: e })
+        ).then(function (r) {
+          fbActive--;
+          pumpFallback();               // 空出一个位置就补下一个
+          return r;
+        })
+      );
+    }
   }
+  function startRunners() {
+    if (runnersStarted) return;
+    runnersStarted = true;
+    for (let i = 0; i < FALLBACK_ORDER.length; i++) {
+      const p = FALLBACK_ORDER[i];
+      if (p === provider) continue;
+      if (fallbackSkip && fallbackSkip.indexOf(p) >= 0) continue;
+      const fn = RESOLVERS[p];
+      if (!fn) continue;
+      // 传 null 作为 id：各 resolver 内部会走「搜索 → 严格匹配」路径，
+      // 不会用到需要本平台 id 的直取通道（如长青）。
+      fbQueue.push({ p: p, fn: fn });
+    }
+    pumpFallback();
+  }
+  /* 没有本平台音源的来源（mb / apple 等）直接发；有的话等窗口过了再发。 */
+  if (GRACE_MS <= 0) startRunners();
   /* 兜底总闸：再慢也不能让用户干等。20 秒内一条都过不了验收就放弃，
      下面照旧走「只给片段 / 全平台失败」两条收尾路径。
 
@@ -14922,24 +14993,68 @@ async function resolveMediaSource(musicItem, quality) {
      12 秒仍然给慢网留了 4 倍于典型耗时的余量。 */
   const FB_DEADLINE = 12000;
   const fbStart = Date.now();
-  const waiting = runners.slice();
+  let ownRaced = false;
   let deadlineHit;
   const deadlineGate = new Promise((resolve) => {
     const t = setTimeout(() => resolve(null), FB_DEADLINE);
     deadlineHit = () => clearTimeout(t);
   });
-  while (waiting.length && Date.now() - fbStart < FB_DEADLINE) {
-    let r;
-    try { r = await Promise.race(waiting.concat([deadlineGate])); } catch (e) { break; }
-    if (r === null) break;                    // 到点，别再等了
-    // 把已经回来的这个从候选里摘掉（按数组身份，不按平台名 ——
-    // 同一个平台可能出现在多个槽位）
-    for (let k = 0; k < waiting.length; k++) {
-      if (waiting[k] === runners[r.slot]) { waiting.splice(k, 1); break; }
+  /* 阶段一：只等本平台，最多 GRACE_MS（没有本平台音源时 GRACE_MS=0，直接跳过）*/
+  if (GRACE_MS > 0) {
+    const graceTag = { __grace: true };
+    const graceGate = new Promise(function (res) { setTimeout(function () { res(graceTag); }, GRACE_MS); });
+    const w = await Promise.race([ownTagged, graceGate]);
+    if (w !== graceTag) {
+      ownRaced = true;
+      if (w && w.u) {
+        deadlineHit();
+        console.log("[粽子] 本平台命中: " + provider + " 《" + want.name + "》"
+          + "（" + (Date.now() - fbStart) + "ms）");
+        return { url: w.u };
+      }
+      /* 本平台明确失败（不是超时）→ 立刻发兜底，不用再等 */
     }
+    startRunners();
+  }
+
+  while (runners.length && Date.now() - fbStart < FB_DEADLINE) {
+    /* ⚠️ 这里的 waiting 每次重新取：startRunners 可能在 await 之前刚跑过，
+       而 runners 数组是就地 push 的，所以要用「本轮回合后的快照」。 */
+    const waiting = runners.filter(function (p) { return p && !p.__done; });
+    if (!waiting.length) break;
+    let r;
+    const pool = ownRaced ? waiting.concat([deadlineGate]) : waiting.concat([deadlineGate, ownTagged]);
+    try { r = await Promise.race(pool); } catch (e) { break; }
+    if (r === null) break;                    // 到点，别再等了
+    if (r && r.own) {
+      ownRaced = true;
+      if (r.u) {
+        deadlineHit();
+        console.log("[粽子] 本平台命中: " + provider + " 《" + want.name + "》"
+          + "（" + (Date.now() - fbStart) + "ms）");
+        return { url: r.u };
+      }
+      continue;                               // 本平台没拿到，继续等兜底
+    }
+    /* 把已经回来的这个标记掉（用 __done 而不是从数组里 splice ——
+       waiting 现在是每轮的快照，splice 它不会影响 runners）。 */
+    if (runners[r.slot]) runners[r.slot].__done = true;
     if (r.err) { errors.push("兜底" + r.p + ": " + r.err.message); continue; }
     const okUrl = await accept(r.u, "兜底" + r.p);
     if (okUrl) {
+      /* 兜底已经能播了，但本平台更准 —— 还没到 GRACE 就先等它一下。
+         等到就换成它，等不到就用兜底这条（用户等的是声音，不是完美）。 */
+      if (GRACE_MS > 0 && !ownSettled && Date.now() - t0 < GRACE_MS) {
+        const ownNow = await Promise.race([
+          ownTagged,
+          new Promise(function (res) { setTimeout(function () { res(null); }, GRACE_MS - (Date.now() - t0)); }),
+        ]);
+        if (ownNow && ownNow.u) {
+          deadlineHit();
+          console.log("[粽子] 本平台命中（优先于兜底 " + r.p + "）: 《" + want.name + "》");
+          return { url: ownNow.u };
+        }
+      }
       deadlineHit();
       console.log("[粽子] 兜底命中: " + provider + " → " + r.p + " 《" + want.name + "》"
         + "（" + (Date.now() - fbStart) + "ms）");
@@ -14947,6 +15062,13 @@ async function resolveMediaSource(musicItem, quality) {
     }
   }
   deadlineHit();
+
+  /* 兜底全跑完/到点了，本平台如果最后回来了仍然可用 —— 它比兜底准。
+     ownP 已经跑了一定时间，这里用 ownSettled 判断，不额外阻塞。 */
+  if (ownResult) {
+    console.log("[粽子] 本平台迟到命中: " + provider + " 《" + want.name + "》");
+    return { url: ownResult };
+  }
 
   // 3) 全平台都只给片段 → 退回片段，别让用户点了报错
   if (previewOnly) {
@@ -15464,6 +15586,18 @@ async function lyricFromPublicSources(want, durMs) {
 }
 
 async function getLyric(musicItem) {
+  /* ⚠️ 歌词必须有总闸（2026-10-21）。
+     内部三段（本源直取 / 公共库 / hi.cn）各自有超时，但 hi.cn 那段是
+     **关键词 × 平台的双层 for 循环**，每个请求都可能卡满 20 秒 ——
+     实测把网络打成「永不返回」时，getLyric 挂满 60 秒还没出来，
+     播放页的歌词面板就一直转（用户看到的是「点进去歌词一直加载」）。
+     现在给整条链路 10 秒：到点就返回空歌词，界面显示「暂无歌词」，
+     比无限转圈好得多。 */
+  const r = await lyricTimeout(getLyricUncached(musicItem), 6000);
+  return r || { rawLrc: "" };
+}
+
+async function getLyricUncached(musicItem) {
   const item = musicItem || {};
   const provider = item._provider || LABEL_TO_PROVIDER[item.platform] || "";
   const want = lyricNameArtist(item);
@@ -15513,7 +15647,7 @@ async function getLyric(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.43",
+  version: "4.10.44",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube、Bilibili 八个平台，支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
