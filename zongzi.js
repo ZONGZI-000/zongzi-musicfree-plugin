@@ -368,10 +368,41 @@ async function ytBootstrap(videoId) {
   }
 }
 
-/** 用 VISIONOS client 取 player 响应 */
-async function ytPlayerVisionos(videoId) {
-  /* bootstrap（抓 watch 页）本身也是网络请求，同样要过熔断 */
-  const boot = await ytGuard(() => ytBootstrap(videoId));
+/* ============================================================
+ * ⚠️ 2026-10-24：visitorData 是「会失效的凭证」，不是拿到就能一直用。
+ *
+ * 现象：YouTube 整条路突然全挂，但网络是通的、搜索也正常，只有取流不行。
+ *
+ * 实测（2026-10-24，本机）：
+ *   · 同一个 visitor 连打 32 次 —— 0 失败，不衰减；
+ *   · 但把 visitor 换成失效值 / 空串 / 不带 —— 立刻稳定回
+ *     LOGIN_REQUIRED「请登录，以便我们确认你不是聊天机器人」；
+ *   · 同一时刻换一个**新** visitor 请求同一首歌 —— 立刻 200 OK，出 5 条直链。
+ *   也就是说：这个报错跟视频无关，只跟手上这个 visitor 有没有被标记有关。
+ *
+ * 旧代码把它当成「这条取流路不可用」，直接掉到 ANDROID/IOS 兜底 ——
+ * 而那两个 client 现在都已经拿不到能下载的直链了（见下方版本矩阵），
+ * 于是整条 YouTube 就死在「兜底也兜不住」上。
+ *
+ * 正确做法：换一个 visitor 重试一次，不要把一次凭证失效升级成整轮失败。
+ * ============================================================ */
+/** 让缓存作废，下次 ytBootstrap 会重新取一对新的 key/visitor */
+function ytInvalidateVisitor() {
+  ytVisitorData = "";
+  ytApiKey = "";
+  ytVisitorAt = 0;
+}
+
+/** 这个错是不是「visitor 被标记了」（换个 visitor 就能好），而不是「视频真的没流」 */
+function ytIsVisitorProblem(e) {
+  const msg = String((e && e.ytStatus) || "") + " "
+    + String((e && e.ytReason) || "") + " "
+    + String((e && e.message) || "");
+  return /LOGIN_REQUIRED|Sign in to confirm|not a bot|请登录|机器人/i.test(msg);
+}
+
+/** 用给定的 key/visitor 打一次 player。单独抽出来，是为了能「换个 visitor 重来」 */
+async function ytVisionosOnce(videoId, boot) {
   const body = {
     context: {
       client: {
@@ -410,7 +441,12 @@ async function ytPlayerVisionos(videoId) {
   ));
   const d = r.data || {};
   const ps = d.playabilityStatus || {};
-  if (ps.status !== "OK") throw new Error("yt visionos: " + (ps.status || "?") + " " + String(ps.reason || "").slice(0, 40));
+  if (ps.status !== "OK") {
+    const err = new Error("yt visionos: " + (ps.status || "?") + " " + String(ps.reason || "").slice(0, 40));
+    err.ytStatus = ps.status || "";
+    err.ytReason = String(ps.reason || "");
+    throw err;
+  }
   const sd = d.streamingData || {};
   const all = (sd.formats || []).concat(sd.adaptiveFormats || []);
   const audios = all
@@ -423,7 +459,11 @@ async function ytPlayerVisionos(videoId) {
       size: Number(f.contentLength || 0),
     }))
     .sort((a, b) => b.bitrate - a.bitrate);
-  if (!audios.length) throw new Error("yt visionos: 无音频流");
+  if (!audios.length) {
+    const err = new Error("yt visionos: 无音频流");
+    err.ytStatus = ps.status || "OK";
+    throw err;
+  }
   const vd = d.videoDetails || {};
   return {
     audios: audios,
@@ -433,6 +473,31 @@ async function ytPlayerVisionos(videoId) {
   };
 }
 
+/**
+ * 用 VISIONOS client 取 player 响应。
+ *
+ * 自带「换 visitor 重试」：一次 LOGIN_REQUIRED 只说明手上这个 visitor 被标记了，
+ * 不代表这条路不通。先作废缓存、重新取一对新的 key/visitor，再打一次。
+ * 重试也只重试一次 —— 连续两次都不行，那才是真的不行，交给上层兜底。
+ */
+async function ytPlayerVisionos(videoId) {
+  let boot = await ytGuard(() => ytBootstrap(videoId));
+  try {
+    return await ytGuard(() => ytVisionosOnce(videoId, boot));
+  } catch (e) {
+    if (!ytIsVisitorProblem(e)) throw e;
+    /* ⚠️ 这里不能再走 ytGuard：失败已经记过一次账了，
+       自愈重试要是再记一次，两首歌就能把熔断器顶开，
+       而实际上只是换了个 visitor 的事。 */
+    console.log("[粽子] YouTube visitor 失效（" + e.message + "）→ 换新 visitor 重试");
+    ytInvalidateVisitor();
+    boot = await ytBootstrap(videoId);
+    return await ytVisionosOnce(videoId, boot);
+  }
+}
+
+/* ⚠️ 2026-10-24 实测：这两个只是「留个痕迹」，现在的直链一律 403。
+   真要救 YouTube，靠的是上面 VISIONOS 的 visitor 自愈，不是这里。 */
 const YT_IOS = {
   version: "20.10.4",
   ua: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
@@ -5773,13 +5838,46 @@ async function ytFetchUrl(videoId, quality) {
     res = await ytPlayerVisionos(videoId);
     usedVisionos = true;
   } catch (e) {
-    // VISIONOS 不可用（极少数视频不支持）→ 退回 ANDROID/IOS
+    /* ⚠️ 2026-10-24：原来这里是「退回 ANDROID / IOS」。
+       实测这三个 client 现在都拿不到能下载的直链了：
+         · ANDROID 20.10.38 —— 能出直链，但 googlevideo 一律 403；
+         · IOS 20.10.4    —— 同上，403；
+         · ANDROID/IOS 20.45+ / 21.x —— 只回 SABR，streamingData 里 url 是 undefined；
+         · 19.x 及更早 —— HTTP 400「Precondition check failed」，服务端强制要新版本号；
+         · ANDROID_VR 1.61/1.62 —— LOGIN_REQUIRED；1.64/1.65 —— 403；
+         · WEB / MWEB / TVHTML5 / WEB_EMBEDDED / WEB_REMIX —— UNPLAYABLE 或已停用。
+       所以这条兜底实际上早就兜不住了，只是以前 VISIONOS 够稳，没暴露出来。
+       现在改成：先换新 visitor 再打一次 VISIONOS（那才是真正的失效原因），
+       实在不行才去试 ANDROID/IOS —— 留着不是指望它能播，是留个痕迹，
+       万一哪天它们又活了不用改代码。 */
     try { res = await ytPlayer(videoId, YT_ANDROID); }
     catch (e2) { res = await ytPlayer(videoId, YT_IOS); }
   }
 
-  const pick = ytPickAudio(res.audios, quality);
+  let pick = ytPickAudio(res.audios, quality);
   if (!pick) throw new Error("yt: 没有可用的音频流");
+  /* ⚠️⚠️ 2026-10-24（这就是「YouTube 又不行了」的根因）：
+     用户在「高 / 无损」档听歌时，ytPickAudio 按偏好表会挑到 256k 那条，
+     一首 3~4 分钟的曲子文件就是 3~5MB —— 永远超过 YT_INLINE_MAX_BYTES(2.5MB)，
+     于是 willInline 直接为假，取流退回**流式地址**。
+     而实机上 YouTube 的流式地址不出声（整首内联存在的唯一理由就是这个），
+     所以「高音质」等于「一首 YouTube 也放不出来」，而标准档却正常。
+     这不是配额问题、也不是 client 失效，纯粹是「档位选太大 → 内联被跳过」。
+
+     修法：内联可用时，如果挑中的音轨超过内联上限，就按体积从小到大找一条
+     塞得进上限的（itag 139/249 那种 48~50k 的 AAC）。
+     音质确实会降，但「能听」比「名义上无损、实际没声音」强得多。
+     ⚠️ 关掉内联（inlineYoutube=0）的用户不动 —— 他们本来就走流式。 */
+  if (shouldInlineYoutube()) {
+    const curSize = Number(pick.size || 0);
+    if (curSize > YT_INLINE_MAX_BYTES) {
+      const fits = (res.audios || [])
+        .filter((a) => a && a.url && !YT_BAD_ITAGS[a.itag] && Number(a.size || 0) > 0)
+        .filter((a) => Number(a.size) <= YT_INLINE_MAX_BYTES)
+        .sort((a, b) => b.bitrate - a.bitrate);
+      if (fits.length) pick = fits[0];
+    }
+  }
 
   /* ⚠️ 验活可以省掉一次往返。
      整首内联那条路本来就要先拉第一块、在里面验魔数（见 inlineAudio），
@@ -16994,7 +17092,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.64",
+  version: "4.10.65",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
