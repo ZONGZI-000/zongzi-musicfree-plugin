@@ -1199,6 +1199,88 @@ const PLATFORM_TRUST = {
    就等于自报翻唱 —— 跟已有的 女声|男声|童声 是同一类，只是说法不同。 */
 const VARIANT_RE = /翻唱|伴奏|ktv|dj|remix|童声|女声|男声|女版|男版|童声版|钢琴|吉他|纯音乐|铃声|片段|cover|instrumental|深情版|伤感版|抖音|加速|降调|慢速|咚鼓|氛围版|纯享|现场|live|演唱会|合辑|串烧|精选|连播|循环/i;
 
+/* ============================================================
+ * 视频平台标题清洗（2026-10-24）
+ *
+ * ⚠️ 为什么需要：YouTube / 视频站的标题天生带一堆发行方后缀 ——
+ *     「晴天 周杰伦 (歌词版)」「周杰倫【稻香】官方MV」「后来 - 刘若英 [歌词]」
+ *    「无損音樂FLAC 歌詞LYRICS 純享」「Official Music Video」。
+ *    这些词对「是不是同一首歌」毫无影响，但会让：
+ *      ① flatTitle ≠ 查询词  → tier 只能评到 2（其它平台显示干净的「稻香」能到 3）
+ *      ② 标题长度暴涨        → _extra 罚分、以及最后那道「短标题优先」全被拖累
+ *    实测搜「稻香」时，YouTube 的核心原唱条目排到第 26 位，
+ *    而前面 15 条是咪咕/网易云的同名翻唱。用户说的「搜索这边也比较弱」就是这个。
+ *
+ * 处理方式：判档 / 算多余字数之前，先把这些**纯发行包装**的词剥掉。
+ * ⚠️ 只剥「装饰」，绝不剥「内容」：
+ *    live / 伴奏 / 翻唱 / remix / 纯音乐 一个都不动 ——
+ *    那些是判 1 档的依据（VARIANT_RE 先跑，轮不到这里）。
+ * ============================================================ */
+/* 装饰括号：只有当括号里**全是装饰词**时才整段删。
+   ⚠️ 不能无条件剥括号 —— 中文视频标题爱把**歌名**放在【】《》里：
+      「周杰倫 Jay Chou【稻香 Rice Field】-Official Music Video」
+      剥掉【稻香 Rice Field】就等于把歌名连根拔了，
+      剩下「周杰倫 Jay Chou」，判档时永远认不出这是《稻香》。
+      实测这就是「稻香」搜出来官方 MV 排到第 45 位的直接原因。 */
+/* 括号**外**散落的装饰词（括号内的交给 stripDecorBrackets 逐段判断） */
+const YT_DECOR_RE = new RegExp(
+  "歌词版|歌词|歌詞版|歌詞|動態歌詞|动态歌词|lyrics?|lyric\\s*video" +
+  "|官方\\s*mv|music\\s*video|official\\s*(?:music\\s*)?video|official\\s*audio|官方版|完整版" +
+  "|高清|超清|无损|無損|flac|hi-?res|纯享|純享|中英字幕|中日字幕|字幕|罗马音|羅馬音" +
+  "|官方音源|原版音源|visualizer|动态封面|動態封面",
+  "gi"
+);
+
+const YT_DECOR_WORDS = new RegExp(
+  "^(?:歌词版?|歌詞版?|動態歌詞|动态歌词|lyrics?|lyric\\s*video" +
+  "|官方mv|官方mv版|mv|mv版|music\\s*video|official\\s*(?:music\\s*)?video|official\\s*audio" +
+  "|官方版|完整版|高清|hd|4k|8k|无损|無損|flac|hi-?res|纯享|純享|字幕|中英字幕|中日字幕" +
+  "|罗马音|羅馬音|audio|官方音源|原版音源|visualizer|动态封面|動態封面|超清|重制版?|修復版?)$",
+  "i"
+);
+
+/* 匹配各类括号成对内容（含嵌套一层），逐个判断里面的字是不是纯装饰 */
+function stripDecorBrackets(t) {
+  const PAIRS = [["【", "】"], ["〔", "〕"], ["[", "]"], ["(", ")"], ["（", "）"], ["《", "》"], ["「", "」"]];
+  let out = String(t || "");
+  for (let round = 0; round < 3; round++) {
+    let changed = false;
+    for (let pi = 0; pi < PAIRS.length; pi++) {
+      const [L, R] = PAIRS[pi];
+      const re = new RegExp(
+        L.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "([^" +
+        R.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "]*)" +
+        R.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"
+      );
+      out = out.replace(re, function (m, inner) {
+        /* 括号里去掉分隔符后如果只剩装饰词，或者整段是空的 → 删掉 */
+        const flatInner = String(inner || "").replace(/[\s|｜,，、\/\\+&·・~～-]/g, " ").trim();
+        if (!flatInner) { changed = true; return " "; }
+        /* 「HD」「4K」这种短标记算装饰 */
+        const parts = flatInner.split(/\s+/).filter(Boolean);
+        const allDecor = parts.length > 0 && parts.every(function (w) { return YT_DECOR_WORDS.test(w); });
+        if (allDecor) { changed = true; return " "; }
+        return m;
+      });
+    }
+    if (!changed) break;
+  }
+  return out;
+}
+
+/** 只用于「档位 / 多余字数」的标题归一化：剥掉发行包装后缀。
+ *  ⚠️ 不要拿它去改名 — 用户看到的标题保持原样，只改打分输入。 */
+function scoreTitle(raw) {
+  let t = toSimplified(String(raw || ""));
+  /* ① 先按「整体是装饰」的规则剥括号（歌名在【】里时必须保住） */
+  t = stripDecorBrackets(t);
+  /* ② 再清掉散落在括号外的装饰词（「-Official Music Video」「无損音樂FLAC」这类） */
+  t = t.replace(YT_DECOR_RE, " ");
+  // 剥完剩下的孤立连接符（「周杰伦 - 」→「周杰伦」）
+  t = t.replace(/[-–—_|/\\]+/g, " ").replace(/\s+/g, " ").trim();
+  return t;
+}
+
 /** 去掉括号里的整段内容：「起风了（2019版）」→「起风了」 */
 function coreTitle(s) {
   // ⚠️ 必须先把繁体摊成简体，否则繁中原唱会被当成「不匹配」
@@ -1594,8 +1676,11 @@ function relevanceTier(title, query, artist, artistQuery, titleQuery) {
   const raw = String(title || "").trim();
   const q = String(query || "").trim();
   if (!raw || !q) return 1;
-  const core = coreTitle(raw);
-  const flat = flatTitle(raw);
+  /* ⚠️ 视频平台的发行包装（歌詞版/MV/無損FLAC…）在判档之前先剥掉，
+     否则标题永远对不齐、只能拿 2 档。见 scoreTitle 的说明。 */
+  const scored = scoreTitle(raw);
+  const core = coreTitle(scored);
+  const flat = flatTitle(scored);
   if (!core) return 1;
   // 变体词直接压到最低档，不管标题多"准"
   // （翻唱那一套标记复用 isCoverTitle，别在两处各维护一份正则）
@@ -1627,6 +1712,17 @@ function relevanceTier(title, query, artist, artistQuery, titleQuery) {
 
   const at = artist;
   const cands = queryTitleCandidates(q);
+  /* ⚠️ 2026-10-24：视频站的官方标题经常是「中文歌名 + 英文对照名」双写 ——
+     「周杰倫 Jay Chou【稻香 Rice Field】-Official Music Video」。
+     scoreTitle 剥掉括号后剩「周杰伦 jay chou 稻香 rice field」，
+     跟查询「稻香」既不相等、也不包含 —— 于是真正的官方原唱被判成 tier=1，
+     而「稻香 (治愈版)」这种翻唱靠干净的短标题拿 tier=3 排到前面。
+     实测「稻香」：周杰伦官方 MV 在第 45 位，前面 20 多条全是别人的翻唱。
+
+     补救：如果某一段候选歌名**出现在**清理后的标题里，且标题里同时出现了
+     目标歌手（artist 字段或标题里的歌手名），也认作 3 档 ——
+     「官方发行版 + 歌手对得上」已经是这条链上最强的证据，
+     不该因为它顺带写了个英文名就被降档。 */
   let best = 1;
   for (let i = 0; i < cands.length; i++) {
     const c = cands[i];
@@ -1637,6 +1733,12 @@ function relevanceTier(title, query, artist, artistQuery, titleQuery) {
          只认 artist 会把唯一能听的原唱跟一堆翻唱判成同一档。 */
     const artistInTitle = titleMentionsArtist(c.others, raw);
     const artistOk = artistConsistent(c.others, at) || artistInTitle;
+    /* 双写标题：候选歌名出现在清理后的标题里，且歌手也对得上 → 3 档。
+       ⚠️ 用 flatTitle(scored) 而不是原标题 —— 原标题里「Official Music Video」
+          这类词的字母会让 indexOf 错位，剥干净后再比才准。 */
+    if (artistOk && c.text.length >= 2 && flat.indexOf(c.text) >= 0) {
+      if (best < 3) best = 3;
+    }
     if (flat === c.text) {
       // 「起风了」对「起风了」；「起风了（2019版）」多出六个字，不算
       const t = artistOk ? 3 : 2;
@@ -17092,7 +17194,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.65",
+  version: "4.10.66",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
