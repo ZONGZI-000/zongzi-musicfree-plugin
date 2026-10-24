@@ -5951,9 +5951,16 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
      deadlineMs 可选：B 站「无 mcdn → 必须内联」那条路要传更长的值。
      默认 6 秒是按「1~2MB 的歌」定的，4MB 的歌在慢网下 6 秒并不够；
      而那条路没有流式备选，放弃内联就等于这首歌播不了。 */
-  const deadline = Number(deadlineMs) > 0 ? Number(deadlineMs) : INLINE_TOTAL_DEADLINE;
+  let deadline = Number(deadlineMs) > 0 ? Number(deadlineMs) : INLINE_TOTAL_DEADLINE;
   const t0 = Date.now();
   const remain = () => deadline - (Date.now() - t0);
+  /* ⚠️ 2026-10-24：给「没有流式退路」的场景开放两个档位（见 opts.waitCapMs）。
+     以前 streamFallback:false 就是「死等到 deadline」，而 deadline 是个定值，
+     跟这首歌到底 300KB 还是 2.4MB 无关 —— 于是 2.4MB 的歌在中等网速下
+     必然超时，而超时在 YouTube 这条路上等于「这首歌唱不了」。
+     现在：先用探测块实测吞吐估总耗时，能等就等（上限 waitCapMs），
+     等不起就立刻失败（别让用户干等满一个 deadline 再告诉他没戏）。 */
+  const waitCapMs = Number(opts && opts.waitCapMs) || 0;
 
   // 先拉第一块确认能下、并验魔数（省得白下整首才发现是错误页）
   /* ⚠️ 探测块用 INLINE_PROBE_BYTES（32KB）而不是 INLINE_CHUNK（256KB）。
@@ -6015,6 +6022,47 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
    *        → 保留「明显下不完就立刻放弃」，省掉十几秒白等。 */
   const streamFallback = !opts || opts.streamFallback !== false;
   if (streamFallback && firstMs > 500 && estTotalMs > deadline * 0.8) return null;
+  /* ⚠️⚠️ 2026-10-24（第二修）：没有流式退路时，deadline 要能跟着网速放宽。
+     用户的要求是「YouTube 不要退回流式」，那内联就成了唯一出声路径，
+     于是「4.5 秒没下完」不再是可以接受的失败 —— 它会直接变成
+     「这首歌唱不了」。而 4.5 秒是给 800KB 的歌定的：
+     一首 2.4MB 的高码率曲子在 600KB/s 的链路上要 4 秒（够），
+     在 300KB/s 上要 8 秒（不够）—— 后者以前必死，其实只是多等几秒的事。
+
+     现在按实测吞吐分三种情况：
+       ① 估出来能在 waitCapMs 内下完 → 把 deadline 放宽到估算值的 1.4 倍，
+          老实下完（用户在等，但等得到声音，比等 4 秒然后失败强）；
+       ② 估出来怎么都赶不上 waitCapMs → 立刻失败，别耗满再报错
+          （让上层马上去试别的上传/别的平台，而不是让用户干等）；
+       ③ 拿不到吞吐样本 → 保持原 deadline，按老规矩来。
+     ⚠️ waitCapMs 只在调用方显式传的时候生效（YouTube 传 9 秒），
+        B 站那条「无 mcdn 必须内联」的路不受影响。 */
+  /* ⚠️⚠️ 2026-10-24（第二修补丁）：估算只在小样本之外才算数。
+     探测块只有 16KB，本机千兆下「16KB / 117ms」会算出 137KB/s ——
+     而这 117ms 里几乎全是 DNS + TLS + 一个 RTT，跟带宽毫无关系。
+     拿这种样本去外推，会把实际 1.8 秒能下完的 2.4MB 歌估成 8.2 秒，
+     然后我们就「因为估出来太慢」直接放弃 —— 明明一秒多就能下完。
+     这跟上一版「假测速把快网判成慢网」是同一个坑，只是这次踩在
+     「放宽/放弃」这条新逻辑上。
+
+     所以：firstMs < 500 的样本**只用来放宽、不用来拒绝**。
+     真拿到 500ms 以上的样本（说明传输本身占了主导，估算可信）才允许
+     「怎么都赶不上 waitCapMs → 立刻失败」，省掉用户干等。 */
+  if (!streamFallback && waitCapMs > 0) {
+    const sampleCredible = firstMs >= 500;
+    if (sampleCredible && estTotalMs > waitCapMs) return null;
+    const widened = sampleCredible
+      ? Math.min(waitCapMs, Math.max(deadline, Math.round(estTotalMs * 1.4) + 1500))
+      : waitCapMs;                       // 样本不可信 → 直接给满预算，让它真去下
+    if (widened > deadline) {
+      deadline = widened;
+      console.log("[粽子] YouTube 内联放宽到 " + Math.round(deadline / 1000)
+        + "s（" + Math.round(size / 1024) + "KB，探测 "
+        + Math.round(probeBps / 1024) + "KB/s"
+        + (sampleCredible ? "，估算 " + (estTotalMs / 1000).toFixed(1) + "s" : "，样本太短不外推")
+        + "）");
+    }
+  }
   {
     const x = (i) => first[i] || 0;
     const okHead =
@@ -6082,6 +6130,21 @@ function shouldInlineYoutube() {
   } catch (e) { return true; }
 }
 
+/* 本次点播还能留给「整首内联」多少毫秒。
+   ⚠️ 2026-10-24：见 _ytBudgetEnd 的说明 —— 内联现在是 YouTube 唯一的
+   出声路径，预算要跟兜底总闸对齐，不能再是一个死数字。
+   留 900ms 给后面的验活/收尾；夹在 4~9 秒之间：
+   低于 4 秒根本没机会下完（2MB 的 128k 音频在 500KB/s 上就要 4 秒），
+   高于 9 秒用户就开始觉得「点了没反应」了。 */
+function ytInlineCapMs() {
+  /* 没上下文、或者那个时间点已经过期（上一次点播留下的残值）→ 用默认 9 秒。
+     过期的值如果参与计算会算出负数，被夹到 4 秒 —— 等于让一条陈旧的
+     预算去掐内联，比默认更短，属于反向优化。 */
+  if (!_ytBudgetEnd || _ytBudgetEnd <= Date.now()) return 9000;
+  const left = _ytBudgetEnd - Date.now() - 900;
+  return Math.max(4000, Math.min(9000, left));
+}
+
 async function ytFetchUrl(videoId, quality) {
   // ⚠️ 优先用 VISIONOS：它的 URL 没有 1MB 配额限制。
   //    ANDROID / IOS 的 URL 对部分版权内容只放行开头 1MB，播到一半断。
@@ -6133,15 +6196,43 @@ async function ytFetchUrl(videoId, quality) {
      塞得进上限的（itag 139/249 那种 48~50k 的 AAC）。
      音质确实会降，但「能听」比「名义上无损、实际没声音」强得多。
      ⚠️ 关掉内联（inlineYoutube=0）的用户不动 —— 他们本来就走流式。 */
+  /* ⚠️⚠️ 2026-10-24（第二修）：**YouTube 不再退回流式地址，一次都不退。**
+     用户明确要求「你 YouTube 不要退回流式」—— 实机上 YouTube 的流式
+     地址就是不出声（要点：这不是慢，是压根没声音），所以「退回流式」
+     等于「这首歌唱不了，还让用户对着转圈界面等」。
+
+     退流式在这个文件里有**四个**入口，这里封掉的是前两个：
+       ① 挑中的音轨太大 → willInline 为假 → 最后 return ok.url；
+       ② 内联下载超时/分块失败 → return ok.url。
+     后两个（预取缓存里躺着的流式裸地址、resolveYoutube 兜底路径）
+     分别在 getMediaSource 的缓存判断和下面的 resolveYoutube 里处理。
+
+     新策略：内联是 YouTube 唯一的出声路径，那就把它当硬要求 ——
+     内联不成就抛错，让上层去试「同一首歌的其它上传」（同一首歌往往
+     有好几条搬运，总有一条更小/更短能塞进内联上限），实在不行再交给
+     其它平台兜底。总之交出去的一定是能出声的东西，不是一个死链接。 */
+  /* ⚠️⚠️ 2026-10-24（第三修）：先把「一条能内联的档位都不存在」这种情况判掉。
+     只按体积上限（2.5MB）挑是不够的 —— 高音质档的 256k 音轨常是 3~6MB，
+     一个都塞不进去。以前的做法是「保留原档、willInline 为假 → 交流式」，
+     等于高音质档下把 YouTube 全废掉。
+
+     现在：塞不进去就抛 ytTooBig，让上层去试「同一首歌的其它上传」
+     （短版本能内联）。真的全塞不进，才轮到别的平台兜底。
+     至于「塞得进但这条链路下不完」那种情况，交给下面的**逐档尝试**处理 ——
+     这里不再拿网速估算去挑档（估算样本太小，会把能下的判成下不完）。 */
   if (shouldInlineYoutube()) {
-    const curSize = Number(pick.size || 0);
-    if (curSize > YT_INLINE_MAX_BYTES) {
-      const fits = (res.audios || [])
-        .filter((a) => a && a.url && !YT_BAD_ITAGS[a.itag] && Number(a.size || 0) > 0)
-        .filter((a) => Number(a.size) <= YT_INLINE_MAX_BYTES)
-        .sort((a, b) => b.bitrate - a.bitrate);
-      if (fits.length) pick = fits[0];
+    const fits = (res.audios || [])
+      .filter((a) => a && a.url && !YT_BAD_ITAGS[a.itag] && Number(a.size || 0) > 0)
+      .filter((a) => Number(a.size) <= YT_INLINE_MAX_BYTES)
+      .sort((a, b) => b.bitrate - a.bitrate);
+    if (!fits.length) {
+      const err = new Error("yt: 音轨过大无法内联（最小 "
+        + Math.round(Number(pick.size || 0) / 1024) + "KB，上限 "
+        + Math.round(YT_INLINE_MAX_BYTES / 1024) + "KB）");
+      err.ytTooBig = true;
+      throw err;
     }
+    if (Number(pick.size || 0) > YT_INLINE_MAX_BYTES) pick = fits[0];
   }
 
   /* ⚠️ 验活可以省掉一次往返。
@@ -6218,22 +6309,105 @@ async function ytFetchUrl(videoId, quality) {
 
      预算 4.5 秒：留出后面 accept() 的 1.5 秒验活竞速，
      总耗时仍压在 7 秒总闸之内。 */
+  /* ⚠️ 2026-10-24（第二修）：预算 4.5s → 9s，并改成「按实测网速放宽」。
+     4.5 秒是「内联只是为了更流畅、下不完还能流式凑」那个前提下的产物，
+     而那个前提现在是假的（YouTube 流式不出声）。既然内联是唯一出路，
+     预算就该按「这首歌到底多大」来定，而不是一个死数字：
+     2.4MB 的歌在 300KB/s 上要 8 秒，4.5 秒必然失败 —— 其实只是多等 3 秒。
+     上限 9 秒：再长用户就开始觉得「点了没反应」了，那时候宁可让它失败
+     去试别的上传（同一首歌常有更短的版本）。 */
   const YT_INLINE_BUDGET = 4500;
   if (shouldInlineYoutube()) {
-    try {
-      const dataUri = await inlineAudio(ok.url, ok.size, ok.mime, null,
-        /* ⚠️ streamFallback 必须是 false（2026-10-21 晚）：
-           实机上 YouTube 的流式地址**不出声** —— 整首内联存在的唯一理由
-           就是这个。所以「提前放弃内联、交流式地址」在这里不是优化，
-           是「这首歌直接打不开」。让 inlineAudio 老实下到预算上限。 */
-        YT_INLINE_MAX_BYTES, YT_INLINE_BUDGET, { streamFallback: false });
-      if (dataUri) return dataUri;
-    } catch (e) { /* 失败就回退流式 */ }
-    /* 内联没成（超预算 / 分块失败 / 太大）→ 交流式地址。
-       ⚠️ 这里**不再**因为验活失败就抛错：慢网下探测本身就会超时，
-          而播放器实际拉流往往是成功的。抛错的代价是这首歌直接不可播，
-          而交出去最多是「播十几秒再跳」—— 后者体验好得多。 */
-    return ok.url;
+    /* ⚠️⚠️ 2026-10-24（第四修）：内联改成**逐档尝试**，不再靠预测挑一次。
+       走过两条弯路：
+         ① 只按体积上限挑 → 高音质档挑到 2.4MB，9 秒下不完 → 歌废掉；
+         ② 按「实测吞吐」预测哪档下得完 → 估算本身不可靠（16KB 探测块
+            里大半是 RTT），把能下的 128k 判成下不完，一刀切到 50k，
+            音质白白掉两档。
+       两条都是「在下载之前就把话说死」。现在改成先下后判：
+       从首选档开始试，这一档在预算内没下完就**换下一档**（更小的），
+       每一档各自带预算，但总时间不超过本次点播的余量。
+       实际代价很小 —— 试错的那一档通常 1~2 秒内就下回大部分数据，
+       失败时已经能看出「这条链路上 2.4MB 是没戏的」。
+       ⚠️ 只试「体积明显更小」的下一档，避免 141→140 这种同尺寸空转。 */
+    const ladder = [];
+    {
+      const seenSize = {};
+      const rankedList = [pick].concat(
+        (res.audios || [])
+          .filter((a) => a && a.url && !YT_BAD_ITAGS[a.itag] && Number(a.size || 0) > 0)
+          .filter((a) => Number(a.size) <= YT_INLINE_MAX_BYTES)
+          .sort((a, b) => b.bitrate - a.bitrate)
+      );
+      for (let i = 0; i < rankedList.length; i++) {
+        const a = rankedList[i];
+        if (!a || !a.url) continue;
+        if (Number(a.size || 0) <= 0 || Number(a.size) > YT_INLINE_MAX_BYTES) continue;
+        const key = a.itag + "|" + a.size;
+        if (seenSize[key]) continue;
+        seenSize[key] = 1;
+        /* 只收「比上一档小 15% 以上」的：同等大小的换条 URL 没有意义，
+           徒增一次失败尝试。 */
+        if (ladder.length) {
+          const prev = Number(ladder[ladder.length - 1].size || 0);
+          if (Number(a.size) > prev * 0.85) continue;
+        }
+        ladder.push(a);
+        if (ladder.length >= 3) break;
+      }
+    }
+
+    for (let li = 0; li < ladder.length; li++) {
+      const cand = ladder[li];
+      const capLeft = ytInlineCapMs();
+      /* 余量已经不够下一次尝试（<2 秒）→ 别再白试，直接判失败去换上传。 */
+      if (capLeft < 2000) break;
+      let dataUri = null;
+      const tTry = Date.now();
+      try {
+        dataUri = await inlineAudio(cand.url, cand.size, cand.mime, null,
+          /* ⚠️ streamFallback 必须是 false（2026-10-21 晚）：
+             实机上 YouTube 的流式地址**不出声** —— 整首内联存在的唯一理由
+             就是这个。所以「提前放弃内联、交流式地址」在这里不是优化，
+             是「这首歌直接打不开」。让 inlineAudio 老实下到预算上限。 */
+          YT_INLINE_MAX_BYTES, YT_INLINE_BUDGET,
+          { streamFallback: false, waitCapMs: capLeft });
+      } catch (e) { dataUri = null; }
+      if (dataUri) {
+        if (cand !== pick) {
+          console.log("[粽子] YouTube 降档成功: "
+            + Math.round(Number(pick.bitrate || 0) / 1000) + "k → "
+            + Math.round(Number(cand.bitrate || 0) / 1000) + "k（"
+            + Math.round(Number(cand.size) / 1024) + "KB，试了 " + (li + 1) + " 档，"
+            + (Date.now() - tTry) + "ms）");
+        }
+        return dataUri;
+      }
+      /* 这一档没下完：如果余量还很足、且它其实没花多久（说明是「链路慢
+         但没死」），继续试下一档；否则直接收工交给上层换上传。 */
+      console.log("[粽子] YouTube 内联第 " + (li + 1) + " 档失败: "
+        + Math.round(Number(cand.size) / 1024) + "KB/"
+        + Math.round(Number(cand.bitrate || 0) / 1000) + "k，"
+        + (Date.now() - tTry) + "ms");
+    }
+
+    /* ⚠️⚠️ 2026-10-24（第二修）：内联没成，**不许**退回流式地址。
+       旧写法是 `return ok.url` —— 这条流式地址实机上不出声，用户等了
+       四五秒拿到的是「点了没声音」，比直接失败还难受（失败至少会跳下一首）。
+
+       现在抛错，让 resolveYoutube 去试「同一首歌的其它上传」：
+       同一首歌在 YouTube 上常有好几条搬运，大小/时长差很多，
+       这条下不完不代表别的下不完。全都不行才轮到别的平台兜底。
+       ⚠️ 用户自己关掉内联（inlineYoutube=0）的走下面那个 return —— 他自愿流式。 */
+    throw (function () {
+      const err = new Error("yt: 内联未完成（各档均试，"
+        + Math.round(Number(pick.size || 0) / 1024) + "KB 起），不回流式");
+      /* ⚠️ 标成「临时性失败」：这只是这次网慢/这条上传大，
+         不代表这首歌以后不能播。调用方据此**不要**把它拉黑 10 分钟
+         （markDead 会把这首歌从列表里藏掉，慢网下一次点播就消失，很难查）。 */
+      err.ytTransient = true;
+      return err;
+    })();
   }
 
   return ok.url;
@@ -6262,6 +6436,26 @@ async function resolveYoutube(id, want, quality) {
   /* 直取失败后，先专门去找「同一首歌的其它上传」，再做正常的兜底搜索。
      这一步是这次修的核心：它不依赖 want 里的歌手是否可信，
      只用原标题里能切出来的段落。 */
+  /* ⚠️ 2026-10-24（第二修）：换上传要有**时间闸**。
+     现在「内联没下完」也会走这条路，而每一次尝试都要花掉一个内联预算
+     （最多 9 秒）。不设闸的话，一条下不完的歌能一口气试五条上传，
+     总共二三十秒 —— 用户看到的就是「一直转」，最后照样失败。
+     闸门同时受两件事约束：
+       ① 单段换上传最多 6 秒；
+       ② 不能越过本次点播的总预算（_ytBudgetEnd，见 resolveMediaSource）。
+     超了就把机会让给别的平台 —— 别的平台往往 1 秒内就有结果。 */
+  /* ⚠️ 闸门要**懒计算**：直取那一步自己也会花掉几秒（一次 player 请求 +
+     最多 9 秒内联），如果在这里就固定一个「现在 + 6 秒」，等轮到换上传时
+     闸门早就过期了，等于一次都不试。所以第一次真正用到时才起算。 */
+  let altDeadlineAt = 0;
+  const altDeadline = function () {
+    if (!altDeadlineAt) {
+      let d = Date.now() + 6000;
+      if (_ytBudgetEnd) d = Math.min(d, _ytBudgetEnd - 500);
+      altDeadlineAt = Math.max(Date.now(), d);
+    }
+    return altDeadlineAt;
+  };
   const tryAltUploads = async (reasonForLog) => {
     const queries = ytAltQueries(want);
     /* 原来这里是 id === null 才做严格校验 —— 意思是「直取已知视频」时
@@ -6278,6 +6472,10 @@ async function resolveYoutube(id, want, quality) {
 
       const ranked = ytRank(list, want);
       for (let i = 0; i < ranked.length; i++) {
+        if (Date.now() > altDeadline()) {
+          errors.push("换上传: 超出时间预算，收工");
+          return null;
+        }
         const cand = ranked[i];
         if (!cand || seen[cand.v.id]) continue;
         /* 同一首歌的判据：
@@ -15785,6 +15983,19 @@ var _prefetchMode = false;
  *   预取那边本来就只是「锦上添花」，让它排队等一等，不能反过来伤害点播。 */
 var _playInFlight = 0;
 
+/* 本次点播的「整首内联」最晚能等到什么时候（绝对时间戳，Date.now() 量级）。
+ *
+ * ⚠️ 2026-10-24（第二修）：为什么需要这个全局值。
+ *   YouTube 现在**不再退回流式**（用户明确要求），内联成了唯一出声路径。
+ *   内联的预算以前是死的 4.5 秒，2.4MB 的歌在中等网速下必然超时 →
+ *   直接判「这首歌唱不了」。而多等 3 秒其实就能下完。
+ *   但等待也不能无限：兜底那边有总闸（FB_DEADLINE + 一次延长），
+ *   内联如果敢超过那道闸，结果就是「下完了、却已经没人收」。
+ *   所以 resolveMediaSource 在开跑时把「闸门时间」写进这里，
+ *   inlineAudio 的 waitCapMs 按它来算，两边永远对得上。
+ *   0 表示「没有上下文」（比如 B 站那条独立路径），此时用默认值。 */
+var _ytBudgetEnd = 0;
+
 /* 整轮预取的总时间预算（毫秒）。
  *
  * ⚠️ 2026-10-21「刷新很久 / 整个软件卡顿」实测数据：
@@ -16461,8 +16672,43 @@ async function getMediaSource(musicItem, quality) {
   return job;
 }
 
+/* 最后一次尝试拿「内联好的整首音频」。
+   ⚠️ 2026-10-24：只在「已经拿到一条 YouTube 流式地址」时被调用 —— 说明
+   前面所有内联路径都没走通（历史缓存、兜底候选之类）。这里直接绕开
+   resolveMediaSource 的竞速逻辑，按 id/标题重新取一遍内联结果。
+   拿不到就抛错：宁可不播，也不给播放器一条不出声的流。 */
+async function ytInlineRetry(musicItem, quality) {
+  const q = QUALITY_MAP[quality] || "128k";
+  const want = { name: musicItem.title, singer: musicItem.artist, album: musicItem.album };
+  /* 重取时给一次完整预算（这里已经不在兜底总闸的管辖里了，
+     用户明确在等这一首）。 */
+  _ytBudgetEnd = Date.now() + 13000;
+  const u = await ytFetchUrl(musicItem.id, q);
+  if (!u || String(u).indexOf("data:") !== 0) {
+    throw new Error("重取仍未拿到内联音频");
+  }
+  return u;
+}
+
 async function getMediaSourceUncached(musicItem, quality, providerForPlay) {
   const result = await resolveMediaSource(musicItem, quality);
+
+  /* ⚠️⚠️ 2026-10-24（第三修）：最后一道闸 —— YouTube 的流式地址不许出厂。
+     前面在 ytFetchUrl 里已经不退流式了，但 resolveMediaSource 还有两条
+     「兜底」出口会把任意候选地址原样交出去（previewOnly / lastCandidate），
+     理论上仍可能漏一条 googlevideo 地址给播放器。实机上那条地址不出声，
+     所以这里是最后一道：命中就丢掉重取一次，再拿到流式地址就直接报错。
+     ⚠️ 只拦 YouTube —— 别的平台（B站/网易/QQ…）的流式地址是能正常出声的，
+        拦了反而把它们废掉。判据用域名，不用 musicItem.platform（兜底会串源）。 */
+  if (result && result.url && isYtStreamUrl(result.url) && shouldInlineYoutube()) {
+    console.log("[粽子] 拦下一条 YouTube 流式地址（不出声），重取: "
+      + String(musicItem.title || "").slice(0, 20));
+    try {
+      result.url = await ytInlineRetry(musicItem, quality);
+    } catch (e) {
+      throw new Error("YouTube 无内联可用（不退流式）: " + String(e.message || e).slice(0, 80));
+    }
+  }
 
   /* 把「播放该带的头」和「http→https」补上。
      这一步必须在缓存之前 —— 缓存的是可以直接交给播放器的成品。 */
@@ -16580,6 +16826,10 @@ async function resolveMediaSource(musicItem, quality) {
   const OWN_SOURCE_PROVIDERS = { netease: 1, qq: 1, kugou: 1, migu: 1, kuwo: 1, miguapi: 1, joox: 1 };
   const GRACE_MS = OWN_SOURCE_PROVIDERS[provider] ? 2000 : 0;
   const t0 = Date.now();
+  /* ⚠️ 2026-10-24（第二修）：把「兜底总闸」的时间点公开给内联用。
+     数值 = FB_DEADLINE(7s) + FB_EXTRA_MS(4s) = 11 秒（见下面那两个常量）。
+     内联现在按这个时间点算自己还能等多久 —— 超过它下完了也没人收。 */
+  _ytBudgetEnd = t0 + 11000;
   const resolver = RESOLVERS[provider];
   let ownResult = null;
   let ownSettled = false;
@@ -16593,7 +16843,11 @@ async function resolveMediaSource(musicItem, quality) {
       .then(function () { return resolver(musicItem.id, want, q); })
       .then(function (u) { return accept(u, provider); })
       .catch(function (e) {
-        markDead(provider, musicItem.id);
+        /* ⚠️ 2026-10-24（第二修）：临时性失败不许拉黑。
+           内联「这次没下完」是网速问题，不是这首歌坏了 —— 一旦 markDead，
+           这首歌会在列表里被藏 10 分钟，慢网下点一次就「消失」，很难查。
+           真正该拉黑的是「视频本身不可播 / 地址 403」这种确定性失败。 */
+        if (!(e && (e.ytTransient || e.ytTooBig))) markDead(provider, musicItem.id);
         errors.push(provider + ": " + e.message);
         return null;
       });
@@ -16833,9 +17087,16 @@ async function resolveMediaSource(musicItem, quality) {
          典型场景是内地四家连着不回、youtube/bilibili 刚被软释放出去、
          正在解析甚至正在整首内联。这时候判失败 = 把唯一能播的那条掐掉。
          所以延长一次 FB_EXTRA_MS —— 只延长一次，不会变成无限等待。 */
-      if (!fbExtended && fbInflight > 0 && !ownResult) {
+      /* ⚠️ 2026-10-24（第二修）：`!ownSettled` 也必须算「还在路上」。
+         以前只看 fbInflight —— 兜底那 4 路快速失败完（内地平台挂 VPN 时
+         通常 0.3 秒就拒），fbInflight 归零，于是 7 秒一到就 break，
+         而此时本平台（YouTube）正在整首内联，还有几秒才下完。
+         结果就是「下好了没人收」，用户看到的是「一直转然后失败」。
+         现在本平台没交卷也延长（仍然只延长一次，最多 11 秒）。 */
+      if (!fbExtended && (fbInflight > 0 || !ownSettled) && !ownResult) {
         fbExtended = true;
-        console.log("[粽子] 兜底总闸到点，仍有 " + fbInflight + " 路在跑 → 延长 "
+        console.log("[粽子] 兜底总闸到点，仍有 " + fbInflight + " 路在跑"
+          + (ownSettled ? "" : "（本平台未交卷）") + " → 延长 "
           + (FB_EXTRA_MS / 1000) + "s");
         armDeadline(FB_EXTRA_MS);
         continue;
@@ -17484,7 +17745,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.69",
+  version: "4.10.70",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
