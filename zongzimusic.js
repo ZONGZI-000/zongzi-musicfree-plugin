@@ -6744,7 +6744,27 @@ async function ytFetchUrl(videoId, quality) {
        等他在列表里再点一次，数据已经攒够了，直接出声。
        ⚠️ 只在第一档（首选音质）上续 —— 降档那几档本来就是备胎，
           留它们的半截数据只会挤掉真需要的缓存。 */
-    if (ladder.length) ytResumeInBackground(videoId, ladder[0], partKeyOf(ladder[0]));
+    /* ⚠️⚠️ 2026-10-24（第七修，实测）：后台补完要挑**补得完**的那一档。
+       以前固定补 ladder[0]（最高码率，2519KB）—— 22KB/s 下要 114 秒，
+       而后台窗口只有 3 分钟、还得给别的歌留余地，经常补不完就收工，
+       用户第二次点还是从头来。ladder 按体积降序，所以从尾部往前找
+       「窗口内下得完的最大档」：优先音质，但不挑三分钟都下不完的。 */
+    let bgPick = ladder.length ? ladder[ladder.length - 1] : null;
+    if (ladder.length) {
+      const bpsNow = linkBps();
+      for (let bi = ladder.length - 1; bi >= 0; bi--) {
+        bgPick = ladder[bi];
+        if (!(bpsNow > 0)) break;                          // 没样本 → 挑最小的
+        if (Number(ladder[bi].size) / bpsNow <= 120) break; // 2 分钟内能下完 → 用它
+      }
+      if (bgPick !== ladder[0]) {
+        console.log("[粽子] 后台续传改挑低档: "
+          + Math.round(Number(ladder[0].size) / 1024) + "KB → "
+          + Math.round(Number(bgPick.size) / 1024) + "KB（"
+          + Math.round(Number(bgPick.bitrate || 0) / 1000) + "k，窗口内下得完）");
+      }
+    }
+    if (bgPick) ytResumeInBackground(videoId, bgPick, partKeyOf(bgPick));
 
     /* ⚠️⚠️ 2026-10-24（第二修）：内联没成，**不许**退回流式地址。
        旧写法是 `return ok.url` —— 这条流式地址实机上不出声，用户等了
@@ -18141,7 +18161,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.72",
+  version: "4.10.73",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",

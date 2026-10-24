@@ -5850,6 +5850,10 @@ function mimeFromExt(mime) {
    分成 256KB 块后每块 150~950ms，整首 2.2MB 只要 3.5 秒。
    ⚠️ 千万别改回「一次 GET 下整首」—— 那条路 100% 卡到 70 秒后 ERR_BAD_RESPONSE。 */
 const INLINE_CHUNK = 256 * 1024;
+/* ⚠️ 2026-10-24（第六修）：慢网下按吞吐把块缩小到这个下限（见 inlineAudio 里
+   「慢网分块」那段）。32KB 在 10KB/s 上约 3 秒 —— 一次点播能完成几块，
+   进度才可能累积。 */
+const INLINE_CHUNK_MIN = 32 * 1024;
 const INLINE_CONCURRENCY = 4;
 
 /* ⚠️ 2026-10-21 事故（第五改）：「不管点哪首都要转十几秒才有反应」。
@@ -5949,6 +5953,14 @@ async function fetchRange(url, start, end, extraHeaders, timeoutMs) {
  *   · 并发 1（不是 4）：慢网上 4 路并发只会互相拖死，单连接反而稳。
  * ============================================================ */
 let _ytResumeRunning = false;
+/* 正在后台补的 videoId（⚠️ 2026-10-24 第六修）：
+   上层收尾时靠它判断「这次失败只是慢，不是这歌坏了」，
+   别把还在灌数据的歌从列表里拉黑。 */
+const _ytResumeIds = {};
+
+function ytResumePending(videoId) {
+  return !!_ytResumeIds[String(videoId)];
+}
 
 function ytResumeInBackground(videoId, audio, partKey) {
   if (_ytResumeRunning) return;
@@ -5956,6 +5968,7 @@ function ytResumeInBackground(videoId, audio, partKey) {
   const size = Number(audio.size || 0);
   if (!size || size > YT_INLINE_MAX_BYTES) return;
   _ytResumeRunning = true;
+  _ytResumeIds[String(videoId)] = Date.now();
   const hardEnd = Date.now() + 3 * 60 * 1000;
 
   (async function () {
@@ -6013,6 +6026,7 @@ function ytResumeInBackground(videoId, audio, partKey) {
     console.log("[粽子] 后台续传异常: " + String(e && e.message || e).slice(0, 80));
   }).then(function () {
     _ytResumeRunning = false;
+    delete _ytResumeIds[String(videoId)];
   });
 }
 
@@ -6176,6 +6190,31 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
   let done = null;            // Set<块下标>，只记 [first.length 之后] 的块
   let carried = 0;            // 复用了几块
   const resume = partKey ? inlinePartialTake(partKey, size) : null;
+
+  /* ⚠️⚠️ 2026-10-24（第六修 · 慢网永远攒不出进度的真正原因）：
+     分块固定 256KB 是给「每块 150~950ms」的正常网络定的。
+     在 10KB/s 的 VPN 上，一块要 26 秒，而本次点播只给 9 秒预算 ——
+     于是**每一块都在下到一半时被掐死**，一块也没完成，
+     fillable = 0，什么进度都存不下来，用户点一百次都从 0 开始。
+     这就是「续传做了但还是不行」的根因。
+
+     现在按实测吞吐反推块大小：目标是「一块 ≈ 3 秒下完」，
+     夹在 32KB~256KB 之间。慢网 → 32KB 的小块（一次点播能完成好几块，
+     进度真的会往前走），快网 → 还是 256KB（少几个请求）。
+     ⚠️ 续传时必须沿用上次记录的块大小，否则块边界全变了、数据对不上。 */
+  const effBps = linkBps() || probeBps;
+  let chunkSize = INLINE_CHUNK;
+  if (resume && resume.chunk) {
+    chunkSize = resume.chunk;
+  } else if (effBps > 0) {
+    const want = Math.round((effBps * 3) / 1024) * 1024;
+    chunkSize = Math.max(INLINE_CHUNK_MIN, Math.min(INLINE_CHUNK, want || INLINE_CHUNK_MIN));
+  }
+  if (chunkSize !== INLINE_CHUNK) {
+    console.log("[粽子] 慢网分块: " + Math.round(chunkSize / 1024) + "KB/块（吞吐 "
+      + Math.round(effBps / 1024) + "KB/s）");
+  }
+
   if (resume) {
     u8 = resume.u8;
     done = resume.done;
@@ -6193,8 +6232,8 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
   if (resume) {
     /* 续传：u8 里已经有上次下好的块，filled 要把它们算进来 ——
        否则「filled < size*0.98」会误判成没下完。 */
-    for (let off = first.length, i = 0; off < size; off += INLINE_CHUNK, i++) {
-      if (done[i]) filled += Math.min(INLINE_CHUNK, size - off);
+    for (let off = first.length, i = 0; off < size; off += chunkSize, i++) {
+      if (done[i]) filled += Math.min(chunkSize, size - off);
     }
   }
 
@@ -6202,14 +6241,14 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
   const ranges = [];          // [{ s, e, i }]
   {
     let i = 0;
-    for (let off = first.length; off < size; off += INLINE_CHUNK) {
-      if (!done[i]) ranges.push({ s: off, e: Math.min(off + INLINE_CHUNK, size) - 1, i: i });
+    for (let off = first.length; off < size; off += chunkSize) {
+      if (!done[i]) ranges.push({ s: off, e: Math.min(off + chunkSize, size) - 1, i: i });
       i++;
     }
   }
   const totalBlocks = (function () {
     let n = 0;
-    for (let off = first.length; off < size; off += INLINE_CHUNK) n++;
+    for (let off = first.length; off < size; off += chunkSize) n++;
     return n;
   })();
   let cursor = 0;
@@ -6219,12 +6258,13 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
      在 20KB/s 的 VPN 上，256KB 一块要 13 秒 —— 每块都在 6 秒被掐死，
      结果就是「永远下不完任何一块」，续传没有可累积的进度。
      后台模式下按实测吞吐给每块留足时间；前台模式保持 6 秒不变
-     （前台本来就该快点失败，别让用户干等）。 */
+     （前台本来就该快点失败，别让用户干等）。
+     ⚠️ 2026-10-24（第六修）：按**实际块大小**算，不再写死 INLINE_CHUNK。 */
   const chunkTimeout = function () {
     const budgetLeft = Math.max(1200, remain());
     if (!(opts && opts.background)) return Math.min(6000, budgetLeft);
-    const bps = linkBps();
-    const needMs = bps > 0 ? (INLINE_CHUNK * 1000) / bps : 0;
+    const bps = effBps;
+    const needMs = bps > 0 ? (chunkSize * 1000) / bps : 0;
     /* 单块最多等到「估算值 × 2 倍」，且不超过本轮剩余预算 */
     return Math.max(6000, Math.min(budgetLeft, Math.round(needMs * 2) + 3000));
   };
@@ -6239,6 +6279,12 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
       u8.set(part, job.s);
       filled += part.length;
       done[job.i] = 1;          // 这块下完了，下次可以跳过
+      /* ⚠️ 2026-10-24（第六修）：**每下完一块就落一次库**。
+         原来只在整体失败时存一次 —— 而慢网下一次点播就是在半路被
+         deadline 掐死的，走到「存库」那行之前 u8 里已经攒了
+         好几块完整数据，全白扔了。现在每块完成就持久化，
+         用户点了 3 秒后失败，这 3 秒的进度是留下的。 */
+      if (partKey) inlinePartialPut(partKey, size, u8, done, totalBlocks, chunkSize);
     }
   }
   /* ⚠️ 后台续传只走 1 路并发（见 ytResumeInBackground 的说明）：
@@ -6252,7 +6298,7 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
     /* ⚠️ 没下完 —— 把已下到的部分存起来，下次接着下。
        这里不 return null 前先落库，是整个「续传」改动的关键：
        以前这一行就是「扔掉全部进度」。 */
-    if (partKey) inlinePartialPut(partKey, size, u8, done, totalBlocks);
+    if (partKey) inlinePartialPut(partKey, size, u8, done, totalBlocks, chunkSize);
     return null;
   }
   if (u8.length < 4096 || u8.length > cap) { if (partKey) inlinePartialDrop(partKey); return null; }
@@ -6298,16 +6344,24 @@ function inlinePartialTake(key, size) {
   v.at = Date.now();
   let count = 0;
   for (const k in v.done) if (v.done[k]) count++;
+  /* ⚠️ 2026-10-24（第六修）：块大小必须跟着一起还回去。
+     慢网下块大小是按吞吐动态算的，第二次点播要是按新算出来的
+     256KB 去切，而上次存的是 32KB 一块 —— 块边界全错位，
+     拼出来的音频是乱的（比不下还糟）。所以以存下来的为准。 */
+  const chunk = Number(v.chunk) || INLINE_CHUNK;
   return {
     u8: v.u8, done: v.done, count: count, total: v.total || 0,
-    bytes: count * INLINE_CHUNK,
+    bytes: count * chunk, chunk: chunk,
   };
 }
 
 /** 存下没下完的半截数据。 */
-function inlinePartialPut(key, size, u8, done, total) {
+function inlinePartialPut(key, size, u8, done, total, chunk) {
   if (!key || !u8) return;
-  INLINE_PARTIAL[key] = { at: Date.now(), size: Number(size), u8: u8, done: done, total: total };
+  INLINE_PARTIAL[key] = {
+    at: Date.now(), size: Number(size), u8: u8, done: done, total: total,
+    chunk: Number(chunk) || INLINE_CHUNK,
+  };
   const ks = Object.keys(INLINE_PARTIAL);
   if (ks.length > INLINE_PARTIAL_MAX) {
     ks.sort((x, y) => INLINE_PARTIAL[x].at - INLINE_PARTIAL[y].at);
@@ -6610,6 +6664,44 @@ async function ytFetchUrl(videoId, quality) {
        带上 itag 和体积，换档/换上传天然失效（见 inlinePartialTake 里对 size 的校验）。 */
     const partKeyOf = (a) => "yt|" + videoId + "|" + a.itag + "|" + a.size;
 
+    /* ⚠️⚠️ 2026-10-24（第六修 · 慢网续传被拆散的真正原因）：
+       慢网下每次点播都只够推进几百 KB，而上面那个 ladder 每次都会
+       「第一档失败 → 换第二档 → 再换第三档」。三档各有自己的续传 key，
+       于是每点一次，进度就被摊到三个不同的 key 上 ——
+       实测 4 次点播：8 块 → 16 块 → 20 块 → 又掉回 8 块（换了档）。
+       看起来「有续传」，实际永远攒不满一首。
+
+       现在：只要这首歌已经有某个档位的半截数据，就**只认那一档**，
+       每次都接着它下，不再往下级兜底。慢网用户的诉求是「多等几次能播」，
+       不是「每次换个更小的档位重新开始」。
+       （占位数据是内存里的，读一次就知道哪档有进度。） */
+    {
+      let bestIdx = -1;
+      let bestBytes = -1;
+      for (let i = 0; i < ladder.length; i++) {
+        const v = INLINE_PARTIAL[partKeyOf(ladder[i])];
+        if (!v) continue;
+        let count = 0;
+        for (const k in v.done) if (v.done[k]) count++;
+        const bytes = count * (Number(v.chunk) || INLINE_CHUNK);
+        if (bytes > bestBytes) { bestBytes = bytes; bestIdx = i; }
+      }
+      if (bestIdx > 0) {
+        const keep = ladder[bestIdx];
+        ladder.length = 0;
+        ladder.push(keep);
+        console.log("[粽子] 续传优先: 已在档位 "
+          + Math.round(Number(keep.size) / 1024) + "KB 上有 "
+          + Math.round(bestBytes / 1024) + "KB 进度，本次只接着它下");
+      } else if (bestIdx === 0) {
+        /* 首选档已有进度 → 也别再往下兜底，省得把预算花在别的档上。 */
+        const keep = ladder[0];
+        ladder.length = 0;
+        ladder.push(keep);
+      }
+    }
+
+    /* `ladder` 现在可能只剩一档 —— 循环逻辑不用改，照走。 */
     for (let li = 0; li < ladder.length; li++) {
       const cand = ladder[li];
       const capLeft = ytInlineCapMs();
@@ -6652,7 +6744,27 @@ async function ytFetchUrl(videoId, quality) {
        等他在列表里再点一次，数据已经攒够了，直接出声。
        ⚠️ 只在第一档（首选音质）上续 —— 降档那几档本来就是备胎，
           留它们的半截数据只会挤掉真需要的缓存。 */
-    if (ladder.length) ytResumeInBackground(videoId, ladder[0], partKeyOf(ladder[0]));
+    /* ⚠️⚠️ 2026-10-24（第七修，实测）：后台补完要挑**补得完**的那一档。
+       以前固定补 ladder[0]（最高码率，2519KB）—— 22KB/s 下要 114 秒，
+       而后台窗口只有 3 分钟、还得给别的歌留余地，经常补不完就收工，
+       用户第二次点还是从头来。ladder 按体积降序，所以从尾部往前找
+       「窗口内下得完的最大档」：优先音质，但不挑三分钟都下不完的。 */
+    let bgPick = ladder.length ? ladder[ladder.length - 1] : null;
+    if (ladder.length) {
+      const bpsNow = linkBps();
+      for (let bi = ladder.length - 1; bi >= 0; bi--) {
+        bgPick = ladder[bi];
+        if (!(bpsNow > 0)) break;                          // 没样本 → 挑最小的
+        if (Number(ladder[bi].size) / bpsNow <= 120) break; // 2 分钟内能下完 → 用它
+      }
+      if (bgPick !== ladder[0]) {
+        console.log("[粽子] 后台续传改挑低档: "
+          + Math.round(Number(ladder[0].size) / 1024) + "KB → "
+          + Math.round(Number(bgPick.size) / 1024) + "KB（"
+          + Math.round(Number(bgPick.bitrate || 0) / 1000) + "k，窗口内下得完）");
+      }
+    }
+    if (bgPick) ytResumeInBackground(videoId, bgPick, partKeyOf(bgPick));
 
     /* ⚠️⚠️ 2026-10-24（第二修）：内联没成，**不许**退回流式地址。
        旧写法是 `return ok.url` —— 这条流式地址实机上不出声，用户等了
@@ -17453,6 +17565,31 @@ async function resolveMediaSource(musicItem, quality) {
     return { url: lastCandidate };
   }
 
+  /* ⚠️⚠️ 2026-10-24（第六修）：慢网不许把这歌当成"坏的"。
+     原来的收尾逻辑：全平台没拿到 → markTrackDead → 这首歌在列表里
+     直接消失 10 分钟。而慢网下的真实情况是「后台正在下载，还没攒够」——
+     用户第一次点必然失败，然后这首歌就从列表里消失了，
+     连再点一次攒进度的机会都没有。续传做得再好也全废。
+     （实测第 1 次失败后，后续点播直接被「已知不可播，跳过」。）
+
+     现在：只要后台还在为这首歌补数据，就**不拉黑、不删缓存**，
+     并把错误信息换成明确的「还在下，等下再点」——
+     用户知道该干什么，而不是以为这歌坏了。 */
+  const ytId = (musicItem.platform === "YouTube") ? String(musicItem.id) : "";
+  const downloading = ytId && (ytResumePending(ytId)
+    || !!INLINE_PARTIAL["yt|" + ytId + "|"] || (function () {
+      /* partKey 是 yt|videoId|itag|size，前缀匹配一次就够。 */
+      for (const k in INLINE_PARTIAL) {
+        if (k.indexOf("yt|" + ytId + "|") === 0) return true;
+      }
+      return false;
+    })());
+
+  if (downloading) {
+    console.log("[粽子] 《" + want.name + "》后台仍在补数据，暂不拉黑");
+    throw ytTransientError("yt: 网速慢，正在后台缓存，等一会儿再点一次就能播");
+  }
+
   // 全平台都没拿到 → 把这首歌记进黑名单，下次搜索直接不显示它
   // （用户明确要求：播不了就别占着列表位置）
   markTrackDead(musicItem.platform, musicItem.id);
@@ -18024,7 +18161,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.71",
+  version: "4.10.73",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
