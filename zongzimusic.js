@@ -5933,6 +5933,89 @@ async function fetchRange(url, start, end, extraHeaders, timeoutMs) {
   } catch (e) { return null; }
 }
 
+/* ============================================================
+ * 后台续传：这次没下完，接线上下完整首。
+ *
+ * ⚠️⚠️ 2026-10-24（第五修）：为什么不能只靠「用户再点一次」。
+ *   用户点一次 → 超时 → 失败。他当然会再点，但如果每次都只推进
+ *   同样的一小段，进度永远攒不起来。所以超时之后让它在后台继续跑，
+ *   把剩下的块逐个补齐；下次点播时 INLINE_PARTIAL 里已经是完整数据，
+ *   直接拼成 data: URI 出声。
+ *
+ * 约束（重要，都是为了不重演「一进 App 就卡死」）：
+ *   · 同一时刻只允许一个后台续传在跑（_ytResumeRunning）；
+ *   · 预算 3 分钟，到点收工（8KB/s 下 2MB 恰好是四分多，给的是「能推进多少算多少」）；
+ *   · 用户一来真实点播（_playInFlight>0）就让路 —— 别和正在听的歌抢带宽；
+ *   · 并发 1（不是 4）：慢网上 4 路并发只会互相拖死，单连接反而稳。
+ * ============================================================ */
+let _ytResumeRunning = false;
+
+function ytResumeInBackground(videoId, audio, partKey) {
+  if (_ytResumeRunning) return;
+  if (!videoId || !audio || !audio.url || !partKey) return;
+  const size = Number(audio.size || 0);
+  if (!size || size > YT_INLINE_MAX_BYTES) return;
+  _ytResumeRunning = true;
+  const hardEnd = Date.now() + 3 * 60 * 1000;
+
+  (async function () {
+    /* 先等一下，让这次点播的失败处理、界面跳转先走完 —— 别在这个
+       最狼狈的时刻抢带宽。 */
+    await new Promise(function (r) { setTimeout(r, 3000); });
+    let idleWait = 0;
+    while (Date.now() < hardEnd) {
+      if (_playInFlight > 0) {
+        /* 用户在听歌 → 完全让路，最多等 20 秒还没空闲就收工。 */
+        idleWait += 500;
+        if (idleWait > 20000) break;
+        await new Promise(function (r) { setTimeout(r, 500); });
+        continue;
+      }
+      idleWait = 0;
+      const left = Math.min(60000, hardEnd - Date.now());
+      if (left < 5000) break;
+      let uri = null;
+      /* ⚠️⚠️ 2026-10-24（第五修，实测踩到的坑）：deadline 必须给足。
+         原来这里传的是固定 2000ms，而 256KB 一块在 20KB/s 下要 13 秒 ——
+         也就是说每一轮都在「块还没下完」时被掐死，token 全部作废，
+         进度**永远**卡在原地（实测：4/6 块纹丝不动，点第 4 次还是 4/6）。
+         现在把这一轮的预算设成 min(剩余总预算, 单块最坏耗时的 2 倍)，
+         保证至少有机会下完一整块 —— 一块下完就是一个可累积的 token。 */
+      const roundBudget = Math.max(8000, Math.min(left, 45000));
+      try {
+        uri = await inlineAudio(audio.url, size, audio.mime, null,
+          YT_INLINE_MAX_BYTES, roundBudget, {
+            streamFallback: false,
+            waitCapMs: roundBudget,
+            partialKey: partKey,
+            /* 后台模式：不并发、不按测速预判（慢网本来就慢，判了也还是慢） */
+            background: true,
+          });
+      } catch (e) { uri = null; }
+      if (uri) {
+        /* 攒完了 → 直接进内联缓存，下次点播秒开。 */
+        const item = { platform: "YouTube", id: String(videoId) };
+        inlineCachePut(item, uri);
+        console.log("[粽子] 后台续传完成: " + String(videoId)
+          + "（" + Math.round(size / 1024) + "KB）已进内联缓存");
+        break;
+      }
+      /* 这一轮没下完（可能又被预算截断）→ 看看还剩多少，
+         没进展就收工，有进展就再来一轮。 */
+      const v = INLINE_PARTIAL[partKey];
+      if (!v) break;
+      let count = 0;
+      for (const k in v.done) if (v.done[k]) count++;
+      if (count <= 0) break;
+      console.log("[粽子] 后台续传推进: " + String(videoId) + " 已存 " + count + " 块");
+    }
+  })().catch(function (e) {
+    console.log("[粽子] 后台续传异常: " + String(e && e.message || e).slice(0, 80));
+  }).then(function () {
+    _ytResumeRunning = false;
+  });
+}
+
 /**
  * 把整首音频下载下来，返回 data: URI。
  * 失败或超限返回 null（调用方回退到流式）。
@@ -6059,18 +6142,23 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
      「怎么都赶不上 waitCapMs → 立刻失败」，省掉用户干等。 */
   if (!streamFallback && waitCapMs > 0) {
     const sampleCredible = firstMs >= 500;
-    if (sampleCredible && estTotalMs > waitCapMs) return null;
+    /* ⚠️⚠️ 2026-10-24（第五修关键）：**估算赶不上也不许提前返回。**
+       以前这里有一句 `if (sampleCredible && estTotalMs > waitCapMs) return null;`
+       —— 意思是「算出来下不完就别试了」。在 100KB/s 以上的网里这是优化，
+       在 25KB/s 的 VPN 里它是死结：每首歌一进来就判「没戏」，一块都不下，
+       进度永远是零，用户点一百次也听不到一秒。
+       既然已经支持续传了，正确做法是**照下不误**：给它本次点播的预算，
+       能推进多少算多少，剩下的存在 INLINE_PARTIAL 里下次接着来。
+       一次点播推进 20%，点五次就凑齐了 —— 这才是「下不完继续下」。 */
     const widened = sampleCredible
       ? Math.min(waitCapMs, Math.max(deadline, Math.round(estTotalMs * 1.4) + 1500))
       : waitCapMs;                       // 样本不可信 → 直接给满预算，让它真去下
-    if (widened > deadline) {
-      deadline = widened;
-      console.log("[粽子] YouTube 内联放宽到 " + Math.round(deadline / 1000)
-        + "s（" + Math.round(size / 1024) + "KB，探测 "
-        + Math.round(probeBps / 1024) + "KB/s"
-        + (sampleCredible ? "，估算 " + (estTotalMs / 1000).toFixed(1) + "s" : "，样本太短不外推")
-        + "）");
-    }
+    if (widened > deadline) deadline = widened;
+    console.log("[粽子] YouTube 内联预算 " + Math.round(deadline / 1000)
+      + "s（" + Math.round(size / 1024) + "KB，探测 "
+      + Math.round(probeBps / 1024) + "KB/s"
+      + (sampleCredible ? "，估算 " + (estTotalMs / 1000).toFixed(1) + "s" : "，样本太短不外推")
+      + "）");
   }
   {
     const x = (i) => first[i] || 0;
@@ -6126,22 +6214,38 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
   })();
   let cursor = 0;
   let failed = false;
+  /* ⚠️⚠️ 2026-10-24（第五修）：单块超时上限不能死钉在 6 秒。
+     6 秒是给「本机 150~950ms 一块」定的（见 fetchRange 的说明）；
+     在 20KB/s 的 VPN 上，256KB 一块要 13 秒 —— 每块都在 6 秒被掐死，
+     结果就是「永远下不完任何一块」，续传没有可累积的进度。
+     后台模式下按实测吞吐给每块留足时间；前台模式保持 6 秒不变
+     （前台本来就该快点失败，别让用户干等）。 */
+  const chunkTimeout = function () {
+    const budgetLeft = Math.max(1200, remain());
+    if (!(opts && opts.background)) return Math.min(6000, budgetLeft);
+    const bps = linkBps();
+    const needMs = bps > 0 ? (INLINE_CHUNK * 1000) / bps : 0;
+    /* 单块最多等到「估算值 × 2 倍」，且不超过本轮剩余预算 */
+    return Math.max(6000, Math.min(budgetLeft, Math.round(needMs * 2) + 3000));
+  };
   async function worker() {
     while (!failed && cursor < ranges.length) {
       /* 每块之前都看一眼总 deadline：超了就直接收工，
          不要「再下一块就好」—— 慢网下每一块都可能是最后一块。 */
       if (remain() <= 0) { failed = true; return; }
       const job = ranges[cursor++];
-      const part = await fetchRange(url, job.s, job.e, extraHeaders,
-        Math.min(6000, Math.max(1200, remain())));
+      const part = await fetchRange(url, job.s, job.e, extraHeaders, chunkTimeout());
       if (!part) { failed = true; return; }
       u8.set(part, job.s);
       filled += part.length;
       done[job.i] = 1;          // 这块下完了，下次可以跳过
     }
   }
+  /* ⚠️ 后台续传只走 1 路并发（见 ytResumeInBackground 的说明）：
+     慢网上 4 路并发互相抢同一条窄管道，单连接反而更容易推进。 */
+  const conc = (opts && opts.background) ? 1 : INLINE_CONCURRENCY;
   const workers = [];
-  for (let i = 0; i < Math.min(INLINE_CONCURRENCY, ranges.length); i++) workers.push(worker());
+  for (let i = 0; i < Math.min(conc, ranges.length); i++) workers.push(worker());
   await Promise.all(workers);
 
   if (failed || filled < size * 0.98) {
@@ -6478,19 +6582,33 @@ async function ytFetchUrl(videoId, quality) {
         const a = rankedList[i];
         if (!a || !a.url) continue;
         if (Number(a.size || 0) <= 0 || Number(a.size) > YT_INLINE_MAX_BYTES) continue;
-        const key = a.itag + "|" + a.size;
-        if (seenSize[key]) continue;
-        seenSize[key] = 1;
-        /* 只收「比上一档小 15% 以上」的：同等大小的换条 URL 没有意义，
-           徒增一次失败尝试。 */
+        /* ⚠️ 按**体积**去重，不是按 itag。
+           ⚠️⚠️ 2026-10-24（第五修踩到的坑）：原来用 itag|size 当键，
+           于是 139/249 这种「体积一样、itag 不同」的两条会**都**进梯子。
+           它们各占一个续传 key，第二次点播又在两条之间来回跳 ——
+           每次都在给不同的 key 下一点点，进度永远攒不起来。
+           现在同一个体积只留一条，续传 key 就稳定了。 */
+        const sizeKey = String(a.size);
+        if (seenSize[sizeKey]) continue;
+        seenSize[sizeKey] = 1;
         if (ladder.length) {
           const prev = Number(ladder[ladder.length - 1].size || 0);
+          /* 只收「比上一档小 15% 以上」的：同等大小的换条 URL 没有意义。 */
           if (Number(a.size) > prev * 0.85) continue;
         }
         ladder.push(a);
         if (ladder.length >= 3) break;
       }
+      if (ladder.length > 1) {
+        console.log("[粽子] YouTube 内联候选: "
+          + ladder.map((a) => Math.round(Number(a.size) / 1024) + "KB/"
+            + Math.round(Number(a.bitrate || 0) / 1000) + "k").join(" → "));
+      }
     }
+
+    /* ⚠️ 续传 key：同一首歌 + 同一个音轨档位，才认为是「同一份音频」。
+       带上 itag 和体积，换档/换上传天然失效（见 inlinePartialTake 里对 size 的校验）。 */
+    const partKeyOf = (a) => "yt|" + videoId + "|" + a.itag + "|" + a.size;
 
     for (let li = 0; li < ladder.length; li++) {
       const cand = ladder[li];
@@ -6506,7 +6624,12 @@ async function ytFetchUrl(videoId, quality) {
              就是这个。所以「提前放弃内联、交流式地址」在这里不是优化，
              是「这首歌直接打不开」。让 inlineAudio 老实下到预算上限。 */
           YT_INLINE_MAX_BYTES, YT_INLINE_BUDGET,
-          { streamFallback: false, waitCapMs: capLeft });
+          {
+            streamFallback: false, waitCapMs: capLeft,
+            /* ⚠️ 2026-10-24（第五修）：带上续传 key。没下完的字节会留下来，
+               下次点同一首接着下 —— 8KB/s 的链路上这是唯一能攒完的办法。 */
+            partialKey: partKeyOf(cand),
+          });
       } catch (e) { dataUri = null; }
       if (dataUri) {
         if (cand !== pick) {
@@ -6518,13 +6641,18 @@ async function ytFetchUrl(videoId, quality) {
         }
         return dataUri;
       }
-      /* 这一档没下完：如果余量还很足、且它其实没花多久（说明是「链路慢
-         但没死」），继续试下一档；否则直接收工交给上层换上传。 */
-      console.log("[粽子] YouTube 内联第 " + (li + 1) + " 档失败: "
+      console.log("[粽子] YouTube 内联第 " + (li + 1) + " 档没下完: "
         + Math.round(Number(cand.size) / 1024) + "KB/"
         + Math.round(Number(cand.bitrate || 0) / 1000) + "k，"
-        + (Date.now() - tTry) + "ms");
+        + (Date.now() - tTry) + "ms（进度已保留，下次接着下）");
     }
+
+    /* ⚠️ 2026-10-24（第五修）：本次点播放弃，但让**后台**接着下。
+       这是「下不完继续下」真正有用的形态：用户这次听不到没关系，
+       等他在列表里再点一次，数据已经攒够了，直接出声。
+       ⚠️ 只在第一档（首选音质）上续 —— 降档那几档本来就是备胎，
+          留它们的半截数据只会挤掉真需要的缓存。 */
+    if (ladder.length) ytResumeInBackground(videoId, ladder[0], partKeyOf(ladder[0]));
 
     /* ⚠️⚠️ 2026-10-24（第二修）：内联没成，**不许**退回流式地址。
        旧写法是 `return ok.url` —— 这条流式地址实机上不出声，用户等了
@@ -6534,18 +6662,22 @@ async function ytFetchUrl(videoId, quality) {
        同一首歌在 YouTube 上常有好几条搬运，大小/时长差很多，
        这条下不完不代表别的下不完。全都不行才轮到别的平台兜底。
        ⚠️ 用户自己关掉内联（inlineYoutube=0）的走下面那个 return —— 他自愿流式。 */
-    throw (function () {
-      const err = new Error("yt: 内联未完成（各档均试，"
-        + Math.round(Number(pick.size || 0) / 1024) + "KB 起），不回流式");
-      /* ⚠️ 标成「临时性失败」：这只是这次网慢/这条上传大，
-         不代表这首歌以后不能播。调用方据此**不要**把它拉黑 10 分钟
-         （markDead 会把这首歌从列表里藏掉，慢网下一次点播就消失，很难查）。 */
-      err.ytTransient = true;
-      return err;
-    })();
+    throw ytTransientError("yt: 内联未完成（各档均试，"
+      + Math.round(Number(pick.size || 0) / 1024) + "KB 起），不回流式");
   }
 
   return ok.url;
+}
+
+/* 「这次下不完」这种临时性失败的统一构造器。
+   ⚠️ 2026-10-24（第五修）：必须有这个统一标记，否则慢网下点一次歌，
+   整首就会被 markDead 拉黑 10 分钟 —— 第二次点直接被「已知不可播，跳过」，
+   续传永远没机会跑起来。这个 bug 是实测发现的：
+   模拟 25KB/s 时第 1 次失败、第 2~4 次全是「youtube: 已知不可播，跳过」。 */
+function ytTransientError(msg) {
+  const err = new Error(msg);
+  err.ytTransient = true;
+  return err;
 }
 
 async function resolveYoutube(id, want, quality) {
@@ -6643,9 +6775,19 @@ async function resolveYoutube(id, want, quality) {
     return null;
   };
 
+  /* ⚠️ 2026-10-24（第五修）：这一整条链路里只要出现过一次「临时性失败」
+     （内联没下完），最终抛出的错误就要带 ytTransient 标记 —— 否则外层
+     会把它当确定性失败去 markDead，这首歌就被藏 10 分钟，
+     用户第二次点直接被跳过，续传永远轮不到运行。 */
+  let sawTransient = false;
+  const noteErr = function (e) {
+    if (e && e.ytTransient) sawTransient = true;
+  };
+
   if (id) {
     try { return await ytFetchUrl(id, quality); }
     catch (e) {
+      noteErr(e);
       errors.push("直取: " + e.message);
       /* 直取失败（视频没流 / 被风控 / 配额截断）→ 同一首歌的其它上传。
          ⚠️ 这里必须无条件尝试，不能因为「上次搜到过它」就跳过：
@@ -6653,7 +6795,7 @@ async function resolveYoutube(id, want, quality) {
       try {
         const alt = await tryAltUploads(String(e.message).slice(0, 40));
         if (alt) return alt;
-      } catch (e2) { errors.push("换上传: " + e2.message); }
+      } catch (e2) { noteErr(e2); errors.push("换上传: " + e2.message); }
     }
   }
 
@@ -6662,9 +6804,11 @@ async function resolveYoutube(id, want, quality) {
        关键词改用 ytAltQueries —— 它会把脏标题切开、把频道名脏值剔掉。 */
     const alt = await tryAltUploads(id ? "换上传全灭" : "");
     if (alt) return alt;
-  } catch (e) { errors.push("搜索: " + e.message); }
+  } catch (e) { noteErr(e); errors.push("搜索: " + e.message); }
 
-  throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
+  const finalErr = new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
+  if (sawTransient) finalErr.ytTransient = true;
+  throw finalErr;
 
 }
 
