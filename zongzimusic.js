@@ -5940,20 +5940,31 @@ async function ytFetchUrl(videoId, quality) {
     res = await ytPlayerVisionos(videoId);
     usedVisionos = true;
   } catch (e) {
-    /* ⚠️ 2026-10-24：原来这里是「退回 ANDROID / IOS」。
-       实测这三个 client 现在都拿不到能下载的直链了：
+    /* ⚠️⚠️ 2026-10-24（这次「一直转圈、永远没声音」的根因）：
+       原来这里会「退回 ANDROID / IOS」。而实测这三个 client 现在都拿不到
+       能下载的直链了：
          · ANDROID 20.10.38 —— 能出直链，但 googlevideo 一律 403；
          · IOS 20.10.4    —— 同上，403；
          · ANDROID/IOS 20.45+ / 21.x —— 只回 SABR，streamingData 里 url 是 undefined；
          · 19.x 及更早 —— HTTP 400「Precondition check failed」，服务端强制要新版本号；
          · ANDROID_VR 1.61/1.62 —— LOGIN_REQUIRED；1.64/1.65 —— 403；
          · WEB / MWEB / TVHTML5 / WEB_EMBEDDED / WEB_REMIX —— UNPLAYABLE 或已停用。
-       所以这条兜底实际上早就兜不住了，只是以前 VISIONOS 够稳，没暴露出来。
-       现在改成：先换新 visitor 再打一次 VISIONOS（那才是真正的失效原因），
-       实在不行才去试 ANDROID/IOS —— 留着不是指望它能播，是留个痕迹，
-       万一哪天它们又活了不用改代码。 */
-    try { res = await ytPlayer(videoId, YT_ANDROID); }
-    catch (e2) { res = await ytPlayer(videoId, YT_IOS); }
+
+       危险的地方在于：ANDROID 会**照常返回一个看起来正常的 googlevideo 地址**，
+       只是这个地址下载时 100% 403。旧代码拿到它之后，因为 ytPickAudio 挑中了
+       超过内联上限的档位（见下面那段），willInline 为假 → 才去 verifyPlayable，
+       而慢网下探测本身也可能超时放行，于是把一个必然 403 的地址交给了播放器。
+       用户看到的就是：点了，一直转圈，永远不出声。
+
+       例：JcuWaJMe5Ys（水仙斗活佛《野钓记》）
+         VISIONOS → UNPLAYABLE（这条视频本身在 YouTube 侧就不可播）；
+         ANDROID  → 给出 rr4---sn-...googlevideo.com/...&c=ANDROID 的地址；
+         实际取 → HTTP 403，0 字节。
+
+       所以现在：VISIONOS 失败就直接失败，**不再退回 ANDROID/IOS**。
+       让上层把它当成「这条视频取不到」去试下一条候选 —— 那才是对的行为
+       （同一首歌往往还有别的搬运条目能播）。 */
+    throw e;
   }
 
   let pick = ytPickAudio(res.audios, quality);
@@ -6003,13 +6014,25 @@ async function ytFetchUrl(videoId, quality) {
   const willInline = shouldInlineYoutube() && Number(pick.size || 0) > 0 &&
     Number(pick.size) <= YT_INLINE_MAX_BYTES;
 
-  if (!willInline && !(await verifyPlayable(pick.url))) throw new Error("yt: 地址不可播");
+  /* ⚠️⚠️ 2026-10-24（补的漏口）：以前只在**不内联**时才验活。
+     理由是「内联本来就会拉第一块，等于验活」。但内联失败后会
+     `return ok.url` 把流式地址交出去 —— 而那条路径从来没被验过。
+     ANDROID 签发的地址正好是「看着正常、下载 403」，
+     于是内联失败 → 交出一个必然 403 的地址 → 播放器转圈到死。
+
+     现在：**任何**要交出去的地址都必须先验活，内联分支也不例外。
+     代价是一个 2KB 的 Range 请求（几十毫秒），换来的是
+     「不会再把死地址交给播放器」。 */
+  if (!(await verifyPlayable(pick.url))) throw new Error("yt: 地址不可播");
 
   /* VISIONOS 签发的 URL 没有 1MB 配额（实测首/中/尾全 200），不用探测。
      ⚠️ 但**不能**在这里提前 return —— 那会跳过下面的整首内联，
      导致 YouTube 又退回流式播放（开头 1 分多钟每 2 秒卡一次）。 */
   let ok = pick;
 
+  /* ⚠️ 2026-10-24：VISIONOS 已经是唯一取流路径（ANDROID/IOS 全废），
+     所以 usedVisionos 恒为真，这段配额探测实际上永远不会执行。
+     代码留着是因为「哪天 ANDROID 活过来」还得用它，但别指望它现在起作用。 */
   if (!usedVisionos && shouldProbeYtQuota() && !willInline) {
     // 探测点落在每个候选文件的尾部（见 ytQuotaOk），能取到尾部就说明整首可下。
     // 只试 2 个档：同一视频各档的配额表现基本一致，多试只是白花时间。
