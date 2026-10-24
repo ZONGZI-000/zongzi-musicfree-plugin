@@ -5938,6 +5938,13 @@ async function fetchRange(url, start, end, extraHeaders, timeoutMs) {
  * 失败或超限返回 null（调用方回退到流式）。
  *
  * ⚠️ 必须分块并发下载：整文件单请求会被 YouTube 卡死 70 秒后 abort。
+ *
+ * ⚠️⚠️ 2026-10-24（第五修）：支持**断点续传**。
+ *   以前超时了就把整块 Uint8Array 扔掉，用户再点一次还得从 0 开始 ——
+ *   在 8KB/s 的 VPN 下永远点不完一首。
+ *   现在把「已经下到的字节 + 哪些块已完成」按 mediaCacheKey 存在
+ *   INLINE_PARTIAL 里（30 分钟、最多 2 首），下次点同一首直接接着下。
+ *   opts.partialKey 传 key 才启用；不传就还是老行为（下完即用、失败即弃）。
  */
 async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, deadlineMs, opts) {
   const size = Number(sizeHint || 0);
@@ -5961,6 +5968,8 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
      现在：先用探测块实测吞吐估总耗时，能等就等（上限 waitCapMs），
      等不起就立刻失败（别让用户干等满一个 deadline 再告诉他没戏）。 */
   const waitCapMs = Number(opts && opts.waitCapMs) || 0;
+  /* 断点续传的 key。调用方给才有；不给就完全是老行为。 */
+  const partKey = (opts && opts.partialKey) ? String(opts.partialKey) : "";
 
   // 先拉第一块确认能下、并验魔数（省得白下整首才发现是错误页）
   /* ⚠️ 探测块用 INLINE_PROBE_BYTES（32KB）而不是 INLINE_CHUNK（256KB）。
@@ -6074,15 +6083,47 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
     if (!okHead) return null;
   }
 
-  const u8 = new Uint8Array(size);
+  /* ---- 续传：优先复用上一次下到的半截数据 ---- */
+  let u8 = null;
+  let done = null;            // Set<块下标>，只记 [first.length 之后] 的块
+  let carried = 0;            // 复用了几块
+  const resume = partKey ? inlinePartialTake(partKey, size) : null;
+  if (resume) {
+    u8 = resume.u8;
+    done = resume.done;
+    carried = resume.count;
+    console.log("[粽子] 续传: 已有 " + carried + "/" + resume.total
+      + " 块（" + Math.round(resume.bytes / 1024) + "/" + Math.round(size / 1024) + "KB）");
+    /* 续传时不再重复拉探测块，但吞吐样本要留着给后面的估算用。 */
+    noteLinkBps(first.length, Math.max(1, firstMs));
+  } else {
+    u8 = new Uint8Array(size);
+    done = {};
+  }
   u8.set(first, 0);
   let filled = first.length;
-
-  // 剩下的按块排队，4 路并发
-  const ranges = [];
-  for (let off = first.length; off < size; off += INLINE_CHUNK) {
-    ranges.push([off, Math.min(off + INLINE_CHUNK, size) - 1]);
+  if (resume) {
+    /* 续传：u8 里已经有上次下好的块，filled 要把它们算进来 ——
+       否则「filled < size*0.98」会误判成没下完。 */
+    for (let off = first.length, i = 0; off < size; off += INLINE_CHUNK, i++) {
+      if (done[i]) filled += Math.min(INLINE_CHUNK, size - off);
+    }
   }
+
+  // 剩下的按块排队，4 路并发。每项带上自己的块下标，续传靠它记账。
+  const ranges = [];          // [{ s, e, i }]
+  {
+    let i = 0;
+    for (let off = first.length; off < size; off += INLINE_CHUNK) {
+      if (!done[i]) ranges.push({ s: off, e: Math.min(off + INLINE_CHUNK, size) - 1, i: i });
+      i++;
+    }
+  }
+  const totalBlocks = (function () {
+    let n = 0;
+    for (let off = first.length; off < size; off += INLINE_CHUNK) n++;
+    return n;
+  })();
   let cursor = 0;
   let failed = false;
   async function worker() {
@@ -6090,25 +6131,88 @@ async function inlineAudio(url, sizeHint, mimeHint, extraHeaders, maxBytes, dead
       /* 每块之前都看一眼总 deadline：超了就直接收工，
          不要「再下一块就好」—— 慢网下每一块都可能是最后一块。 */
       if (remain() <= 0) { failed = true; return; }
-      const idx = cursor++;
-      const [s, e] = ranges[idx];
-      const part = await fetchRange(url, s, e, extraHeaders,
+      const job = ranges[cursor++];
+      const part = await fetchRange(url, job.s, job.e, extraHeaders,
         Math.min(6000, Math.max(1200, remain())));
       if (!part) { failed = true; return; }
-      u8.set(part, s);
+      u8.set(part, job.s);
       filled += part.length;
+      done[job.i] = 1;          // 这块下完了，下次可以跳过
     }
   }
   const workers = [];
   for (let i = 0; i < Math.min(INLINE_CONCURRENCY, ranges.length); i++) workers.push(worker());
   await Promise.all(workers);
 
-  if (failed || filled < size * 0.98) return null;
-  if (u8.length < 4096 || u8.length > cap) return null;
+  if (failed || filled < size * 0.98) {
+    /* ⚠️ 没下完 —— 把已下到的部分存起来，下次接着下。
+       这里不 return null 前先落库，是整个「续传」改动的关键：
+       以前这一行就是「扔掉全部进度」。 */
+    if (partKey) inlinePartialPut(partKey, size, u8, done, totalBlocks);
+    return null;
+  }
+  if (u8.length < 4096 || u8.length > cap) { if (partKey) inlinePartialDrop(partKey); return null; }
 
   const isWebm = u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3;
   const b64 = b64FromU8(u8);
+  if (partKey) inlinePartialDrop(partKey);   // 下完了，半截数据没用了
   return "data:" + mimeFromExt(mimeHint || (isWebm ? "webm" : "mp4")) + ";base64," + b64;
+}
+
+/* ============================================================
+ * 半截音频缓存（断点续传的地基）
+ *
+ * ⚠️⚠️ 2026-10-24：用户的实际场景是 VPN 只有 8KB/s，一首 2MB 的歌
+ *   要四分多钟。以前「超时就扔掉」意味着这种网速下**永远**下不完 ——
+ *   每次点都从 0 开始，每次都在同一个地方超时。
+ *
+ * 现在：没下完的 Uint8Array 连「哪些块已完成」一起存起来，
+ * 下次点同一首接着下，进度是累积的。哪怕一次只推进 200KB，
+ * 点五六次也能把整首攒完。
+ *
+ * 约束（照抄 INLINE_CACHE 的教训，别让 Hermes 吃不住）：
+ *   · 最多留 2 首，每首上限就是内联上限（2.5MB）→ 最多 5MB 常驻；
+ *   · 30 分钟过期：直链签名早就换了，块数据本身还是对的，但不能无限留；
+ *   · 只在「真有用户点播」时才会被写入（预取不续传）。
+ * ============================================================ */
+const INLINE_PARTIAL = {};
+const INLINE_PARTIAL_TTL = 30 * 60 * 1000;
+const INLINE_PARTIAL_MAX = 2;
+
+/** 取出某首歌的半截数据。size 对不上就丢弃（换了音轨/换了上传）。 */
+function inlinePartialTake(key, size) {
+  const v = INLINE_PARTIAL[key];
+  if (!v) return null;
+  if (Date.now() - v.at > INLINE_PARTIAL_TTL) { delete INLINE_PARTIAL[key]; return null; }
+  if (Number(v.size) !== Number(size)) {
+    /* 体积变了说明换了音频档位/另一条上传 —— 旧的块对不上位置，留着是毒药。 */
+    console.log("[粽子] 续传作废（体积变化 " + Math.round(Number(v.size) / 1024)
+      + "KB → " + Math.round(Number(size) / 1024) + "KB）");
+    delete INLINE_PARTIAL[key];
+    return null;
+  }
+  v.at = Date.now();
+  let count = 0;
+  for (const k in v.done) if (v.done[k]) count++;
+  return {
+    u8: v.u8, done: v.done, count: count, total: v.total || 0,
+    bytes: count * INLINE_CHUNK,
+  };
+}
+
+/** 存下没下完的半截数据。 */
+function inlinePartialPut(key, size, u8, done, total) {
+  if (!key || !u8) return;
+  INLINE_PARTIAL[key] = { at: Date.now(), size: Number(size), u8: u8, done: done, total: total };
+  const ks = Object.keys(INLINE_PARTIAL);
+  if (ks.length > INLINE_PARTIAL_MAX) {
+    ks.sort((x, y) => INLINE_PARTIAL[x].at - INLINE_PARTIAL[y].at);
+    for (let i = 0; i < ks.length - INLINE_PARTIAL_MAX; i++) delete INLINE_PARTIAL[ks[i]];
+  }
+}
+
+function inlinePartialDrop(key) {
+  if (key) delete INLINE_PARTIAL[key];
 }
 
 /* ⚠️ 历史教训（2026-10-17）：别改成「一次 GET 下整首」。
@@ -6221,10 +6325,31 @@ async function ytFetchUrl(videoId, quality) {
      至于「塞得进但这条链路下不完」那种情况，交给下面的**逐档尝试**处理 ——
      这里不再拿网速估算去挑档（估算样本太小，会把能下的判成下不完）。 */
   if (shouldInlineYoutube()) {
+    /* ⚠️⚠️ 2026-10-24（第四修 · AAC 优先）：「能播」和「播得动」是两件事。
+       同一首歌，YouTube 一般同时给 AAC（itag 139/140，audio/mp4）和
+       Opus（249/250/251，audio/webm）两套音轨。旧代码只按码率挑，
+       于是常常落到 Opus/webm 上 —— 而 webm 这条在实机上有两个坑：
+
+         · 体积大：Opus 档按体积封顶会先被砍到 50k 档，仍比同档 AAC 大；
+         · 播放器兼容差：安卓 ExoPlayer 对 webm/opus 内联串的解码支持
+           参差不齐，表现在用户眼里就是「点了不出声 / 卡住不动」。
+
+       实测同一首《所以我停下來》（LIVE 场）：
+         itag 250 webm/opus 73k → 1852KB（旧代码就挑这条）
+         itag 139 mp4/AAC   50k → 1369KB（AAC，体积小 26%）
+       两首实测时长都完整，但 AAC 解出来更快、兼容性稳得多。
+
+       所以：**在塞得进内联上限的档位里，优先 audio/mp4(AAC)**，
+       只有确实没有 mp4 档时才用 webm。码率仍然在同类里从高到低排。 */
     const fits = (res.audios || [])
       .filter((a) => a && a.url && !YT_BAD_ITAGS[a.itag] && Number(a.size || 0) > 0)
       .filter((a) => Number(a.size) <= YT_INLINE_MAX_BYTES)
-      .sort((a, b) => b.bitrate - a.bitrate);
+      .sort(function (a, b) {
+        var am = /mp4/i.test(String(a.mime || "")) ? 1 : 0;
+        var bm = /mp4/i.test(String(b.mime || "")) ? 1 : 0;
+        if (am !== bm) return bm - am;      // AAC 排在 webm 前面
+        return b.bitrate - a.bitrate;       // 同类里码率高者优先
+      });
     if (!fits.length) {
       const err = new Error("yt: 音轨过大无法内联（最小 "
         + Math.round(Number(pick.size || 0) / 1024) + "KB，上限 "
@@ -6232,7 +6357,17 @@ async function ytFetchUrl(videoId, quality) {
       err.ytTooBig = true;
       throw err;
     }
-    if (Number(pick.size || 0) > YT_INLINE_MAX_BYTES) pick = fits[0];
+    /* 只要要走内联，就按上面的优先级重新挑档 —— 不再是「超上限才换」。
+       原因：原 pick 可能是一条塞得进上限的 webm，换掉它才有意义
+       （AAC 更小更稳）。只有确实挑不出 AAC 时才沿用原档。 */
+    if (fits.length) {
+      const bestAac = fits.filter(function (a) { return /mp4/i.test(String(a.mime || "")); })[0];
+      if (bestAac) {
+        pick = bestAac;
+      } else if (Number(pick.size || 0) > YT_INLINE_MAX_BYTES) {
+        pick = fits[0];
+      }
+    }
   }
 
   /* ⚠️ 验活可以省掉一次往返。
@@ -17745,7 +17880,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.70",
+  version: "4.10.71",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
