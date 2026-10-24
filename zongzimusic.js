@@ -6378,18 +6378,36 @@ function inlinePartialDrop(key) {
    ERR_BAD_RESPONSE / stream has been aborted，整首永远下不完。
    分块后同样 2.2MB 只要 3.5 秒。 */
 
-/** 是否开启 YouTube 整首内联（默认开） */
+/** 是否开启 YouTube 整首内联（**默认关** —— 2026-10-24 改为流式优先）
+ *
+ *  ⚠️⚠️ 2026-10-24（第十修，「切过去」）：默认从内联改成**流式**。
+ *
+ *  为什么翻这个默认值：
+ *    内联是「整首下完才出声」，慢网下 2.7MB 要一分多钟，掉到 1~2KB/s 就是
+ *    永远转圈。而流式跟视频播放器同构：先缓冲几秒就能开始放，后面边播边补。
+ *
+ *  为什么以前不敢用流式（记录在这里，别再踩一遍）：
+ *    2026-10-21 那一轮里 YouTube 流式地址实机「不出声」，于是把内联做成了
+ *    唯一出声路径，甚至加了三道闸把流式地址全拦下来。2026-10-24 实测重新
+ *    验证了那条结论的前提，已经不再成立：
+ *      · 直链补 `&range=0-` 之后不再是限速流（实测 1MB/s 以上）；
+ *      · 首块 256KB 里 moov 就在文件头（fMP4），**截断也能解析出声** ——
+ *        这正是「缓冲几秒就开始放」能成立的物理前提；
+ *      · desktop / ExoPlayer / stagefright / 空 UA 全部 206，不再有 UA 403。
+ *    也就是说当年那个「不出声」更可能是慢网导致的播放器缓冲超时，
+ *    而不是地址本身不可播。
+ *
+ *  留口子：填 1 仍然可以退回内联（老行为），用于「流式又不响了」的排查。
+ *  ⚠️ 预取仍然不要内联结果 —— 预取只该拿一条地址，见下方 prefetchTop。 */
 function shouldInlineYoutube() {
-  /* 同 shouldInlineBili：预取只要流式 URL，不做整首下载。
-     ⚠️ 但只要有真实点播在场（_playInFlight>0），就不许压制内联 ——
-        用户就在预取那 4 秒里点歌，按全局开关走就是「点了没声音」。 */
   if (_prefetchMode && _playInFlight === 0) return false;
   try {
     const vars = (typeof env !== "undefined" && env && env.userVariables) || {};
     const v = vars.inlineYoutube;
-    if (v === undefined || v === null || v === "") return true;
-    return !(v === "0" || v === "false" || v === "off");
-  } catch (e) { return true; }
+    /* 空值 = 走新默认（流式）。只有显式写 1/true/on 才回到整首内联。 */
+    if (v === undefined || v === null || v === "") return false;
+    return v === "1" || v === "true" || v === "on";
+  } catch (e) { return false; }
 }
 
 /* 本次点播还能留给「整首内联」多少毫秒。
@@ -16463,13 +16481,16 @@ function prefetchTop(list, count) {
              内存里就长期钉着好几条巨串 —— 之后每次 GC 都要扫它们。 */
           if (String(u).indexOf("data:") === 0) {
             if (String(u).length <= INLINE_MAX_CHARS) inlineCachePut(it, u);
-          } else if (isYtStreamUrl(u)) {
-            /* ⚠️ 2026-10-21：YouTube 的流式裸地址**不进缓存**。
-               预取阶段禁止内联，拿到的一定是流式地址；而流式在实机上
-               就是「点了没声音」。把它写进直链池 = 用户点歌时走快速通道
-               直接复用这条流式地址，整首内联永远轮不到。
-               预取对 YouTube 就等于「什么都没预热」，这是对的 ——
-               内联的等待本来也只能发生在用户真的点下去那一刻。 */
+          } else if (isYtStreamUrl(u) && shouldInlineYoutube()) {
+            /* ⚠️ 2026-10-21：YouTube 的流式裸地址**不进缓存**（仅限内联模式）。
+               内联模式下预取拿到的是流式地址，而那时流式被当作「点了没声音」，
+               写进直链池等于让用户绕过内联 → 无声。
+
+               ⚠️⚠️ 2026-10-24（第十修）：现在默认就是流式，这条缓存**必须进** ——
+               预取的全部价值就在于「点歌时手上已经有一条地址」。继续拦着，
+               预取对 YouTube 就等于什么都没做，每次点歌都要现签一次。
+               注意 mediaCachePut 存的是裸 URL 签名，播放前 getMediaSource
+               还会再过一遍 decorateSource 补 &range=0- 和请求头。 */
           } else {
             mediaCachePut(it, u);
           }
@@ -17010,8 +17031,16 @@ async function getMediaSource(musicItem, quality) {
    *   第一次内联成功，第二、三次全走缓存 → 无声。
    *
    *   正确做法跟下面 B 站 主站节点 那条完全同构：这类地址不进快速通道，
-   *   丢掉缓存重走一遍完整取流（这次会内联）。 */
-  if (cached && isYtStreamUrl(cached)) {
+   *   丢掉缓存重走一遍完整取流（这次会内联）。
+   *
+   *   ⚠️⚠️ 2026-10-24（第十修）：上面这一整段的**前提已翻转**。
+   *   现在默认走流式，预取写进缓存的流式地址正是我们想要的成品，
+   *   所以命中缓存时**不该**再丢掉重取 —— 那会把预取白做一遍，
+   *   用户点歌反而多等 1 秒。只有「退回内联模式」（inlineYoutube=1）时，
+   *   这条丢弃逻辑才仍然成立。
+   *   ⚠️ 缓存里的裸地址依然要过 decorateSource 补 &range=0- 和请求头，
+   *      见下面那个 else-if 分支。 */
+  if (cached && isYtStreamUrl(cached) && shouldInlineYoutube()) {
     console.log("[粽子] 缓存里是 YouTube 流式地址（应内联），丢弃重取: "
       + String(musicItem.title || "").slice(0, 20));
     mediaCacheForget(musicItem);
@@ -18161,7 +18190,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.73",
+  version: "4.10.74",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -18228,8 +18257,8 @@ module.exports = {
     },
     {
       key: "inlineYoutube",
-      name: "YouTube 整首预载（默认开）",
-      hint: "填 1 开启、0 关闭。开启后 YouTube 的音轨会先完整下载并内联，播放时不卡（代价是首次多等 2~5 秒）。超过 2MB 的文件自动回退流式。\n\n⚠️ 关掉它：看到「整个 App 卡死 / 点切歌没反应」时先关这个和下面那个。内联是把音频转成一长条字符串塞给播放器，字符串越大主线程越容易堵。",
+      name: "YouTube 整首预载（默认关，走流式）",
+      hint: "留空 = 流式（默认，推荐）。填 1 才开启整首预载。\n\n默认改成流式的原因：整首预载是「下完整首才出声」，慢网下 2.7MB 要一分多钟，速度掉到 1~2KB/s 就是永远转圈。流式跟视频播放器一个机制 —— 先缓冲几秒就开声，后面边播边补，网再慢也能听。\n\n什么时候填 1：流式又出现「点了没声音 / 每 2 秒卡一次」时，退回整首预载试试。内联的代价是首次多等 2~9 秒，而且音频要转成一长条字符串塞给播放器，太大会让 App 卡顿。",
     },
     {
       key: "inlineBili",
