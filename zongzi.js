@@ -4017,9 +4017,67 @@ async function resolveQQ(id, want, quality) {
   throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
+/* ============================================================
+ * 通道 E0：酷狗官方 playInfo（2026-10-24）
+ *
+ * 为什么要有它：聚合上游的**酷狗通道整条挂了**。
+ *   实测 2026-10-24：不论 hash 是什么（周杰伦《晴天》和冷门独立乐团都一样），
+ *   /api/url?provider=kugou 一律 HTTP 502 + {"error":"第三方渠道返回异常状态（520）"}。
+ *   搜索还正常（/api/search?provider=kugou 照常返回条目），所以用户能看到歌、
+ *   点下去必然失败 ——「列表里明明有，点了打不开」就是这么来的。
+ *   同一时刻 coco 的网易云 / QQ 通道都是好的，说明挂的是它上游的酷狗那一路，
+ *   不是我们这边的问题，也不是这首歌的问题。
+ *
+ * 官方这个接口不用 key、不用登录，只要 hash（正好就是搜索结果里的 id）：
+ *   GET https://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=<32位HEX>
+ *   返回 url / backup_url[] / fileSize / timeLength / bitRate
+ * 实测：免费曲 1.1 秒给 sharefs.kugou.com 的完整 mp3（206 + audio/mpeg）；
+ *       付费曲明确返回 status=0 + error="需要付费" —— 快速失败，不拖时间。
+ *
+ * ⚠️ 只给 128kbps。放到聚合上游**之后**是错的（那边现在 502，排后面等于永远用不上），
+ *    放**之前**又会在 coco 复活后白丢 FLAC —— 折中：先问官方（0.5~1.1s，够快），
+ *    拿不到（付费/下架）再走聚合上游。
+ * ============================================================ */
+const KUGOU_PLAYINFO = "https://m.kugou.com/app/i/getSongInfo.php";
+const KUGOU_APP_UA = "Mozilla/5.0 (Linux; Android 10; MI 9 Build/QKQ1.190825.002)";
+
+async function kugouOfficialUrl(id) {
+  const h = String(id || "").trim().toUpperCase();
+  if (!/^[0-9A-F]{32}$/.test(h)) throw new Error("不是酷狗 hash");
+  const r = await httpGet(KUGOU_PLAYINFO,
+    { cmd: "playInfo", hash: h },
+    { "User-Agent": KUGOU_APP_UA, Referer: "https://m.kugou.com/" }, 8000);
+  if (!r) throw new Error("酷狗无响应");
+  if (Number(r.status) !== 1 || !r.url) {
+    throw new Error(r.error || ("酷狗未给地址(status=" + r.status + ")"));
+  }
+  /* ⚠️ 这里**不**做 https→http 改写。那条规则是给 coco 上游的网宿地址用的
+     （证书 SAN 覆盖不到两级子域）；sharefs.kugou.com 的 https 实测 206 正常，
+     改成 http 只是多一次明文。 */
+  const cands = [r.url];
+  if (Array.isArray(r.backup_url)) {
+    for (let i = 0; i < r.backup_url.length; i++) cands.push(r.backup_url[i]);
+  }
+  const errs = [];
+  for (let i = 0; i < cands.length; i++) {
+    const u = String(cands[i] || "");
+    if (!u) continue;
+    try {
+      if (await verifyPlayable(u)) return u;
+      errs.push("不可播");
+    } catch (e) { errs.push(String(e && e.message)); }
+  }
+  throw new Error("官方地址不可播" + (errs.length ? "（" + errs.join(",") + "）" : ""));
+}
+
 async function resolveKugou(id, want, quality) {
   const errors = [];
-  // 1. 聚合上游 直取（出 FLAC，注意 http 修正）
+  // 1. 官方 playInfo 直取（最快；聚合上游的酷狗通道 2026-10-24 起整条 502）
+  if (id) {
+    try { return await kugouOfficialUrl(id); }
+    catch (e) { errors.push("kugou官方: " + e.message); }
+  }
+  // 2. 聚合上游 直取（出 FLAC，注意 http 修正）
   if (id) {
     try { return await cocoFetchUrl("kugou", id, quality); }
     catch (e) { errors.push("coco直取: " + e.message); }
@@ -5352,6 +5410,99 @@ async function ytSearchRaw(query) {
  *   - 时长 2~10 分钟像首歌，超长（演唱会/合辑）和超短（切片）降权
  *   - 标题含 歌词/翻唱/remix/DJ/伴奏/纯享 等降权
  */
+/* ============================================================
+ * YouTube 兜底：查询词清洗 + 「同一首歌的其它上传」判据
+ *
+ * ⚠️⚠️ 2026-10-24 事故（「野钓记点了永远转圈、最后报错」的真正根因）：
+ *
+ *   YouTube 条目的 title / artist 是从 YouTube 自己的渲染树里扒的，很脏：
+ *     title  = "水仙斗活佛——野钓记"   ← 作者和歌名被一个破折号粘在一起
+ *     artist = "zz z"                 ← 频道名，不是歌手
+ *
+ *   而兜底搜索用的是 buildKeywords(want)，它假设 name 是干净歌名、
+ *   singer 是真人。于是拼出来的查询词是：
+ *     "水仙斗活佛——野钓记 zz z"  → YouTube 回 0 条
+ *     "水仙斗活佛——野钓记"       → 回 1 条（就是那条已经死掉的）
+ *     "zz z"                      → 回一堆无关视频
+ *
+ *   实测同一时刻手搜「野钓记 水仙斗活佛」→ 3 条，
+ *   其中 PPD9mbDWfgI / FRummv8E2j0 两条都能正常内联播放。
+ *
+ *   所以「VISIONOS 判 UNPLAYABLE 就交给别的条目」这条兜底**从来没生效过** ——
+ *   不是取流坏了，是查询词把兜底自己打瞎了。
+ * ============================================================ */
+/** 标题切段：按分隔符把「作者——歌名」拆开 */
+const YT_TITLE_SPLIT_RE = /[\/|｜·•—–\-_～~]+|【|】|《|》|「|」|\(|\)|（|）|\[|\]|,|，|：|:|\.{3,}|…/;
+function ytTitleSegs(s) {
+  return String(s || "")
+    .split(YT_TITLE_SPLIT_RE)
+    .map(function (x) { return x.replace(/^\s*(by|feat\.?|ft\.?)\s+/i, "").trim(); })
+    .filter(function (x) { return x.length >= 2; });
+}
+
+/** 这个歌手字段像不像真人名，还是频道名脏值。
+ *  "zz z" / "idle" / "WeiZhi Wu" 这种纯拉丁短串一律当脏值 ——
+ *  拼进查询词只会把搜索打空。中文名一律保留（宁可多搜一次，也别扔了真歌手）。 */
+function ytSingerCredible(singer, title) {
+  const v = String(singer || "").trim();
+  if (!v) return false;
+  if (/[\u4e00-\u9fff]/.test(v)) return true;
+  if (normText(v).length >= 6) return true;
+  return normText(String(title || "")).indexOf(normText(v)) >= 0;
+}
+
+/** YouTube 兜底用的查询词列表（按「命中概率从高到低」排）。
+ *  ① 可信歌手 + 标题每一段
+ *  ② 标题干净段两两组合（脏标题的正主就在这里救回来）
+ *  ③ 原来那套 buildKeywords（含繁体变体）
+ *  ④ 单段兜底 */
+function ytAltQueries(want) {
+  const out = [];
+  const push = function (x) {
+    const v = String(x || "").replace(/\s+/g, " ").trim();
+    if (v && out.indexOf(v) < 0) out.push(v);
+  };
+  const name = String(want.name || "").trim();
+  const singer = String(want.singer || "").trim();
+  const segs = ytTitleSegs(name);
+  const singerOk = ytSingerCredible(singer, name);
+
+  if (singerOk) {
+    for (let i = 0; i < segs.length; i++) push(segs[i] + " " + singer);
+  }
+  if (segs.length >= 2) {
+    for (let i = 0; i < segs.length; i++) {
+      for (let j = 0; j < segs.length; j++) {
+        if (i !== j) push(segs[i] + " " + segs[j]);
+      }
+    }
+  }
+  const base = buildKeywords({
+    name: name,
+    singer: singerOk ? singer : "",
+    album: want.album,
+  });
+  for (let i = 0; i < base.length; i++) push(base[i]);
+  for (let i = 0; i < segs.length; i++) push(segs[i]);
+  return out;
+}
+
+/** 已知原视频、只是它这条取不到流，要去找**同一首歌的其它上传**。
+ *  不能拿整条脏标题当查询词，也不能拿它整串跟候选比 ——
+ *  改成「原标题的任何一段，在候选标题里能整段命中」。
+ *  比 isDefinitelySameSong 松一档，但要求整段对齐，所以不会串歌。 */
+function ytSameVideoSong(candTitle, rawTitle) {
+  const cand = String(candTitle || "");
+  if (!cand) return false;
+  if (isAudiobookTitle(cand) || EPISODE_RE.test(cand)) return false;
+  const segs = ytTitleSegs(toSimplified(String(rawTitle || "")));
+  for (let i = 0; i < segs.length; i++) {
+    const q = coreTitle(segs[i]);
+    if (q && q.length >= 2 && titleSegHit(cand, q)) return true;
+  }
+  return false;
+}
+
 /**
  * 兜底时判断「这条 YouTube 视频是不是目标歌手唱的」。
  *
@@ -5940,21 +6091,33 @@ async function ytFetchUrl(videoId, quality) {
     res = await ytPlayerVisionos(videoId);
     usedVisionos = true;
   } catch (e) {
-    /* ⚠️ 2026-10-24：原来这里是「退回 ANDROID / IOS」。
-       实测这三个 client 现在都拿不到能下载的直链了：
+    /* ⚠️⚠️ 2026-10-24（这次「一直转圈、永远没声音」的根因）：
+       原来这里会「退回 ANDROID / IOS」。而实测这三个 client 现在都拿不到
+       能下载的直链了：
          · ANDROID 20.10.38 —— 能出直链，但 googlevideo 一律 403；
          · IOS 20.10.4    —— 同上，403；
          · ANDROID/IOS 20.45+ / 21.x —— 只回 SABR，streamingData 里 url 是 undefined；
          · 19.x 及更早 —— HTTP 400「Precondition check failed」，服务端强制要新版本号；
          · ANDROID_VR 1.61/1.62 —— LOGIN_REQUIRED；1.64/1.65 —— 403；
          · WEB / MWEB / TVHTML5 / WEB_EMBEDDED / WEB_REMIX —— UNPLAYABLE 或已停用。
-       所以这条兜底实际上早就兜不住了，只是以前 VISIONOS 够稳，没暴露出来。
-       现在改成：先换新 visitor 再打一次 VISIONOS（那才是真正的失效原因），
-       实在不行才去试 ANDROID/IOS —— 留着不是指望它能播，是留个痕迹，
-       万一哪天它们又活了不用改代码。 */
-    try { res = await ytPlayer(videoId, YT_ANDROID); }
-    catch (e2) { res = await ytPlayer(videoId, YT_IOS); }
+
+       危险的地方在于：ANDROID 会**照常返回一个看起来正常的 googlevideo 地址**，
+       只是这个地址下载时 100% 403。旧代码拿到它之后，因为 ytPickAudio 挑中了
+       超过内联上限的档位（见下面那段），willInline 为假 → 才去 verifyPlayable，
+       而慢网下探测本身也可能超时放行，于是把一个必然 403 的地址交给了播放器。
+       用户看到的就是：点了，一直转圈，永远不出声。
+
+       例：JcuWaJMe5Ys（水仙斗活佛《野钓记》）
+         VISIONOS → UNPLAYABLE（这条视频本身在 YouTube 侧就不可播）；
+         ANDROID  → 给出 rr4---sn-...googlevideo.com/...&c=ANDROID 的地址；
+         实际取 → HTTP 403，0 字节。
+
+       所以现在：VISIONOS 失败就直接失败，**不再退回 ANDROID/IOS**。
+       让上层把它当成「这条视频取不到」去试下一条候选 —— 那才是对的行为
+       （同一首歌往往还有别的搬运条目能播）。 */
+    throw e;
   }
+
 
   let pick = ytPickAudio(res.audios, quality);
   if (!pick) throw new Error("yt: 没有可用的音频流");
@@ -6003,13 +6166,25 @@ async function ytFetchUrl(videoId, quality) {
   const willInline = shouldInlineYoutube() && Number(pick.size || 0) > 0 &&
     Number(pick.size) <= YT_INLINE_MAX_BYTES;
 
-  if (!willInline && !(await verifyPlayable(pick.url))) throw new Error("yt: 地址不可播");
+  /* ⚠️⚠️ 2026-10-24（补的漏口）：以前只在**不内联**时才验活。
+     理由是「内联本来就会拉第一块，等于验活」。但内联失败后会
+     `return ok.url` 把流式地址交出去 —— 而那条路径从来没被验过。
+     ANDROID 签发的地址正好是「看着正常、下载 403」，
+     于是内联失败 → 交出一个必然 403 的地址 → 播放器转圈到死。
+
+     现在：**任何**要交出去的地址都必须先验活，内联分支也不例外。
+     代价是一个 2KB 的 Range 请求（几十毫秒），换来的是
+     「不会再把死地址交给播放器」。 */
+  if (!(await verifyPlayable(pick.url))) throw new Error("yt: 地址不可播");
 
   /* VISIONOS 签发的 URL 没有 1MB 配额（实测首/中/尾全 200），不用探测。
      ⚠️ 但**不能**在这里提前 return —— 那会跳过下面的整首内联，
      导致 YouTube 又退回流式播放（开头 1 分多钟每 2 秒卡一次）。 */
   let ok = pick;
 
+  /* ⚠️ 2026-10-24：VISIONOS 已经是唯一取流路径（ANDROID/IOS 全废），
+     所以 usedVisionos 恒为真，这段配额探测实际上永远不会执行。
+     代码留着是因为「哪天 ANDROID 活过来」还得用它，但别指望它现在起作用。 */
   if (!usedVisionos && shouldProbeYtQuota() && !willInline) {
     // 探测点落在每个候选文件的尾部（见 ytQuotaOk），能取到尾部就说明整首可下。
     // 只试 2 个档：同一视频各档的配额表现基本一致，多试只是白花时间。
@@ -6066,48 +6241,98 @@ async function ytFetchUrl(videoId, quality) {
 
 async function resolveYoutube(id, want, quality) {
   const errors = [];
-  if (id) {
-    try { return await ytFetchUrl(id, quality); }
-    catch (e) { errors.push("直取: " + e.message); }
-  }
-  try {
-    const kws = buildKeywords(want);
-    for (let k = 0; k < kws.length; k++) {
-      const list = await ytSearchRaw(kws[k]);
-      if (!list.length) continue;
+  /* ============================================================
+   * ⚠️⚠️ 2026-10-24（「点了永远转圈、最后『所有平台均失败』」的真正根因）
+   *
+   * 旧逻辑的兜底查询词直接由 want 拼出来，而 YouTube 条目的
+   * want.name / want.artist 是**脏数据**：
+   *     name   = "水仙斗活佛——野钓记"   （作者和歌名粘在一起）
+   *     artist = "zz z"                （频道名）
+   * 拼出来的查询词是 "水仙斗活佛——野钓记 zz z" —— YouTube 回 0 条；
+   * 退到 "水仙斗活佛——野钓记" 只回 1 条，就是那条已经死掉的；
+   * 再退到 "zz z" 只能说全是无关视频。
+   *
+   * 实测同一时刻手搜「野钓记 水仙斗活佛」→ 3 条，
+   * 其中 PPD9mbDWfgI / FRummv8E2j0 两条都能正常内联播放。
+   *
+   * 也就是说：「VISIONOS 判 UNPLAYABLE 就试下一条候选」这条兜底
+   * **从来没真正生效过** —— 不是取流坏了，是查询词把兜底自己打瞎了。
+   * ============================================================ */
+
+  /* 直取失败后，先专门去找「同一首歌的其它上传」，再做正常的兜底搜索。
+     这一步是这次修的核心：它不依赖 want 里的歌手是否可信，
+     只用原标题里能切出来的段落。 */
+  const tryAltUploads = async (reasonForLog) => {
+    const queries = ytAltQueries(want);
+    /* 原来这里是 id === null 才做严格校验 —— 意思是「直取已知视频」时
+       任何搜索结果都直接拿来放。脏标题场景下这就完全是瞎放，
+       很可能放了一条别人的版本。现在两条路都要校验，
+       只是判据不同：兜底用「同名同歌手」，换上传用「原标题整段命中」。 */
+    const seen = {};
+    if (id) seen[id] = 1;
+    for (let k = 0; k < queries.length; k++) {
+      let list;
+      try { list = await ytSearchRaw(queries[k]); }
+      catch (e) { errors.push("搜索(" + queries[k] + "): " + e.message); continue; }
+      if (!list || !list.length) continue;
+
       const ranked = ytRank(list, want);
-      /* ⚠️ 以前只试前 2 条。加上严格校验后，前两条经常都被拒
-         （越南语合集、十七周年展播合集），真正的「趙薇 - 不要告别」
-         排在第 3、4 条，永远轮不到。校验已经够严，多试几条不会串歌。
-         ⚠️ 2026-10-21：6 条还是不够 —— 实测《覺醒》的正确版本
-         「趙薇 Zhao Wei 【覺醒】」在 ytRank 里排第 10（分数只有 20，
-         因为频道是个人号不是 Topic，拿不到那 50 分），前 6 名全是
-         赵薇的新闻八卦视频。校验本身已经够严，所以直接扫全榜，
-         让「过校验」而不是「排名靠前」决定用哪一条。 */
-      let usable = 0;
       for (let i = 0; i < ranked.length; i++) {
         const cand = ranked[i];
-        if (cand.score < 0) continue;
-        // 兜底场景下必须是同一首歌，别拿同名/近似名的顶替
-        if (id === null && !isDefinitelySameSong({ title: cand.v.title, artist: "" }, { name: want.name, singer: "", album: "" })) continue;
-        /* 兜底时还要确认是**这个人**唱的。
-           ⚠️ 事故：赵薇《不要告别》命中「Triệu Vy - Vol5.9: Không cần cáo biệt |
-              不要告别 | 2zhaowei.net***爱赵薇」—— 歌名在标题里、频道名里也有
-              「爱赵薇」，但那是越南语合集，不是她这一版。 */
-        if (id === null && !ytIsThisArtist(cand.v, want)) continue;
-        usable++;
-        try { return await ytFetchUrl(cand.v.id, quality); }
-        catch (e) { errors.push("搜索取流: " + e.message); }
+        if (!cand || seen[cand.v.id]) continue;
+        /* 同一首歌的判据：
+           ① 有原 id 时 → 原标题任一段在候选标题里整段命中（换上传）
+           ② 没原 id 时 → 严格同名 + 同歌手（兜底）
+           两条都过不了的不碰，避免串歌。 */
+        let ok = false;
+        if (id) {
+          ok = ytSameVideoSong(cand.v.title, want.name);
+        } else {
+          ok = isDefinitelySameSong({ title: cand.v.title, artist: "" },
+            { name: want.name, singer: "", album: "" })
+            && ytIsThisArtist(cand.v, want);
+        }
+        if (!ok) continue;
+        seen[cand.v.id] = 1;
+        try {
+          const u = await ytFetchUrl(cand.v.id, quality);
+          if (u) {
+            console.log("[粽子] YouTube " + (id ? "换上传" : "兜底") + "命中: "
+              + cand.v.id + " 《" + String(cand.v.title).slice(0, 30) + "》"
+              + (reasonForLog ? "（" + reasonForLog + "）" : ""));
+            return u;
+          }
+        } catch (e) {
+          errors.push("换上传取流(" + cand.v.id + "): " + e.message);
+        }
       }
-      /* ⚠️ 这里原来写的是 if (ranked.length) break ——
-         只要这次搜索「有结果」就再也不试后面的关键词，哪怕一条都没过校验。
-         实测《遊園會》：第一个关键词「游园会 赵薇」回 20 条，全是八卦视频，
-         一条不合格；后面那个「遊園會 趙薇」本来能命中，却因为 break 永远发不出去。
-         改成「真的取到过合格候选」才停。 */
-      if (usable) break;
     }
+    return null;
+  };
+
+  if (id) {
+    try { return await ytFetchUrl(id, quality); }
+    catch (e) {
+      errors.push("直取: " + e.message);
+      /* 直取失败（视频没流 / 被风控 / 配额截断）→ 同一首歌的其它上传。
+         ⚠️ 这里必须无条件尝试，不能因为「上次搜到过它」就跳过：
+            那条死掉的视频恰恰是最常被搜到、排最前的那条。 */
+      try {
+        const alt = await tryAltUploads(String(e.message).slice(0, 40));
+        if (alt) return alt;
+      } catch (e2) { errors.push("换上传: " + e2.message); }
+    }
+  }
+
+  try {
+    /* 兜底搜索（未拿到 id，或换上传也全灭）：
+       关键词改用 ytAltQueries —— 它会把脏标题切开、把频道名脏值剔掉。 */
+    const alt = await tryAltUploads(id ? "换上传全灭" : "");
+    if (alt) return alt;
   } catch (e) { errors.push("搜索: " + e.message); }
+
   throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
+
 }
 
 /* ============================================================
@@ -7197,6 +7422,12 @@ async function resolveMiguApi(id, want, quality) {
  * ============================================================ */
 
 const KUWO_PAGE_SIZE = 20;
+/* 「这一页算不算满」的统一判据（2026-10-24）。
+   ⚠️ 用 20 而不是各分支自己的页大小（专辑 30 / 歌单 20 / 歌手 20）：
+      它是**下界**，判宽一点最坏只是多翻一页（那一页立刻回 isEnd=true），
+      判窄了就会把「还有下一页」误判成结束 —— 后者会直接吃掉用户的搜索结果。
+      所以统一按 20 判，宁可多翻一次。 */
+const SEARCH_PAGE_SIZE = 20;
 
 /** 酷我通用搜索：ft = music | album | artist | playlist */
 async function kuwoSearchTyped(keyword, ft, page, size) {
@@ -8654,7 +8885,28 @@ async function searchAlbum(query, page) {
 
   /* 合并放在**排序之后**（理由见 dedupeAlbumList 的注释：放前面会削掉共识票数） */
   data = dedupeAlbumList(data);
-  return { isEnd: out.length < KUWO_PAGE_SIZE, data: data };
+  /* ⚠️⚠️ isEnd 必须按**这一页最后真正交出去的东西**判，不能按过滤前的 out.length 判。
+     事故现象（2026-10-24 用户报「结果页白屏 / 无限翻页」）：
+       搜「水仙斗活佛」→ 专辑页第 1 页 41 条，后面每页也都有 20 条；
+       可酷狗/酷我按分词返回的《怪兔记》《三伏记》这类噪声会把 out 撑满 20 条，
+       而 rankByName + 同名翻唱沉底 + dedupeAlbumList 之后 data 只剩个位数甚至 0 条。
+       out.length 仍然是 20 → isEnd=false → 客户端 FlashList 见空列表照样触发
+       onEndReached → 又翻下一页 → 又是「撑满但清空」→ 永远翻不完。
+       界面上就是列表区一片空白、圈一直转（用户嘴里的「白屏」）。
+     ⚠️ 判据换成 data.length + 「这一页有没有拿到新东西」两个条件：
+        - 这一页交出去的条目少于页大小 → 后面不会再有 → isEnd
+        - 交了但全是重复（已见过的 platform+id）→ 同样不会再有 → isEnd
+       两个都不满足才算「还有下一页」。 */
+  const pageIds = {};
+  let freshCount = 0;
+  for (let i = 0; i < data.length; i++) {
+    const k = String(data[i].platform) + "|" + String(data[i].id);
+    if (pageIds[k]) continue;
+    pageIds[k] = 1;
+    freshCount++;
+  }
+  const more = data.length >= SEARCH_PAGE_SIZE && freshCount > 0;
+  return { isEnd: !more, data: data };
 }
 
 /* ---------- 歌手 ---------- */
@@ -9401,7 +9653,14 @@ async function searchSheet(query, page) {
   // ⚠️ 全被过滤掉时不能直接返回空：那是「各平台就是没有这个歌单」，
   //    但要区分「过滤得太狠」和「本来就没有」。这里选择宁可少给 —— 
   //    用户明确说过相关的杂牌歌单比空列表更糟（第 1 条就是无关的）。
-  return { isEnd: out.length < KUWO_PAGE_SIZE, data: rankSheets(kept, query) };
+  /* ⚠️⚠️ isEnd 按 kept 判，不是按 out 判（2026-10-24 白屏事故，同 searchAlbum）。
+     原来写 out.length < KUWO_PAGE_SIZE：酷我+酷狗+网易云每页能凑 31 条 out，
+     可 related() 硬过滤把「按词拆碎拼出来的」全砍掉后只剩 13 条。
+     第 4 页起 out 凑不满 20 → isEnd 才算 true，可第 4 页 kept 已经是 0 条：
+     客户端拿到「空数组 + isEnd=false」→ 又翻页 → 又是空 → 一路空到底。
+     现在按 kept 判：交出去的不足一页就是最后一页。 */
+  const rows = rankSheets(kept, query);
+  return { isEnd: rows.length < SEARCH_PAGE_SIZE, data: rows };
 }
 
 /** 网易云歌单搜索。
@@ -13213,7 +13472,20 @@ async function getArtistWorksOf(artistItem, page, type) {
     return { isEnd: true, data: [] };
   })();
   ARTIST_WORKS_INFLIGHT[gcKey] = job;
-  return job;
+  /* ⚠️ 同一道「空页必须收口」的闸（2026-10-24 白屏事故）。
+     歌手页也一样：某一路（网易云/酷狗/QQ）在这一页返回 0 条却自称
+     isEnd=false，客户端就会在空白列表上反复 onEndReached。 */
+  return job.then(function (v) {
+    if (v && Array.isArray(v.data) && v.data.length === 0 && v.isEnd !== true) {
+      const fixed = {};
+      for (const k in v) fixed[k] = v[k];
+      fixed.isEnd = true;
+      console.log("[粽子] 歌手页「" + (artistItem.name || id) + "」" + type
+        + " 第" + page + "页为空但 isEnd=false → 强制收口");
+      return fixed;
+    }
+    return v;
+  });
 }
 
 async function getArtistWorksUncached(artistItem, page, type) {
@@ -15723,7 +15995,25 @@ function withTypeDeadline(type, query, page, ck, task) {
       return r;
     }),
     guard,
-  ]);
+  ]).then(function (r) {
+    /* ---- 出口最后一道闸：绝不允许「空数组 + isEnd=false」出去 ----
+       （2026-10-24 白屏事故的兜底，不替代各分支里按 data.length 判 isEnd。）
+
+       客户端拿到空数组时 FlashList 内容高度是 0，onEndReached 会被立刻触发，
+       于是「空页 → 再翻一页 → 又是空」打成死循环，列表区永远是空白，
+       用户看到的就是「结果页白屏打不开」。
+       各分支现在都按**过滤后**的数据判 isEnd 了，但过滤逻辑以后还会改，
+       这里再钉一道：只要是空的，就必须是终点。 */
+    if (r && Array.isArray(r.data) && r.data.length === 0 && r.isEnd !== true) {
+      const fixed = {};
+      for (const k in r) fixed[k] = r[k];
+      fixed.isEnd = true;
+      console.log("[粽子] " + type + " 搜索「" + query + "」第 " + page
+        + " 页为空但 isEnd=false → 强制收口（避免客户端空页无限翻页）");
+      return fixed;
+    }
+    return r;
+  });
 }
 
 const search = async function (query, page, type) {
@@ -17194,7 +17484,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.66",
+  version: "4.10.69",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",

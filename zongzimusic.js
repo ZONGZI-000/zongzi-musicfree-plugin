@@ -14,20 +14,6 @@
  *   1. 酷狗 CDN 证书覆盖不到两级子域 → 必须走 http
  *   2. 所有第三方直链都要验活（会过期，实测遇到过 410）
  *   3. 手机端没有 Buffer，只能用 Uint8Array
- *
- * v4.10.67（2026-10-24）：YouTube 回退缩死链 —— 「这首歌打不开」的真正原因。
- *   现象：点某首 YouTube 曲目一直转圈，最后「所有平台均失败」。
- *   实测：YouTube 本身完全正常（同一首歌的另外两个上传 2~3 秒就取到流）。
- *   三处叠加的 bug，全在「取流失败之后」这条回退路上：
- *     a) titleSegHit 先切段再比，标题跟查询词一模一样也判「不是同一首」
- *        （「水仙斗活佛——野钓记」被破折号切成两半，q 里还带着破折号）。
- *     b) YouTube 条目的 artist 是**上传者频道名**（随手传的号叫「zz z」），
- *        回退搜索时它被当成演唱者，「必须是这个人唱的」那道闸把 20 条
- *        同名上传全筛掉。
- *     c) usable 在「候选取流失败」时照样 +1，于是循环外 `if (usable) break`
- *        直接跳出关键词循环 —— 后面那个能回 20 条同名上传的关键词永远轮不到。
- *   修法：整串先比 + 段集合比；歌手闸在「本批候选一条都没命中该歌手」时
- *        降级（说明它不是演唱者）；deadUpload 单独计数，只有真取到流才 break。
  */
 const axios_1 = require("axios");
 
@@ -405,22 +391,6 @@ function ytInvalidateVisitor() {
   ytVisitorData = "";
   ytApiKey = "";
   ytVisitorAt = 0;
-}
-
-/**
- * 这个错是不是「这条上传本身不行」，而不是网络/凭证问题？
- *
- * 用来区分：换一个关键词（= 换别家上传的同一个歌）能不能救。
- *   · UNPLAYABLE / 此视频无法播放 —— 版权或地区限制，这条上传废了
- *   · 无音频流 / 无可用格式      —— 这条上传只有视频轨
- *   · 地址不可播 / 受配额限制    —— 拿到的直链拉不动
- * 反过来，visitor 被标记、超时、DNS 失败这些换关键词也没用，不算。
- */
-function ytIsDeadUpload(e) {
-  const m = String((e && e.message) || "");
-  if (!m) return false;
-  if (/VISITOR|LOGIN_REQUIRED|登录|机器人/i.test(m)) return false;
-  return /UNPLAYABLE|此视频无法播放|无音频流|无可用|地址不可播|配额限制|not\s*available|private/i.test(m);
 }
 
 /** 这个错是不是「visitor 被标记了」（换个 visitor 就能好），而不是「视频真的没流」 */
@@ -4055,7 +4025,7 @@ async function resolveQQ(id, want, quality) {
  *   /api/url?provider=kugou 一律 HTTP 502 + {"error":"第三方渠道返回异常状态（520）"}。
  *   搜索还正常（/api/search?provider=kugou 照常返回条目），所以用户能看到歌、
  *   点下去必然失败 ——「列表里明明有，点了打不开」就是这么来的。
- *   同一时刻 coco 的网易云/QQ 通道都好的，说明挂的是它上游的酷狗那一路，
+ *   同一时刻 coco 的网易云 / QQ 通道都是好的，说明挂的是它上游的酷狗那一路，
  *   不是我们这边的问题，也不是这首歌的问题。
  *
  * 官方这个接口不用 key、不用登录，只要 hash（正好就是搜索结果里的 id）：
@@ -4064,7 +4034,7 @@ async function resolveQQ(id, want, quality) {
  * 实测：免费曲 1.1 秒给 sharefs.kugou.com 的完整 mp3（206 + audio/mpeg）；
  *       付费曲明确返回 status=0 + error="需要付费" —— 快速失败，不拖时间。
  *
- * ⚠️ 只给 128kbps。放在聚合上游**之后**是错的（那边现在是 502，排后面等于永远用不上），
+ * ⚠️ 只给 128kbps。放到聚合上游**之后**是错的（那边现在 502，排后面等于永远用不上），
  *    放**之前**又会在 coco 复活后白丢 FLAC —— 折中：先问官方（0.5~1.1s，够快），
  *    拿不到（付费/下架）再走聚合上游。
  * ============================================================ */
@@ -5440,6 +5410,99 @@ async function ytSearchRaw(query) {
  *   - 时长 2~10 分钟像首歌，超长（演唱会/合辑）和超短（切片）降权
  *   - 标题含 歌词/翻唱/remix/DJ/伴奏/纯享 等降权
  */
+/* ============================================================
+ * YouTube 兜底：查询词清洗 + 「同一首歌的其它上传」判据
+ *
+ * ⚠️⚠️ 2026-10-24 事故（「野钓记点了永远转圈、最后报错」的真正根因）：
+ *
+ *   YouTube 条目的 title / artist 是从 YouTube 自己的渲染树里扒的，很脏：
+ *     title  = "水仙斗活佛——野钓记"   ← 作者和歌名被一个破折号粘在一起
+ *     artist = "zz z"                 ← 频道名，不是歌手
+ *
+ *   而兜底搜索用的是 buildKeywords(want)，它假设 name 是干净歌名、
+ *   singer 是真人。于是拼出来的查询词是：
+ *     "水仙斗活佛——野钓记 zz z"  → YouTube 回 0 条
+ *     "水仙斗活佛——野钓记"       → 回 1 条（就是那条已经死掉的）
+ *     "zz z"                      → 回一堆无关视频
+ *
+ *   实测同一时刻手搜「野钓记 水仙斗活佛」→ 3 条，
+ *   其中 PPD9mbDWfgI / FRummv8E2j0 两条都能正常内联播放。
+ *
+ *   所以「VISIONOS 判 UNPLAYABLE 就交给别的条目」这条兜底**从来没生效过** ——
+ *   不是取流坏了，是查询词把兜底自己打瞎了。
+ * ============================================================ */
+/** 标题切段：按分隔符把「作者——歌名」拆开 */
+const YT_TITLE_SPLIT_RE = /[\/|｜·•—–\-_～~]+|【|】|《|》|「|」|\(|\)|（|）|\[|\]|,|，|：|:|\.{3,}|…/;
+function ytTitleSegs(s) {
+  return String(s || "")
+    .split(YT_TITLE_SPLIT_RE)
+    .map(function (x) { return x.replace(/^\s*(by|feat\.?|ft\.?)\s+/i, "").trim(); })
+    .filter(function (x) { return x.length >= 2; });
+}
+
+/** 这个歌手字段像不像真人名，还是频道名脏值。
+ *  "zz z" / "idle" / "WeiZhi Wu" 这种纯拉丁短串一律当脏值 ——
+ *  拼进查询词只会把搜索打空。中文名一律保留（宁可多搜一次，也别扔了真歌手）。 */
+function ytSingerCredible(singer, title) {
+  const v = String(singer || "").trim();
+  if (!v) return false;
+  if (/[\u4e00-\u9fff]/.test(v)) return true;
+  if (normText(v).length >= 6) return true;
+  return normText(String(title || "")).indexOf(normText(v)) >= 0;
+}
+
+/** YouTube 兜底用的查询词列表（按「命中概率从高到低」排）。
+ *  ① 可信歌手 + 标题每一段
+ *  ② 标题干净段两两组合（脏标题的正主就在这里救回来）
+ *  ③ 原来那套 buildKeywords（含繁体变体）
+ *  ④ 单段兜底 */
+function ytAltQueries(want) {
+  const out = [];
+  const push = function (x) {
+    const v = String(x || "").replace(/\s+/g, " ").trim();
+    if (v && out.indexOf(v) < 0) out.push(v);
+  };
+  const name = String(want.name || "").trim();
+  const singer = String(want.singer || "").trim();
+  const segs = ytTitleSegs(name);
+  const singerOk = ytSingerCredible(singer, name);
+
+  if (singerOk) {
+    for (let i = 0; i < segs.length; i++) push(segs[i] + " " + singer);
+  }
+  if (segs.length >= 2) {
+    for (let i = 0; i < segs.length; i++) {
+      for (let j = 0; j < segs.length; j++) {
+        if (i !== j) push(segs[i] + " " + segs[j]);
+      }
+    }
+  }
+  const base = buildKeywords({
+    name: name,
+    singer: singerOk ? singer : "",
+    album: want.album,
+  });
+  for (let i = 0; i < base.length; i++) push(base[i]);
+  for (let i = 0; i < segs.length; i++) push(segs[i]);
+  return out;
+}
+
+/** 已知原视频、只是它这条取不到流，要去找**同一首歌的其它上传**。
+ *  不能拿整条脏标题当查询词，也不能拿它整串跟候选比 ——
+ *  改成「原标题的任何一段，在候选标题里能整段命中」。
+ *  比 isDefinitelySameSong 松一档，但要求整段对齐，所以不会串歌。 */
+function ytSameVideoSong(candTitle, rawTitle) {
+  const cand = String(candTitle || "");
+  if (!cand) return false;
+  if (isAudiobookTitle(cand) || EPISODE_RE.test(cand)) return false;
+  const segs = ytTitleSegs(toSimplified(String(rawTitle || "")));
+  for (let i = 0; i < segs.length; i++) {
+    const q = coreTitle(segs[i]);
+    if (q && q.length >= 2 && titleSegHit(cand, q)) return true;
+  }
+  return false;
+}
+
 /**
  * 兜底时判断「这条 YouTube 视频是不是目标歌手唱的」。
  *
@@ -6055,6 +6118,7 @@ async function ytFetchUrl(videoId, quality) {
     throw e;
   }
 
+
   let pick = ytPickAudio(res.audios, quality);
   if (!pick) throw new Error("yt: 没有可用的音频流");
   /* ⚠️⚠️ 2026-10-24（这就是「YouTube 又不行了」的根因）：
@@ -6177,89 +6241,98 @@ async function ytFetchUrl(videoId, quality) {
 
 async function resolveYoutube(id, want, quality) {
   const errors = [];
-  if (id) {
-    try { return await ytFetchUrl(id, quality); }
-    catch (e) { errors.push("直取: " + e.message); }
-  }
-  try {
-    const kws = buildKeywords(want);
-    for (let k = 0; k < kws.length; k++) {
-      const list = await ytSearchRaw(kws[k]);
-      if (!list.length) continue;
+  /* ============================================================
+   * ⚠️⚠️ 2026-10-24（「点了永远转圈、最后『所有平台均失败』」的真正根因）
+   *
+   * 旧逻辑的兜底查询词直接由 want 拼出来，而 YouTube 条目的
+   * want.name / want.artist 是**脏数据**：
+   *     name   = "水仙斗活佛——野钓记"   （作者和歌名粘在一起）
+   *     artist = "zz z"                （频道名）
+   * 拼出来的查询词是 "水仙斗活佛——野钓记 zz z" —— YouTube 回 0 条；
+   * 退到 "水仙斗活佛——野钓记" 只回 1 条，就是那条已经死掉的；
+   * 再退到 "zz z" 只能说全是无关视频。
+   *
+   * 实测同一时刻手搜「野钓记 水仙斗活佛」→ 3 条，
+   * 其中 PPD9mbDWfgI / FRummv8E2j0 两条都能正常内联播放。
+   *
+   * 也就是说：「VISIONOS 判 UNPLAYABLE 就试下一条候选」这条兜底
+   * **从来没真正生效过** —— 不是取流坏了，是查询词把兜底自己打瞎了。
+   * ============================================================ */
+
+  /* 直取失败后，先专门去找「同一首歌的其它上传」，再做正常的兜底搜索。
+     这一步是这次修的核心：它不依赖 want 里的歌手是否可信，
+     只用原标题里能切出来的段落。 */
+  const tryAltUploads = async (reasonForLog) => {
+    const queries = ytAltQueries(want);
+    /* 原来这里是 id === null 才做严格校验 —— 意思是「直取已知视频」时
+       任何搜索结果都直接拿来放。脏标题场景下这就完全是瞎放，
+       很可能放了一条别人的版本。现在两条路都要校验，
+       只是判据不同：兜底用「同名同歌手」，换上传用「原标题整段命中」。 */
+    const seen = {};
+    if (id) seen[id] = 1;
+    for (let k = 0; k < queries.length; k++) {
+      let list;
+      try { list = await ytSearchRaw(queries[k]); }
+      catch (e) { errors.push("搜索(" + queries[k] + "): " + e.message); continue; }
+      if (!list || !list.length) continue;
+
       const ranked = ytRank(list, want);
-      /* ⚠️⚠️ 2026-10-24：YouTube 条目的 artist 是**上传者频道名**，不是演唱者。
-         事故：用户点的那条「水仙斗活佛——野钓记」频道叫「zz z」（随手传的号），
-         于是 want.singer 变成了 "zz z"。这条视频本身 UNPLAYABLE，
-         本该回退到同一首歌的另外两个上传版本（channel 是 idle / WeiZhi Wu），
-         但「必须是这个人唱的」那道闸拿 "zz z" 去比，一条都对不上 ——
-         整页唯一的 YouTube 回退路径被自己关死，用户看到「这首歌打不开」。
-
-         判法：这一批候选里**没有任何一条**的标题或频道命中 want.singer，
-         就说明这个「歌手」根本不是演唱者（是上传者），歌手闸降级为不校验，
-         只靠歌名闸把关。歌名闸是段集合级的严格比对，cover/伴奏 另有否决。
-
-         ⚠️ 这不影响「赵薇《不要告别》」那个事故：那次 want.singer 是真歌手名，
-            越南语合集的标题里就带「爱赵薇」→ 命中 → 闸门照旧生效。 */
-      let artistGate = true;
-      {
-        const sl = splitSingers(want.singer).map((x) => normText(toSimplified(x))).filter(Boolean);
-        if (sl.length) {
-          artistGate = ranked.some(function (c) {
-            const tn = normText(toSimplified(String(c.v.title || "")));
-            const an = normText(toSimplified(String(c.v.artist || "")));
-            return sl.some(function (x) { return tn.indexOf(x) >= 0 || an.indexOf(x) >= 0; });
-          });
-        }
-      }
-      /* ⚠️ 以前只试前 2 条。加上严格校验后，前两条经常都被拒
-         （越南语合集、十七周年展播合集），真正的「趙薇 - 不要告别」
-         排在第 3、4 条，永远轮不到。校验已经够严，多试几条不会串歌。
-         ⚠️ 2026-10-21：6 条还是不够 —— 实测《覺醒》的正确版本
-         「趙薇 Zhao Wei 【覺醒】」在 ytRank 里排第 10（分数只有 20，
-         因为频道是个人号不是 Topic，拿不到那 50 分），前 6 名全是
-         赵薇的新闻八卦视频。校验本身已经够严，所以直接扫全榜，
-         让「过校验」而不是「排名靠前」决定用哪一条。 */
-      let usable = 0;
-      /* ⚠️⚠️ 2026-10-24：usable 的语义错了。
-         原来只要「有一条候选过了校验」就 +1，然后循环外 `if (usable) break`
-         —— 可如果那条候选**取流失败**（比如这条上传在 YouTube 侧 UNPLAYABLE），
-         usable 依然 >0，于是直接跳出关键词循环，后面那个能回 20 条同名上传的
-         关键词永远轮不到。用户点的那条「水仙斗活佛——野钓记」正是这种情况：
-         第一个关键词只回 1 条（就是那条死链），第二个（繁体）也一样，
-         第三个「歌名」本可以回 20 条、其中两条 3 秒就能取流 —— 全被 break 挡了。
-
-         所以把「失败原因」分开记：
-           deadUpload —— 这条上传本身不行（UNPLAYABLE / 无音频 / 地址不可播 / 配额），
-                         换关键词找到别家上传就还有救 → **继续**试下一个关键词。
-           其他失败   —— 网络 / visitor 被标记这类，换关键词也是同一个结果 → break。
-         判据：usable > deadUpload 才 break。 */
-      let deadUpload = 0;
       for (let i = 0; i < ranked.length; i++) {
         const cand = ranked[i];
-        if (cand.score < 0) continue;
-        // 兜底场景下必须是同一首歌，别拿同名/近似名的顶替
-        if (id === null && !isDefinitelySameSong({ title: cand.v.title, artist: "" }, { name: want.name, singer: "", album: "" })) continue;
-        /* 兜底时还要确认是**这个人**唱的。
-           ⚠️ 事故：赵薇《不要告别》命中「Triệu Vy - Vol5.9: Không cần cáo biệt |
-              不要告别 | 2zhaowei.net***爱赵薇」—— 歌名在标题里、频道名里也有
-              「爱赵薇」，但那是越南语合集，不是她这一版。 */
-        if (id === null && artistGate && !ytIsThisArtist(cand.v, want)) continue;
-        usable++;
-        try { return await ytFetchUrl(cand.v.id, quality); }
-        catch (e) {
-          if (ytIsDeadUpload(e)) deadUpload++;
-          errors.push("搜索取流: " + e.message);
+        if (!cand || seen[cand.v.id]) continue;
+        /* 同一首歌的判据：
+           ① 有原 id 时 → 原标题任一段在候选标题里整段命中（换上传）
+           ② 没原 id 时 → 严格同名 + 同歌手（兜底）
+           两条都过不了的不碰，避免串歌。 */
+        let ok = false;
+        if (id) {
+          ok = ytSameVideoSong(cand.v.title, want.name);
+        } else {
+          ok = isDefinitelySameSong({ title: cand.v.title, artist: "" },
+            { name: want.name, singer: "", album: "" })
+            && ytIsThisArtist(cand.v, want);
+        }
+        if (!ok) continue;
+        seen[cand.v.id] = 1;
+        try {
+          const u = await ytFetchUrl(cand.v.id, quality);
+          if (u) {
+            console.log("[粽子] YouTube " + (id ? "换上传" : "兜底") + "命中: "
+              + cand.v.id + " 《" + String(cand.v.title).slice(0, 30) + "》"
+              + (reasonForLog ? "（" + reasonForLog + "）" : ""));
+            return u;
+          }
+        } catch (e) {
+          errors.push("换上传取流(" + cand.v.id + "): " + e.message);
         }
       }
-      /* ⚠️ 这里原来写的是 if (ranked.length) break ——
-         只要这次搜索「有结果」就再也不试后面的关键词，哪怕一条都没过校验。
-         实测《遊園會》：第一个关键词「游园会 赵薇」回 20 条，全是八卦视频，
-         一条不合格；后面那个「遊園會 趙薇」本来能命中，却因为 break 永远发不出去。
-         改成「真的取到过合格候选」才停。 */
-      if (usable > deadUpload) break;
     }
+    return null;
+  };
+
+  if (id) {
+    try { return await ytFetchUrl(id, quality); }
+    catch (e) {
+      errors.push("直取: " + e.message);
+      /* 直取失败（视频没流 / 被风控 / 配额截断）→ 同一首歌的其它上传。
+         ⚠️ 这里必须无条件尝试，不能因为「上次搜到过它」就跳过：
+            那条死掉的视频恰恰是最常被搜到、排最前的那条。 */
+      try {
+        const alt = await tryAltUploads(String(e.message).slice(0, 40));
+        if (alt) return alt;
+      } catch (e2) { errors.push("换上传: " + e2.message); }
+    }
+  }
+
+  try {
+    /* 兜底搜索（未拿到 id，或换上传也全灭）：
+       关键词改用 ytAltQueries —— 它会把脏标题切开、把频道名脏值剔掉。 */
+    const alt = await tryAltUploads(id ? "换上传全灭" : "");
+    if (alt) return alt;
   } catch (e) { errors.push("搜索: " + e.message); }
+
   throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
+
 }
 
 /* ============================================================
@@ -8821,7 +8894,7 @@ async function searchAlbum(query, page) {
        onEndReached → 又翻下一页 → 又是「撑满但清空」→ 永远翻不完。
        界面上就是列表区一片空白、圈一直转（用户嘴里的「白屏」）。
      ⚠️ 判据换成 data.length + 「这一页有没有拿到新东西」两个条件：
-        - 这一页交出去的条目少于页大小 → 後面不会再有 → isEnd
+        - 这一页交出去的条目少于页大小 → 后面不会再有 → isEnd
         - 交了但全是重复（已见过的 platform+id）→ 同样不会再有 → isEnd
        两个都不满足才算「还有下一页」。 */
   const pageIds = {};
@@ -9578,7 +9651,7 @@ async function searchSheet(query, page) {
   const kept = out.filter(related);
 
   // ⚠️ 全被过滤掉时不能直接返回空：那是「各平台就是没有这个歌单」，
-  //    但要区分「过滤得太狠」和「本来就没有」。这里选择宁可少给 ——
+  //    但要区分「过滤得太狠」和「本来就没有」。这里选择宁可少给 —— 
   //    用户明确说过相关的杂牌歌单比空列表更糟（第 1 条就是无关的）。
   /* ⚠️⚠️ isEnd 按 kept 判，不是按 out 判（2026-10-24 白屏事故，同 searchAlbum）。
      原来写 out.length < KUWO_PAGE_SIZE：酷我+酷狗+网易云每页能凑 31 条 out，
@@ -17411,7 +17484,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.68",
+  version: "4.10.69",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
@@ -17889,56 +17962,6 @@ module.exports = {
 const TITLE_SEG_RE = /[\/|｜·•\-–—_]+|【|】|《|》|「|」|\(|\)|（|）|\[|\]|,|，/;
 function titleSegHit(rawTitle, q) {
   if (!q) return false;
-  /* ⚠️⚠️ 2026-10-24：先拿**整串**比一次，再谈切段。
-     事故：YouTube 搜「水仙斗活佛——野钓记」回来一条同名视频，标题就是
-     「水仙斗活佛——野钓记」—— 跟 want.name 一模一样。但下面按分隔符切段后
-     得到的是「水仙斗活佛」「野钓记」两段（破折号被 split 吃掉了），
-     而 q 里还留着那两个破折号，于是 seg === q、indexOf 全部落空，
-     **连一模一样的标题都被判成「不是同一首歌」**。
-     后果不是少一条结果：那条唯一的视频本身 UNPLAYABLE（YouTube 侧不可播），
-     本该回退到同名的另外两个上传版本，结果全被自家校验挡掉 ——
-     用户看到的就是「这首歌根本打不开」，而 YouTube 其实完全没挂。
-
-     所以整串比对必须先做，而且要抹掉分隔符再比一次：
-     「野钓记——水仙斗活佛」和「野钓记 水仙斗活佛」是同一个意思。 */
-  const tFull = coreTitle(toSimplified(String(rawTitle || "")));
-  if (tFull === q) return true;
-  {
-    const g = new RegExp(TITLE_SEG_RE.source, "g");
-    const sq = function (x) { return x.replace(g, ""); };
-    if (sq(tFull) && sq(tFull) === sq(q)) return true;
-  }
-  /* 查询词自己也带分隔符时（「水仙斗活佛——野钓记」这种把歌手写进标题的写法），
-     按「段集合」比：候选的每一段都在查询词的段里 → 同一首；
-     或者查询词的每一段都出现在候选里（允许 by / 搬运 这类装饰）→ 同一首。
-     ⚠️ 只比段集合，不做模糊：候选多出任何一段有信息量的中文都算别的歌，
-        否则「水仙斗活佛 - 深埋地下八万里」会被当成《野钓记》。 */
-  {
-    const segSet = function (x) {
-      const arr = String(x || "").split(TITLE_SEG_RE);
-      const out = [];
-      for (let i = 0; i < arr.length; i++) {
-        const v = coreTitle(toSimplified(arr[i]));
-        if (v && v.length >= 2 && out.indexOf(v) < 0) out.push(v);
-      }
-      return out;
-    };
-    /* ⚠️ 这条放宽只看「段集合」，会被 cover / 伴奏 这类版本蹭进来：
-       「《野钓记》（cover：水仙斗活佛）」coreTitle 把括号整段删掉后
-       和原唱一模一样。兜底场景宁可不出声也不能给别人的版本，
-       所以带明确「非原唱」标记的直接否掉。只否 cover/伴奏/remix 这类，
-       不否「原唱 / 官方 / 现场」等 —— 现场版是同一个人的声音。 */
-    if (/cover|翻唱|翻自|伴奏|伴唱|ktv|instrumental|remix|dj版|纯音乐|純音樂|钢琴版|piano\s*ver/i.test(String(rawTitle || ""))) return false;
-    const qs = segSet(q);
-    if (qs.length >= 2) {
-      const ts = segSet(tFull);
-      // ① 候选的段全在查询词里（顺序无所谓）
-      if (ts.length && ts.every(function (x) { return qs.indexOf(x) >= 0; })) return true;
-      // ② 查询词的段全在候选整串里，且候选没有多出太多东西
-      if (qs.every(function (x) { return tFull.indexOf(x) >= 0; }) &&
-          tFull.length <= q.length + 12) return true;
-    }
-  }
   const segs = String(rawTitle || "").split(TITLE_SEG_RE);
   for (let i = 0; i < segs.length; i++) {
     let v = coreTitle(toSimplified(segs[i]));
