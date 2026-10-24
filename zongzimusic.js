@@ -4047,9 +4047,67 @@ async function resolveQQ(id, want, quality) {
   throw new Error(errors.length ? errors.join(" | ") : "没有找到可播的版本");
 }
 
+/* ============================================================
+ * 通道 E0：酷狗官方 playInfo（2026-10-24）
+ *
+ * 为什么要有它：聚合上游的**酷狗通道整条挂了**。
+ *   实测 2026-10-24：不论 hash 是什么（周杰伦《晴天》和冷门独立乐团都一样），
+ *   /api/url?provider=kugou 一律 HTTP 502 + {"error":"第三方渠道返回异常状态（520）"}。
+ *   搜索还正常（/api/search?provider=kugou 照常返回条目），所以用户能看到歌、
+ *   点下去必然失败 ——「列表里明明有，点了打不开」就是这么来的。
+ *   同一时刻 coco 的网易云/QQ 通道都好的，说明挂的是它上游的酷狗那一路，
+ *   不是我们这边的问题，也不是这首歌的问题。
+ *
+ * 官方这个接口不用 key、不用登录，只要 hash（正好就是搜索结果里的 id）：
+ *   GET https://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=<32位HEX>
+ *   返回 url / backup_url[] / fileSize / timeLength / bitRate
+ * 实测：免费曲 1.1 秒给 sharefs.kugou.com 的完整 mp3（206 + audio/mpeg）；
+ *       付费曲明确返回 status=0 + error="需要付费" —— 快速失败，不拖时间。
+ *
+ * ⚠️ 只给 128kbps。放在聚合上游**之后**是错的（那边现在是 502，排后面等于永远用不上），
+ *    放**之前**又会在 coco 复活后白丢 FLAC —— 折中：先问官方（0.5~1.1s，够快），
+ *    拿不到（付费/下架）再走聚合上游。
+ * ============================================================ */
+const KUGOU_PLAYINFO = "https://m.kugou.com/app/i/getSongInfo.php";
+const KUGOU_APP_UA = "Mozilla/5.0 (Linux; Android 10; MI 9 Build/QKQ1.190825.002)";
+
+async function kugouOfficialUrl(id) {
+  const h = String(id || "").trim().toUpperCase();
+  if (!/^[0-9A-F]{32}$/.test(h)) throw new Error("不是酷狗 hash");
+  const r = await httpGet(KUGOU_PLAYINFO,
+    { cmd: "playInfo", hash: h },
+    { "User-Agent": KUGOU_APP_UA, Referer: "https://m.kugou.com/" }, 8000);
+  if (!r) throw new Error("酷狗无响应");
+  if (Number(r.status) !== 1 || !r.url) {
+    throw new Error(r.error || ("酷狗未给地址(status=" + r.status + ")"));
+  }
+  /* ⚠️ 这里**不**做 https→http 改写。那条规则是给 coco 上游的网宿地址用的
+     （证书 SAN 覆盖不到两级子域）；sharefs.kugou.com 的 https 实测 206 正常，
+     改成 http 只是多一次明文。 */
+  const cands = [r.url];
+  if (Array.isArray(r.backup_url)) {
+    for (let i = 0; i < r.backup_url.length; i++) cands.push(r.backup_url[i]);
+  }
+  const errs = [];
+  for (let i = 0; i < cands.length; i++) {
+    const u = String(cands[i] || "");
+    if (!u) continue;
+    try {
+      if (await verifyPlayable(u)) return u;
+      errs.push("不可播");
+    } catch (e) { errs.push(String(e && e.message)); }
+  }
+  throw new Error("官方地址不可播" + (errs.length ? "（" + errs.join(",") + "）" : ""));
+}
+
 async function resolveKugou(id, want, quality) {
   const errors = [];
-  // 1. 聚合上游 直取（出 FLAC，注意 http 修正）
+  // 1. 官方 playInfo 直取（最快；聚合上游的酷狗通道 2026-10-24 起整条 502）
+  if (id) {
+    try { return await kugouOfficialUrl(id); }
+    catch (e) { errors.push("kugou官方: " + e.message); }
+  }
+  // 2. 聚合上游 直取（出 FLAC，注意 http 修正）
   if (id) {
     try { return await cocoFetchUrl("kugou", id, quality); }
     catch (e) { errors.push("coco直取: " + e.message); }
@@ -7291,6 +7349,12 @@ async function resolveMiguApi(id, want, quality) {
  * ============================================================ */
 
 const KUWO_PAGE_SIZE = 20;
+/* 「这一页算不算满」的统一判据（2026-10-24）。
+   ⚠️ 用 20 而不是各分支自己的页大小（专辑 30 / 歌单 20 / 歌手 20）：
+      它是**下界**，判宽一点最坏只是多翻一页（那一页立刻回 isEnd=true），
+      判窄了就会把「还有下一页」误判成结束 —— 后者会直接吃掉用户的搜索结果。
+      所以统一按 20 判，宁可多翻一次。 */
+const SEARCH_PAGE_SIZE = 20;
 
 /** 酷我通用搜索：ft = music | album | artist | playlist */
 async function kuwoSearchTyped(keyword, ft, page, size) {
@@ -8748,7 +8812,28 @@ async function searchAlbum(query, page) {
 
   /* 合并放在**排序之后**（理由见 dedupeAlbumList 的注释：放前面会削掉共识票数） */
   data = dedupeAlbumList(data);
-  return { isEnd: out.length < KUWO_PAGE_SIZE, data: data };
+  /* ⚠️⚠️ isEnd 必须按**这一页最后真正交出去的东西**判，不能按过滤前的 out.length 判。
+     事故现象（2026-10-24 用户报「结果页白屏 / 无限翻页」）：
+       搜「水仙斗活佛」→ 专辑页第 1 页 41 条，后面每页也都有 20 条；
+       可酷狗/酷我按分词返回的《怪兔记》《三伏记》这类噪声会把 out 撑满 20 条，
+       而 rankByName + 同名翻唱沉底 + dedupeAlbumList 之后 data 只剩个位数甚至 0 条。
+       out.length 仍然是 20 → isEnd=false → 客户端 FlashList 见空列表照样触发
+       onEndReached → 又翻下一页 → 又是「撑满但清空」→ 永远翻不完。
+       界面上就是列表区一片空白、圈一直转（用户嘴里的「白屏」）。
+     ⚠️ 判据换成 data.length + 「这一页有没有拿到新东西」两个条件：
+        - 这一页交出去的条目少于页大小 → 後面不会再有 → isEnd
+        - 交了但全是重复（已见过的 platform+id）→ 同样不会再有 → isEnd
+       两个都不满足才算「还有下一页」。 */
+  const pageIds = {};
+  let freshCount = 0;
+  for (let i = 0; i < data.length; i++) {
+    const k = String(data[i].platform) + "|" + String(data[i].id);
+    if (pageIds[k]) continue;
+    pageIds[k] = 1;
+    freshCount++;
+  }
+  const more = data.length >= SEARCH_PAGE_SIZE && freshCount > 0;
+  return { isEnd: !more, data: data };
 }
 
 /* ---------- 歌手 ---------- */
@@ -9493,9 +9578,16 @@ async function searchSheet(query, page) {
   const kept = out.filter(related);
 
   // ⚠️ 全被过滤掉时不能直接返回空：那是「各平台就是没有这个歌单」，
-  //    但要区分「过滤得太狠」和「本来就没有」。这里选择宁可少给 —— 
+  //    但要区分「过滤得太狠」和「本来就没有」。这里选择宁可少给 ——
   //    用户明确说过相关的杂牌歌单比空列表更糟（第 1 条就是无关的）。
-  return { isEnd: out.length < KUWO_PAGE_SIZE, data: rankSheets(kept, query) };
+  /* ⚠️⚠️ isEnd 按 kept 判，不是按 out 判（2026-10-24 白屏事故，同 searchAlbum）。
+     原来写 out.length < KUWO_PAGE_SIZE：酷我+酷狗+网易云每页能凑 31 条 out，
+     可 related() 硬过滤把「按词拆碎拼出来的」全砍掉后只剩 13 条。
+     第 4 页起 out 凑不满 20 → isEnd 才算 true，可第 4 页 kept 已经是 0 条：
+     客户端拿到「空数组 + isEnd=false」→ 又翻页 → 又是空 → 一路空到底。
+     现在按 kept 判：交出去的不足一页就是最后一页。 */
+  const rows = rankSheets(kept, query);
+  return { isEnd: rows.length < SEARCH_PAGE_SIZE, data: rows };
 }
 
 /** 网易云歌单搜索。
@@ -13307,7 +13399,20 @@ async function getArtistWorksOf(artistItem, page, type) {
     return { isEnd: true, data: [] };
   })();
   ARTIST_WORKS_INFLIGHT[gcKey] = job;
-  return job;
+  /* ⚠️ 同一道「空页必须收口」的闸（2026-10-24 白屏事故）。
+     歌手页也一样：某一路（网易云/酷狗/QQ）在这一页返回 0 条却自称
+     isEnd=false，客户端就会在空白列表上反复 onEndReached。 */
+  return job.then(function (v) {
+    if (v && Array.isArray(v.data) && v.data.length === 0 && v.isEnd !== true) {
+      const fixed = {};
+      for (const k in v) fixed[k] = v[k];
+      fixed.isEnd = true;
+      console.log("[粽子] 歌手页「" + (artistItem.name || id) + "」" + type
+        + " 第" + page + "页为空但 isEnd=false → 强制收口");
+      return fixed;
+    }
+    return v;
+  });
 }
 
 async function getArtistWorksUncached(artistItem, page, type) {
@@ -15817,7 +15922,25 @@ function withTypeDeadline(type, query, page, ck, task) {
       return r;
     }),
     guard,
-  ]);
+  ]).then(function (r) {
+    /* ---- 出口最后一道闸：绝不允许「空数组 + isEnd=false」出去 ----
+       （2026-10-24 白屏事故的兜底，不替代各分支里按 data.length 判 isEnd。）
+
+       客户端拿到空数组时 FlashList 内容高度是 0，onEndReached 会被立刻触发，
+       于是「空页 → 再翻一页 → 又是空」打成死循环，列表区永远是空白，
+       用户看到的就是「结果页白屏打不开」。
+       各分支现在都按**过滤后**的数据判 isEnd 了，但过滤逻辑以后还会改，
+       这里再钉一道：只要是空的，就必须是终点。 */
+    if (r && Array.isArray(r.data) && r.data.length === 0 && r.isEnd !== true) {
+      const fixed = {};
+      for (const k in r) fixed[k] = r[k];
+      fixed.isEnd = true;
+      console.log("[粽子] " + type + " 搜索「" + query + "」第 " + page
+        + " 页为空但 isEnd=false → 强制收口（避免客户端空页无限翻页）");
+      return fixed;
+    }
+    return r;
+  });
 }
 
 const search = async function (query, page, type) {
@@ -17288,7 +17411,7 @@ async function getLyricUncached(musicItem) {
  * ============================================================ */
 module.exports = {
   platform: "粽子音源",
-  version: "4.10.67",
+  version: "4.10.68",
   author: "粽子 & Alma",
   description:
     "粽子音源：聚合网易云、QQ、酷狗、咪咕、酷我、JOOX、YouTube 七个平台（Bilibili 因链路不稳已默认下线），支持单曲、专辑、歌手、歌单四类搜索，取流自动跨平台兜底。推荐页每天自动拼一张《拼好歌》歌单，按分类配封面。",
